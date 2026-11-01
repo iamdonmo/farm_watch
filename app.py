@@ -193,8 +193,8 @@ def registration_form():
 
 @app.post("/submit-registration")
 def handle_registration(name: str = Form(...), phone: str = Form(...), zone: str = Form(...)):
-    db = db_engine.load_db()
-    clean_phone = db_engine.clean_phone_number(phone)
-    db["farmers"][clean_phone] = {"name": name, "zone": zone}
-    db_engine.save_db(db)
+    # 🌟 REDIRECT TO SHARED CLOUD KV ENGINE CONTAINER
+    db_engine.add_farmer_to_cloud(phone, name, zone)
+
+    print(f"\n💾 [GLOBAL CENTRAL DB CLOUD REGISTRATION] {name} added under {zone}")
     return RedirectResponse(url="/dashboard", status_code=303)
