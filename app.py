@@ -115,17 +115,21 @@ def admin_dashboard(username: str = Depends(authenticate_admin)):
 
 @app.post("/incoming-alert")
 def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
+    # 🌟 THE PERMANENT FIX: Force-load the absolute freshest database snapshot from the disk file!
     db = db_engine.load_db()
+
     sender_number = db_engine.clean_phone_number(From.replace("whatsapp:", ""))
     alert_message = Body
 
+    # Search for the sender inside our fresh disk snapshot
     if sender_number not in db["farmers"]:
-        print(f"\n❌ [SECURITY REJECTED] Cleaned lookup token key missing from storage index: '{sender_number}'")
+        print(f"\n❌ [SECURITY REJECTED] Unknown lookup token key: '{sender_number}'")
         return Response(content="<Response></Response>", media_type="application/xml")
 
     sender_name = db["farmers"][sender_number]["name"]
     sender_zone = db["farmers"][sender_number]["zone"]
 
+    # Intelligent emergency priority sorting
     alert_type = "Standard"
     is_master_override = False
     if any(k in alert_message.lower() for k in ["fire", "flood", "attack", "armed"]):
@@ -134,6 +138,7 @@ def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
 
     db_engine.archive_incident(sender_name, sender_zone, alert_message, alert_type)
 
+    # Pull the neighbor lists from our fresh snapshot as well!
     neighbors_to_alert = []
     for number, data in db["farmers"].items():
         if number != sender_number:
@@ -147,7 +152,9 @@ def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
         broadcast_text = f"FARM WATCH ALERT from {sender_name} ({sender_zone}): {alert_message}"
         for neighbor_number, neighbor_name in neighbors_to_alert:
             print(f"   💬 Broadcast Target Node: {neighbor_name} ({neighbor_number})")
-            send_physical_sms(neighbor_number, broadcast_text)
+
+            # This calls whichever paid Twilio function you have active
+            send_production_alert(neighbor_number, broadcast_text)
 
     print("-" * 60)
     return Response(content="<Response></Response>", media_type="application/xml")
