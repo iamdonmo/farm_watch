@@ -19,7 +19,7 @@ ANDROID_GATEWAY_IP = "http://192.168.1.50:8080"
 ANDROID_API_TOKEN = "YOUR_ANDROID_APP_PASSWORD_OR_TOKEN"
 
 
-def send_physical_sms(to_number: str, message_text: str):
+def send_production_alert(to_number: str, message_text: str):
     """Sends a wireless command packet to your local Android Phone to fire an SMS."""
     url = f"{ANDROID_GATEWAY_IP}/api/v1/sms/send"
     payload = {"phone": to_number, "message": message_text}
@@ -32,7 +32,6 @@ def send_physical_sms(to_number: str, message_text: str):
     except Exception as e:
         print(f"⚠️ [SIMULATION FALLBACK] Android gateway phone offline or unmapped: {e}")
     return False
-
 
 def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
     """Locks the dashboard panel behind HTTP Basic Authentication."""
