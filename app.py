@@ -13,6 +13,154 @@ db_engine.initialize_db()
 ADMIN_USERNAME = "chief"
 ADMIN_PASSWORD = "securepassword123"
 
+
+# ---------------------------------------------------------
+# NEW ENDPOINT: MAIN COMMUNITY LANDING HOMEPAGE
+# ---------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+def community_homepage():
+    """
+    Renders a stunning, modern landing page for the Neighborhood Farm Watch platform.
+    """
+    return """
+    <html>
+        <head>
+            <title>Farm Watch - Community Security Network</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body { 
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+                    background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+                    color: white;
+                    margin: 0; 
+                    padding: 0;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    min-height: 100vh;
+                    box-sizing: border-box;
+                }
+                .hero-container {
+                    background: rgba(255, 255, 255, 0.1);
+                    backdrop-filter: blur(10px);
+                    border: 1px solid rgba(255, 255, 255, 0.2);
+                    padding: 40px;
+                    border-radius: 16px;
+                    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
+                    max-width: 650px;
+                    width: 100%;
+                    text-align: center;
+                    box-sizing: border-box;
+                }
+                h1 {
+                    font-size: 36px;
+                    margin-top: 0;
+                    font-weight: 800;
+                    letter-spacing: -0.5px;
+                    color: #fff;
+                }
+                h1 span {
+                    color: #2ecc71;
+                }
+                p.tagline {
+                    font-size: 18px;
+                    color: #e2e8f0;
+                    margin-bottom: 35px;
+                    line-height: 1.6;
+                }
+                .features-grid {
+                    display: flex;
+                    gap: 15px;
+                    margin-bottom: 40px;
+                    text-align: left;
+                }
+                .feature-card {
+                    flex: 1;
+                    background: rgba(255, 255, 255, 0.05);
+                    padding: 15px;
+                    border-radius: 8px;
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                }
+                .feature-card h3 {
+                    margin-top: 0;
+                    color: #2ecc71;
+                    font-size: 16px;
+                }
+                .feature-card p {
+                    margin: 0;
+                    font-size: 13px;
+                    color: #cbd5e1;
+                    line-height: 1.4;
+                }
+                .action-box {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 15px;
+                }
+                .btn {
+                    display: block;
+                    padding: 15px;
+                    text-decoration: none;
+                    font-weight: bold;
+                    font-size: 16px;
+                    border-radius: 8px;
+                    transition: all 0.2s ease;
+                }
+                .btn-register {
+                    background: #2ecc71;
+                    color: white;
+                    box-shadow: 0 4px 15px rgba(46, 204, 113, 0.3);
+                }
+                .btn-register:hover {
+                    background: #27ae60;
+                    transform: translateY(-2px);
+                }
+                .btn-dashboard {
+                    background: transparent;
+                    color: white;
+                    border: 2px solid white;
+                }
+                .btn-dashboard:hover {
+                    background: white;
+                    color: #1e3c72;
+                    transform: translateY(-2px);
+                }
+                .footer {
+                    margin-top: 30px;
+                    font-size: 12px;
+                    color: #94a3b8;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="hero-container">
+                <h1>📡 <span>Farm Watch</span></h1>
+                <p class="tagline">Protecting our fields together. An automated, community-driven look-out network safeguarding local smallholder livelihoods.</p>
+
+                <div class="features-grid">
+                    <div class="feature-card">
+                        <h3>📍 Zone Security</h3>
+                        <p>Alerts are instantly targeted specifically to your immediate neighbors to eliminate notification fatigue.</p>
+                    </div>
+                    <div class="feature-card">
+                        <h3>⚡ Emergency Override</h3>
+                        <p>Critical events like fires or floods instantly bypass geographic boundaries to keep everyone safe.</p>
+                    </div>
+                </div>
+
+                <div class="action-box">
+                    <a href="/register" class="btn btn-register">➕ Register My Farm Location</a>
+                    <a href="/dashboard" class="btn btn-dashboard">🖥️ Access Admin Control Center</a>
+                </div>
+
+                <div class="footer">
+                    Secured Node Ecosystem • Active Monitoring Enabled
+                </div>
+            </div>
+        </body>
+    </html>
+    """
+
 # ---------------------------------------------------------
 # 🛠️ PHYSICAL ANDROID SMS GATEWAY CONFIGURATION
 # ---------------------------------------------------------
