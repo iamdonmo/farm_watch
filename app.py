@@ -116,8 +116,6 @@ def admin_dashboard(username: str = Depends(authenticate_admin)):
 @app.post("/incoming-alert")
 def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
     db = db_engine.load_db()
-
-    # Automatically running through the data cleaning layer to strip spaces/brackets
     sender_number = db_engine.clean_phone_number(From.replace("whatsapp:", ""))
     alert_message = Body
 
@@ -128,7 +126,6 @@ def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
     sender_name = db["farmers"][sender_number]["name"]
     sender_zone = db["farmers"][sender_number]["zone"]
 
-    # Intelligent emergency priority sorting
     alert_type = "Standard"
     is_master_override = False
     if any(k in alert_message.lower() for k in ["fire", "flood", "attack", "armed"]):
@@ -170,11 +167,10 @@ def resolve_alert(alert_id: int = Form(...)):
 
 @app.get("/register", response_class=HTMLResponse)
 def registration_form():
-    """Renders a styled, responsive, centered sign-up web card layout card."""
     return """
     <html><body style="font-family:sans-serif; background:#f4f7f6; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; padding:20px; box-sizing:border-box;">
         <div style="background:white; padding:30px; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.08); width:100%; max-width:360px;">
-            <h2 style="color:#2c3e50; text-align:center; margin-top:0;">Register New Farm</h2>
+            <h2>Register New Farm</h2>
             <form action="/submit-registration" method="post">
                 <label style="font-weight:bold; color:#34495e;">Farmer Name</label><input type="text" name="name" style="width:100%; padding:10px; margin:5px 0 15px 0; border:1px solid #ccc; border-radius:6px;" placeholder="Kwame" required><br>
                 <label style="font-weight:bold; color:#34495e;">Phone Number</label><input type="text" name="phone" style="width:100%; padding:10px; margin:5px 0 15px 0; border:1px solid #ccc; border-radius:6px;" placeholder="e.g. +2348030001111" required><br>
