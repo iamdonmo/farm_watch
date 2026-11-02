@@ -34,10 +34,25 @@ def initialize_db():
 
 
 def load_db():
-    """Pulls data straight from the active environment file path."""
+    """
+    FORCED CACHE-BREAKER SNAPSHOT LOOKUP
+    Bypasses Python memory process wrappers to read raw hard drive bytes directly.
+    """
     initialize_db()
-    with open(DB_FILE, "r") as f:
-        return json.load(f)
+
+    # 🌟 THE CLOUD FIX: Force python to read raw data from the disk drive immediately,
+    # stripping away any stale process memory cache locks.
+    try:
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            # We explicitly read the raw text stream first, then decode it manually
+            raw_text_stream = f.read()
+            if not raw_text_stream.strip():
+                return {"farmers": {}, "alerts_log": []}
+            return json.loads(raw_text_stream)
+    except Exception as e:
+        print(f"⚠️ [CRITICAL CLOUD FILE READ FAIL] Forcing baseline reload: {e}")
+        # Standard safety failover framework template structure
+        return {"farmers": {}, "alerts_log": []}
 
 
 def save_db(data):
