@@ -2,43 +2,47 @@ import json
 import os
 from datetime import datetime
 
-# Absolute hard-locked path on your MacBook
-DB_FILE = "/Users/mackbook/Documents/farm watch/farmers_db.json"
+# 🌟 THE COMPATIBILITY SWITCH
+# If the code detects Render's secure persistent folder path, it switches to cloud mode.
+# Otherwise, it locks onto your exact MacBook path so your laptop never gets confused!
+IF_RENDER_CLOUD = "/data/farmers_db.json"
+IF_MACKBOOK_LOCAL = "/Users/mackbook/Documents/farm watch/farmers_db.json"
+
+DB_FILE = IF_RENDER_CLOUD if os.path.exists("/data") else IF_MACKBOOK_LOCAL
 
 def clean_phone_number(phone: str) -> str:
     """Removes spaces, dashes, brackets, and formatting to normalize keys."""
     return phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace("whatsapp:", "")
 
 def initialize_db():
-    """
-    Creates a clean, blank database framework ONLY if the file does not exist.
-    It no longer carries the starter numbers, so it will NEVER overwrite your edits!
-    """
+    """Creates a clean, blank database framework ONLY if the file does not exist."""
     folder_path = os.path.dirname(DB_FILE)
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path, exist_ok=True)
+    if folder_path and not os.path.exists(folder_path):
+        try:
+            os.makedirs(folder_path, exist_ok=True)
+        except Exception:
+            pass
         
     if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
-        # We start with a completely empty ledger framework
         blank_structure = {
             "farmers": {},
             "alerts_log": []
         }
         with open(DB_FILE, "w") as f:
             json.dump(blank_structure, f, indent=4)
-        print(f"🆕 Created a clean, permanent database file ledger at: {DB_FILE}")
+        print(f"🆕 [DATABASE ENGINE] Initialized clean database file ledger at: {DB_FILE}")
 
 def load_db():
-    """Pulls directly from your MacBook file disk with zero default overrides."""
+    """Pulls data straight from the active environment file path."""
     initialize_db()
     with open(DB_FILE, "r") as f:
         return json.load(f)
 
 def save_db(data):
-    """Writes changes instantly and directly onto your MacBook disk file."""
+    """Writes updates instantly directly onto the active disk storage path."""
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=4)
-    print(f"💾 [DISK UPDATE COMPLETE] Saved directly to: {DB_FILE}")
+    print(f"💾 [DISK UPDATE] Successfully saved data changes to: {DB_FILE}")
 
 def remove_farmer(phone_number):
     db = load_db()
