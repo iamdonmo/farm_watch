@@ -39,7 +39,8 @@ def initialize_db():
                     "+2348030004444": {"name": "Musa", "zone": "Zone_South"},
                 }
                 for phone, data in default_farmers.items():
-                    requests.post(f"{REDIS_URL}/hset/farmers/{phone}/name={data['name']}|zone={data['zone']}", headers=HEADERS, timeout=5)
+                    requests.post(f"{REDIS_URL}/hset/farmers/{phone}/name={data['name']}|zone={data['zone']}",
+                                  headers=HEADERS, timeout=5)
         except Exception:
             pass
     else:
@@ -53,7 +54,7 @@ def load_db():
 
     farmers = {}
     alerts_log = []
-    
+
     try:
         # 1. Fetch cloud farmers map
         r_farmers = requests.post(f"{REDIS_URL}/hgetall/farmers", headers=HEADERS, timeout=5).json()
@@ -62,7 +63,7 @@ def load_db():
             for i in range(0, len(flat_list), 2):
                 phone = flat_list[i]
                 try:
-                    parts = flat_list[i+1].split("|")
+                    parts = flat_list[i + 1].split("|")
                     name = parts[0].split("=")[1]
                     zone = parts[1].split("=")[1]
                     farmers[phone] = {"name": name, "zone": zone}
@@ -127,7 +128,7 @@ def archive_incident(sender_name, zone, message, alert_type="Standard"):
     """Appends an operational threat entry record straight into live timeline arrays."""
     t_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     clean_msg = message.replace("|", " ").replace("=", " ")
-    
+
     if IS_CLOUD_ACTIVE:
         try:
             log_str = f"time={t_str}|sender={sender_name}|zone={zone}|msg={clean_msg}|type={alert_type}|status=Active"
@@ -136,7 +137,7 @@ def archive_incident(sender_name, zone, message, alert_type="Standard"):
             pass
     else:
         LOCAL_ALERTS_LOG.append({
-            "timestamp": t_str, "sender": sender_name, "zone": zone, 
+            "timestamp": t_str, "sender": sender_name, "zone": zone,
             "message": clean_msg, "type": alert_type, "status": "Active"
         })
 
@@ -160,3 +161,18 @@ def update_incident_status(alert_id, target_status="Resolved"):
             LOCAL_ALERTS_LOG[alert_id]["status"] = target_status
             return True
     return False
+def save_db(data):
+    """
+    Local fallback save method. Updates the offline memory cache tables
+    when running locally on your laptop without cloud environment keys.
+    """
+    global LOCAL_FARMER_RAM, LOCAL_ALERTS_LOG
+    if not IS_CLOUD_ACTIVE:
+        if "farmers" in data:
+            LOCAL_FARMER_RAM = data["farmers"]
+        if "alerts_log" in data:
+            LOCAL_ALERTS_LOG = data["alerts_log"]
+        print("💾 [LOCAL STORAGE MODE] Temporary session data snapshot updated successfully.")
+    else:
+        # In cloud mode, adjustments are handled dynamically via individual requests, so we skip file-writes
+        pass
