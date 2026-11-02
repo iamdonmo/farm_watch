@@ -15,7 +15,7 @@ db_engine.initialize_db()
 
 ADMIN_USERNAME = "chief"
 ADMIN_PASSWORD = "securepassword123"
-ANDROID_GATEWAY_IP = "http://192.168.1.50:8080"
+ANDROID_GATEWAY_IP = "http://10.216.163.169:8080/send-sms"
 ANDROID_API_TOKEN = "YOUR_ANDROID_APP_PASSWORD_OR_TOKEN"
 ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
 
