@@ -9,7 +9,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import database as db_engine
 
-app = FastAPI(title="Farm Watch Enterprise Node", version="3.9.0")
+app = FastAPI(title="Farm Watch Enterprise Node", version="3.9.5")
 security = HTTPBasic()
 db_engine.initialize_db()
 
@@ -222,6 +222,13 @@ def admin_export_ledger(username: str = Depends(authenticate_admin)):
         msg = i.get("message", "").replace('"', '""')
         csv_data += f'"{i.get("timestamp")}","{i.get("type")}","{i.get("sender")}","{i.get("lga")}","{msg}","{i.get("status")}"\n'
     return StreamingResponse(iter([csv_data]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=farm_watch_security_ledger.csv"})
+
+@app.post("/portal/approve-node")
+def handle_node_approval(target_phone: str = Form(...), current_user=Depends(get_current_farmer)):
+    """🤝 HARNESS FIX: Commits validation parameters and triggers an instant client-side reload script to eliminate blank screens."""
+    if not current_user: return HTMLResponse(content="<html><script>window.location.href='/portal/login';</script></html>")
+    db_engine.approve_farmer_node(target_phone)
+    return HTMLResponse(content="<html><script>window.location.href='/portal/feed';</script></html>")
 
 @app.get("/portal/logout")
 def handle_member_logout():
