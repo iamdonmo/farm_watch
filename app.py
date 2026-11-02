@@ -5,7 +5,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import database as db_engine
 
-app = FastAPI(title="Farm Watch Enterprise Node", version="3.0.0")
+app = FastAPI(title="Farm Watch Enterprise Node", version="3.1.0")
 security = HTTPBasic()
 db_engine.initialize_db()
 
@@ -13,6 +13,9 @@ ADMIN_USERNAME = "chief"
 ADMIN_PASSWORD = "securepassword123"
 ANDROID_GATEWAY_IP = "http://192.168.1.50:8080"
 ANDROID_API_TOKEN = "YOUR_ANDROID_APP_PASSWORD_OR_TOKEN"
+
+# 🔔 SYSTEM ADMINISTRATIVE ALERT WEBHOOK (Slack / Discord incoming URL layout channel)
+ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
 
 GLOBAL_GEO_DB = {
     "Nigeria": {
@@ -57,6 +60,12 @@ def send_production_alert(to_number: str, message_text: str):
         res = requests.post(url, json=payload, headers=headers, timeout=5)
         return res.status_code == 200
     except Exception: return False
+
+def send_admin_webhook(payload: dict):
+    """Fires a background thread JSON notification packet to the designated supervisor channel."""
+    if "://slack.com" in ADMIN_ALERT_WEBHOOK_URL or "://discord.com" in ADMIN_ALERT_WEBHOOK_URL:
+        try: requests.post(ADMIN_ALERT_WEBHOOK_URL, json=payload, timeout=5)
+        except Exception: pass
 
 def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
     is_user = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
@@ -104,7 +113,7 @@ def farmer_feed_portal(current_user=Depends(get_current_farmer)):
     f_phone, f_name, d = current_user["phone"], current_user["data"]["name"], current_user["data"]
     country, state, city, lga, area = d.get("country","?"), d.get("state","?"), d.get("city","?"), d.get("lga","?"), d.get("area","?")
     if d.get("status", "Pending") == "Pending":
-        return f"""<html><head><style>{CORE_CSS}</style></head><body><div class="glass-panel" style="padding:40px; max-width:420px; text-align:center;"><h2 style="color:#eab308;">⏳ Integration Pending</h2><p style="color:#94a3b8;">Hello {f_name}. Please request an approved peer inside <strong>{lga}</strong> to authorize your device.</p><a href="/" class="btn" style="background:rgba(255,255,255,0.05); color:white;">Exit Terminal</a></div></body></html>"""
+        return f"""<html><head><style>{CORE_CSS}</style></head><body><div class="glass-panel" style="padding:40px; max-width:420px; text-align:center;"><h2 style="color:#eab308;">⏳ Integration Pending</h2><p style="color:#94a3b8;">Hello {f_name}. Please request an approved system administrator or neighbor inside your sector to authorize your node.</p><a href="/" class="btn" style="background:rgba(255,255,255,0.05); color:white;">Exit Terminal</a></div></body></html>"""
     db = db_engine.load_db()
     feed_html = "".join([f'<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:14px; margin-bottom:10px; border-radius:10px;"><div style="display:flex; justify-content:space-between; font-size:11px; color:#64748b;"><span>⏱️ {i["timestamp"]}</span><span style="color:#ef4444; font-weight:800;">{i["status"]}</span></div><strong style="color:#f97316; font-size:13px;">[{i.get("type")}]</strong><span style="display:block; margin:4px 0; color:#e2e8f0;">"{i["message"]}"</span><span style="font-size:11px; color:#475569;">Origin: {i["sender"]} | Branch: {i.get("area","General")}</span></div>' for i in reversed(db["alerts_log"]) if i.get("lga") == lga])
     nb_html = "".join([f'<div style="background:rgba(59,130,246,0.03); padding:12px; margin-bottom:8px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;"><div><strong style="color:white; display:block;">{info["name"]}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:6px 12px; font-size:12px;">🤝 Verify</button></form></div>' for p, info in db["farmers"].items() if info.get("lga") == lga and info.get("status", "Pending") == "Pending" and p != f_phone])
@@ -148,10 +157,14 @@ def admin_dashboard(username: str = Depends(authenticate_admin)):
         if g_key not in by_geo: by_geo[g_key] = []
         by_geo[g_key].append((p, f))
     for path, members in by_geo.items():
-        m_list = "".join([f'<li style="display:flex; justify-content:space-between; padding:8px; background:rgba(255,255,255,0.01); margin-bottom:4px; border-radius:4px;"><span>👤 <strong>{m["name"]}</strong> ({m.get("area")}) <small style="color:#64748b;">{phone}</small></span><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:none; border:none; color:#ef4444; cursor:pointer;">❌</button></form></li>' for phone, m in members])
+        m_list = ""
+        for phone, m in members:
+            b_color, action_lbl = ("#10b981", "🤝 Approve Node") if m.get("status", "Pending") == "Pending" else ("#475569", "🟢 Fully Approved")
+            approve_btn = f'<form action="/admin/approve-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:{b_color}; border:none; color:white; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;" {"disabled" if m.get("status")=="Approved" else ""}>{action_lbl}</button></form>'
+            m_list += f'<li style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:rgba(255,255,255,0.01); margin-bottom:4px; border-radius:6px;"><span>👤 <strong>{m["name"]}</strong> ({m.get("area")}) <small style="color:#64748b;">{phone}</small></span><div style="display:flex; gap:8px; align-items:center;">{approve_btn}<form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:none; border:none; color:#ef4444; cursor:pointer;">❌ Delete</button></form></div></li>'
         grouped_html += f'<div style="margin-bottom:15px; border-left:3px solid #3b82f6; padding-left:10px;"><h4 style="margin:0 0 6px; color:#38bdf8; font-size:12px; text-transform:uppercase;">🗺️ {path}</h4><ul style="padding:0; margin:0; list-style:none;">{m_list}</ul></div>'
     al_html = "".join([f'<div style="background:rgba(239,68,68,0.03); border:1px solid rgba(239,68,68,0.1); padding:12px; margin-bottom:8px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;"><div><strong>🚨 {i["type"]} ({i.get("lga")}):</strong> "{i["message"]}"</div><form action="/resolve-alert" method="post" style="margin:0;"><input type="hidden" name="alert_id" value="{idx}"><button type="submit" class="btn" style="background:#10b981; color:white; padding:4px 10px; font-size:11px;">Clear</button></form></div>' for idx, i in enumerate(db["alerts_log"]) if i.get("status") == "Active"])
-    return f"""<html><head><style>{CORE_CSS} body {{ display:block; padding:40px 20px; }} .box {{ max-width:900px; margin:0 auto; }} .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:15px; margin:20px 0; }} .card {{ padding:20px; text-align:center; }}</style></head><body><div class="box glass-panel" style="padding:30px;"><h2>📡 Global Command Dashboard</h2><div class="grid"><div class="card glass-panel" style="border-top:3px solid #10b981;"><h2>{total}</h2><small style="color:#64748b; font-weight:700;">REGISTRATIONS</small></div><div class="card glass-panel" style="border-top:3px solid #ef4444;"><h2>{active}</h2><small style="color:#64748b; font-weight:700;">ACTIVE THREATS</small></div><div class="card glass-panel" style="border-top:3px solid #3b82f6;"><h2>{resolved}</h2><small style="color:#64748b; font-weight:700;">CONTAINED</small></div></div><h2>🚨 Active Alarms Ledger</h2>{al_html or "<p style='color:#475569;'>No open alarms.</p>"}<h3>🗂️ Map Infrastructure</h3>{grouped_html or "<p style='color:#475569;'>Map unmapped.</p>"}</div></body></html>"""
+    return f"""<html><head><style>{CORE_CSS} body {{ display:block; padding:40px 20px; }} .box {{ max-width:900px; margin:0 auto; }} .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:15px; margin:20px 0; }} .card {{ padding:20px; text-align:center; }}</style></head><body><div class="box glass-panel" style="padding:30px;"><h2>📡 Global Command Dashboard</h2><div class="grid"><div class="card glass-panel" style="border-top:3px solid #10b981;"><h2>{total}</h2><small style="color:#64748b; font-weight:700;">REGISTRATIONS</small></div><div class="card glass-panel" style="border-top:3px solid #ef4444;"><h2>{active}</h2><small style="color:#64748b; font-weight:700;">ACTIVE THREATS</small></div><div class="card glass-panel" style="border-top:3px solid #3b82f6;"><h2>{resolved}</h2><small style="color:#64748b; font-weight:700;">CONTAINED</small></div></div><h2>🚨 Active Alarms Ledger</h2>{al_html or "<p style='color:#475569;'>No open alarms.</p>"}<h3>🗂️ Map Infrastructure & Central Approvals</h3>{grouped_html or "<p style='color:#475569;'>Map unmapped.</p>"}</div></body></html>"""
 @app.post("/incoming-alert")
 def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
     db = db_engine.load_db()
@@ -180,14 +193,23 @@ def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
     for num in targets: send_production_alert(num, txt)
     return Response(content="<Response></Response>", media_type="application/xml")
 
+@app.post("/admin/approve-farmer")
+def admin_direct_approve_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
+    """Allows administrators to directly approve members from the central master control desk layout."""
+    db_engine.approve_farmer_node(phone)
+    return RedirectResponse(url="/dashboard", status_code=303)
+
 @app.post("/delete-farmer")
 def handle_delete_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
     db_engine.remove_farmer(phone)
     return RedirectResponse(url="/dashboard", status_code=303)
+
+
 @app.post("/resolve-alert")
 def resolve_alert(alert_id: int = Form(...)):
     db_engine.update_incident_status(alert_id)
     return RedirectResponse(url="/dashboard", status_code=303)
+
 
 @app.get("/register", response_class=HTMLResponse)
 def registration_form():
@@ -227,15 +249,29 @@ def registration_form():
         document.getElementById("area_select").onchange = function() {{ toggleManual("area_select", "area_manual", "MANUAL"); }};
     </script></body></html>"""
 
+
 @app.post("/submit-registration")
-def handle_registration(name: str = Form(...), phone: str = Form(...), country: str = Form(...), state: str = Form(...), city: str = Form(...), lga: str = Form(...), area: str = Form(...), country_manual: str = Form(None), state_manual: str = Form(None), city_manual: str = Form(None), lga_manual: str = Form(None), area_manual: str = Form(None)):
+def handle_registration(name: str = Form(...), phone: str = Form(...), country: str = Form(...), state: str = Form(...),
+                        city: str = Form(...), lga: str = Form(...), area: str = Form(...),
+                        country_manual: str = Form(None), state_manual: str = Form(None), city_manual: str = Form(None),
+                        lga_manual: str = Form(None), area_manual: str = Form(None)):
+    is_custom = "MANUAL" in [country, state, city, lga, area]
     c = country_manual if country == "MANUAL" else country
     s = state_manual if state == "MANUAL" else state
     ci = city_manual if city == "MANUAL" else city
     lg = lga_manual if lga == "MANUAL" else lga
     ar = area_manual if area == "MANUAL" else area
+
     db = db_engine.load_db()
     clean_phone = db_engine.clean_phone_number(phone)
-    db["farmers"][clean_phone] = {"name": name, "country": c, "state": s, "city": ci, "lga": lg, "area": ar, "zone": lg, "status": "Pending"}
+    db["farmers"][clean_phone] = {"name": name, "country": c, "state": s, "city": ci, "lga": lg, "area": ar, "zone": lg,
+                                  "status": "Pending"}
     db_engine.save_db(db)
-    return HTMLResponse(content=f"""<html><body style="font-family:sans-serif; background:#020617; color:white; text-align:center; padding-top:100px;"><div class="glass-panel" style="display:inline-block; padding:40px; max-width:420px;"><h2 style="color:#eab308; margin-top:0;">⏳ Operational Node Active</h2><p style="color:#94a3b8;">Thank you, {name}. Your account is mapped under the <strong>{lg} Sector</strong>. Ask an active verified member inside your LGA to authenticate your node link.</p><a href="/" class="btn btn-emerald" style="margin-top:15px;">Back Home</a></div></body></html>""")
+
+    if is_custom:
+        webhook_payload = {
+            "text": f"🚧 *CUSTOM REGISTRATION RADAR*: New user *{name}* ({phone}) just signed up outside index map. Mapped Context: {c} -> {s} -> {lg}."}
+        send_admin_webhook(webhook_payload)
+
+    return HTMLResponse(
+        content=f"""<html><body style="font-family:sans-serif; background:#020617; color:white; text-align:center; padding-top:100px;"><div class="glass-panel" style="display:inline-block; padding:40px; max-width:420px;"><h2 style="color:#eab308; margin-top:0;">⏳ Operational Node Active</h2><p style="color:#94a3b8;">Thank you, {name}. Your account is mapped under the <strong>{lg} Sector</strong>. Your terminal registration is under administrative trace review.</p><a href="/" class="btn btn-emerald" style="margin-top:15px;">Back Home</a></div></body></html>""")
