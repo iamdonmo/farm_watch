@@ -5,9 +5,11 @@ from datetime import datetime
 # Absolute hard-locked path on your MacBook
 DB_FILE = "/Users/mackbook/Documents/farm watch/farmers_db.json"
 
+
 def clean_phone_number(phone: str) -> str:
     """Removes spaces, dashes, brackets, and formatting to normalize keys."""
     return phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace("whatsapp:", "")
+
 
 def initialize_db():
     """
@@ -17,7 +19,7 @@ def initialize_db():
     folder_path = os.path.dirname(DB_FILE)
     if not os.path.exists(folder_path):
         os.makedirs(folder_path, exist_ok=True)
-        
+
     if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
         # We start with a completely empty ledger framework
         blank_structure = {
@@ -25,8 +27,9 @@ def initialize_db():
             "alerts_log": []
         }
         with open(DB_FILE, "w") as f:
-            json.dump(blank_structure, f, indent=4)
-        print(f"🆕 Created a clean, permanent database file ledger at: {DB_FILE}")
+            json.dump(get_default_data(), f, indent=4)
+        print(f"🆕 Created a fresh masterfile layout straight at: {DB_FILE}")
+
 
 def load_db():
     """Pulls directly from your MacBook file disk with zero default overrides."""
@@ -34,11 +37,13 @@ def load_db():
     with open(DB_FILE, "r") as f:
         return json.load(f)
 
+
 def save_db(data):
     """Writes changes instantly and directly onto your MacBook disk file."""
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=4)
-    print(f"💾 [DISK UPDATE COMPLETE] Saved directly to: {DB_FILE}")
+    print(f"💾 [DISK STORAGE SECURED] Data hard-written straight to: {DB_FILE}")
+
 
 def remove_farmer(phone_number):
     db = load_db()
@@ -48,6 +53,7 @@ def remove_farmer(phone_number):
         save_db(db)
         return True
     return False
+
 
 def archive_incident(sender_name, zone, message, alert_type="Standard"):
     db = load_db()
@@ -63,6 +69,7 @@ def archive_incident(sender_name, zone, message, alert_type="Standard"):
     db["alerts_log"].append(incident_record)
     save_db(db)
     return incident_record
+
 
 def update_incident_status(alert_id, target_status="Resolved"):
     db = load_db()
