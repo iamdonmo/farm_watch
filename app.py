@@ -5,7 +5,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import database as db_engine
 
-app = FastAPI(title="Farm Watch Enterprise Node", version="3.2.0")
+app = FastAPI(title="Farm Watch Enterprise Node", version="3.3.0")
 security = HTTPBasic()
 db_engine.initialize_db()
 
@@ -13,8 +13,6 @@ ADMIN_USERNAME = "chief"
 ADMIN_PASSWORD = "securepassword123"
 ANDROID_GATEWAY_IP = "http://192.168.1.50:8080"
 ANDROID_API_TOKEN = "YOUR_ANDROID_APP_PASSWORD_OR_TOKEN"
-
-# 🔔 SYSTEM ADMINISTRATIVE ALERT WEBHOOK (Slack / Discord incoming URL layout channel)
 ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
 
 GLOBAL_GEO_DB = {
@@ -39,13 +37,23 @@ GLOBAL_GEO_DB = {
             "Iseyin": ["Iseyin-Okeogun Central", "Ado-Awaye Route", "Agrarian North"],
             "Saki": ["Saki West Grid", "Saki East Valley", "Oke-Ogun Boundary Ring"]
         }
-    },
-    "Ghana": {
-        "Greater Accra": {
-            "Accra Metropolitan": ["Osu Node", "Labadi Sector", "Jamestown"],
-            "Tema Metropolitan": ["Tema Community 1", "Tema Harbour"]
-        }
     }
+}
+
+# 🧠 INTELLIGENT AUTO-FILL INFERENCE ENGINE DATA
+CITY_AUTOFILL_MAP = {
+    "osogbo": {"country": "Nigeria", "state": "Osun", "lga": "Osogbo", "area": "Ataoja Sector"},
+    "ile-ife": {"country": "Nigeria", "state": "Osun", "lga": "Ile-Ife", "area": "Ife Central Town"},
+    "ife": {"country": "Nigeria", "state": "Osun", "lga": "Ile-Ife", "area": "Ife Central Town"},
+    "ilesa": {"country": "Nigeria", "state": "Osun", "lga": "Ilesa", "area": "Ilesa East Sector"},
+    "ede": {"country": "Nigeria", "state": "Osun", "lga": "Ede", "area": "Timi Market Node"},
+    "ibadan": {"country": "Nigeria", "state": "Oyo", "lga": "Ibadan", "area": "Ido Farming Grid"},
+    "ogbomoso": {"country": "Nigeria", "state": "Oyo", "lga": "Ogbomoso", "area": "Ogbomoso South Central"},
+    "iseyin": {"country": "Nigeria", "state": "Oyo", "lga": "Iseyin", "area": "Iseyin-Okeogun Central"},
+    "saki": {"country": "Nigeria", "state": "Oyo", "lga": "Saki", "area": "Saki West Grid"},
+    "ikeja": {"country": "Nigeria", "state": "Lagos", "lga": "Ikeja", "area": "Alausa"},
+    "lekki": {"country": "Nigeria", "state": "Lagos", "lga": "Lekki", "area": "Phase 1"},
+    "kano": {"country": "Nigeria", "state": "Kano", "lga": "Kano Municipal", "area": "Kano City Center"}
 }
 def mask_phone_number(phone: str) -> str:
     clean = str(phone).strip()
@@ -101,9 +109,8 @@ def farmer_authentication(phone: str = Form(...)):
     db = db_engine.load_db()
     clean_phone = db_engine.clean_phone_number(phone)
     if clean_phone in db["farmers"]:
-        # 🔒 ENHANCED RADAR LOCK: Refuse token generation entirely if account isn't approved yet
         if db["farmers"][clean_phone].get("status", "Pending") == "Pending":
-            return RedirectResponse(url="/portal/login?error=Access Restricted. Your application is still awaiting executive admin clearance.", status_code=303)
+            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting administrator review.", status_code=303)
         res = RedirectResponse(url="/portal/feed", status_code=303)
         res.set_cookie(key="farmer_session", value=clean_phone, max_age=2592000, httponly=True)
         return res
@@ -117,7 +124,7 @@ def farmer_feed_portal(current_user=Depends(get_current_farmer)):
     db = db_engine.load_db()
     feed_html = "".join([f'<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:14px; margin-bottom:10px; border-radius:10px;"><div style="display:flex; justify-content:space-between; font-size:11px; color:#64748b;"><span>⏱️ {i["timestamp"]}</span><span style="color:#ef4444; font-weight:800;">{i["status"]}</span></div><strong style="color:#f97316; font-size:13px;">[{i.get("type")}]</strong><span style="display:block; margin:4px 0; color:#e2e8f0;">"{i["message"]}"</span><span style="font-size:11px; color:#475569;">Origin: {i["sender"]} | Branch: {i.get("area","General")}</span></div>' for i in reversed(db["alerts_log"]) if i.get("lga") == lga])
     nb_html = "".join([f'<div style="background:rgba(59,130,246,0.03); padding:12px; margin-bottom:8px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;"><div><strong style="color:white; display:block;">{info["name"]}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:6px 12px; font-size:12px;">🤝 Verify</button></form></div>' for p, info in db["farmers"].items() if info.get("lga") == lga and info.get("status", "Pending") == "Pending" and p != f_phone])
-    return f"""<html><head><style>{CORE_CSS} body {{ display:block; padding:30px 20px; }} .container {{ max-width:800px; margin:0 auto; }}</style></head><body><div class="container glass-panel" style="padding:30px;"><div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:15px; margin-bottom:25px;"><div><h2 style="margin:0;">👨‍🌾 Node Terminal: {f_name}</h2><span style="background:rgba(16,185,129,0.1); color:#10b981; padding:3px 8px; border-radius:5px; font-size:11px; font-weight:700;">📍 Index: {country} / {state} / {lga} / {area}</span></div><a href="/portal/logout" class="btn" style="background:rgba(239,68,68,0.1); color:#f87171;">Disconnect</a></div><div style="display:grid; grid-template-columns:1fr; gap:25px;"><div style="background:rgba(239,68,68,0.02); border:1px solid rgba(239,68,68,0.1); padding:20px; border-radius:16px;">ux3>🚨 Broadcast Emergency</h3><form action="/portal/alert/raise" method="post" style="display:flex; flex-direction:column; gap:12px;"><select name="alert_type"><option value="Intruder Spotted">Intruder Spotted</option><option value="Critical Disaster">Critical Disaster</option><option value="Armed Attack">Armed Attack</option></select><input type="text" name="message" placeholder="Situation details..." required><button type="submit" class="btn btn-emerald">📡 Dispatch Alert Matrix</button></form></div><div><h3>🤝 Peer Authentication Desk</h3>{nb_html or "<p style='color:#475569; font-size:13px;'>Clear ring.</p>"}<h3>📡 Security Feed</h3>{feed_html or "<p style='color:#475569; font-size:13px;'>Quiet sector.</p>"}</div></div></div></body></html>"""
+    return f"""<html><head><style>{CORE_CSS} body {{ display:block; padding:30px 20px; }} .container {{ max-width:800px; margin:0 auto; }}</style></head><body><div class="container glass-panel" style="padding:30px;"><div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:15px; margin-bottom:25px;"><div><h2 style="margin:0;">👨‍🌾 Node Terminal: {f_name}</h2><span style="background:rgba(16,185,129,0.1); color:#10b981; padding:3px 8px; border-radius:5px; font-size:11px; font-weight:700;">📍 Index: {country} / {state} / {lga} / {area}</span></div><a href="/portal/logout" class="btn" style="background:rgba(239,68,68,0.1); color:#f87171;">Disconnect</a></div><div style="display:grid; grid-template-columns:1fr; gap:25px;"><div style="background:rgba(239,68,68,0.02); border:1px solid rgba(239,68,68,0.1); padding:20px; border-radius:16px;"><h3>🚨 Broadcast Emergency</h3><form action="/portal/alert/raise" method="post" style="display:flex; flex-direction:column; gap:12px;"><select name="alert_type"><option value="Intruder Spotted">Intruder Spotted</option><option value="Critical Disaster">Critical Disaster</option><option value="Armed Attack">Armed Attack</option></select><input type="text" name="message" placeholder="Situation details..." required><button type="submit" class="btn btn-emerald">📡 Dispatch Alert Matrix</button></form></div><div><h3>🤝 Peer Authentication Desk</h3>{nb_html or "<p style='color:#475569; font-size:13px;'>Clear ring.</p>"}<h3>📡 Security Feed</h3>{feed_html or "<p style='color:#475569; font-size:13px;'>Quiet sector.</p>"}</div></div></div></body></html>"""
 
 
 @app.post("/portal/alert/raise")
@@ -136,7 +143,12 @@ def farmer_raise_alert(alert_type: str = Form(...), message: str = Form(...), cu
                p != f_phone and data.get("status") == "Approved" and (override or data.get("lga") == d.get("lga"))]
     txt = f"ALERT [{alert_type.upper()}] from {f_name} ({d.get('lga')}): {message}"
     for num in targets: send_production_alert(num, txt)
-    return RedirectResponse(url="/portal/feed", status_code=303)
+
+    # 📡 THE BROADCAST SUCCESS LANDING PAGE INTERCEPTOR
+    return HTMLResponse(content=f"""<html><head><style>{CORE_CSS}</style></head><body><div class="glass-panel" style="padding:40px; text-align:center; max-width:450px;">
+        <div style="font-size:48px; margin-bottom:15px;">✅</div><h2 style="color:#10b981; margin:0 0 10px;">Broadcast Dispatched</h2>
+        <p style="color:#94a3b8; line-height:1.6; font-size:14px;">Your incident report has been securely transmitted across the <strong>{d.get('lga')} Lookout Grid</strong>. Neighbor alert protocols are active.</p>
+        <a href="/portal/feed" class="btn btn-blue" style="margin-top:20px; width:100%;">Return to Guard Station</a></div></body></html>""")
 
 
 @app.post("/portal/approve-node")
@@ -158,14 +170,10 @@ def admin_dashboard(username: str = Depends(authenticate_admin)):
     db = db_engine.load_db()
     total, active, resolved = len(db["farmers"]), sum(1 for i in db["alerts_log"] if i.get("status") == "Active"), sum(
         1 for i in db["alerts_log"] if i.get("status") == "Resolved")
-
-    # ⏳ CATEGORY 1: Dedicated Executive Pending Authorization Queue
     pending_html = ""
     for phone, m in db["farmers"].items():
         if m.get("status", "Pending") == "Pending":
-            pending_html += f'<div style="display:flex; justify-content:space-between; align-items:center; padding:12px; background:rgba(234,179,8,0.03); border:1px solid rgba(234,179,8,0.15); margin-bottom:6px; border-radius:8px;"><span>⏳ <strong>{m["name"]}</strong> <small style="color:#eab308;">({phone})</small><br><small style="color:#64748b;">Scope: {m.get("country")} → {m.get("lga")} ({m.get("area")})</small></span><div style="display:flex; gap:6px;"><form action="/admin/approve-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:#10b981; border:none; color:white; padding:5px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:700;">🤝 Approve Access</button></form><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:rgba(239,68,68,0.1); border:none; color:#f87171; padding:5px 10px; border-radius:4px; font-size:11px; cursor:pointer;">❌ Deny</button></form></div></div>'
-
-    # ✅ CATEGORY 2: Approved Active Node Grid Map
+            pending_html += f'<div style="display:flex; justify-content:space-between; align-items:center; padding:12px; background:rgba(234,179,8,0.03); border:1px solid rgba(234,179,8,0.15); margin-bottom:6px; border-radius:8px;"><span>⏳ <strong>{m["name"]}</strong> ({phone})<br><small style="color:#64748b;">MAPPED: {m.get("country")} -> {m.get("lga")} ({m.get("area")})</small></span><div style="display:flex; gap:6px;"><form action="/admin/approve-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:#10b981; border:none; color:white; padding:5px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:700;">Approve</button></form><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:rgba(239,68,68,0.1); border:none; color:#f87171; padding:5px 10px; border-radius:4px; font-size:11px; cursor:pointer;">Deny</button></form></div></div>'
     grouped_html, by_geo = "", {}
     for p, f in db["farmers"].items():
         if f.get("status") == "Approved":
@@ -218,62 +226,67 @@ def admin_direct_approve_farmer(phone: str = Form(...), username: str = Depends(
 def handle_delete_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
     db_engine.remove_farmer(phone)
     return RedirectResponse(url="/dashboard", status_code=303)
+
+
 @app.post("/resolve-alert")
 def resolve_alert(alert_id: int = Form(...)):
     db_engine.update_incident_status(alert_id)
     return RedirectResponse(url="/dashboard", status_code=303)
 
+
 @app.get("/register", response_class=HTMLResponse)
 def registration_form():
-    return f"""<html><head><style>{CORE_CSS} body{{display:flex; justify-content:center; align-items:center; min-height:100vh; padding:20px;}} .reg {{ max-width:400px; width:100%; }} label{{display:block; margin:10px 0 4px; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase;}} .manual-field {{ display: none; }}</style></head><body><div class="glass-panel reg" style="padding:35px;"><h2>Register Security Node</h2><form action="/submit-registration" method="post"><label>Name</label><input type="text" name="name" required><label>Phone</label><input type="text" name="phone" required><label>Country</label><select id="c_select" name="country" onchange="updateStates()"><option value="">-- Country --</option><option value="Nigeria">Nigeria</option><option value="Ghana">Ghana</option><option value="MANUAL">Other (Type Manually)</option></select><input type="text" id="c_manual" name="country_manual" class="manual-field" placeholder="Type Country..."><label>State</label><select id="s_select" name="state" onchange="updateCities()"><option value="">-- State --</option></select><input type="text" id="s_manual" name="state_manual" class="manual-field" placeholder="Type State..."><label>City</label><select id="city_select" name="city" onchange="updateLGAs()"><option value="">-- City --</option></select><input type="text" id="city_manual" name="city_manual" class="manual-field" placeholder="Type City..."><label>LGA</label><select id="lga_select" name="lga" onchange="updateAreas()"><option value="">-- LGA --</option></select><input type="text" id="lga_manual" name="lga_manual" class="manual-field" placeholder="Type LGA..."><label>Sector Area</label><select id="area_select" name="area"><option value="">-- Area --</option></select><input type="text" id="area_manual" name="area_manual" class="manual-field" placeholder="Type Area Sector..."><button type="submit" class="btn btn-emerald" style="width:100%; margin-top:15px;">Complete Request</button></form></div>
+    return f"""<html><head><style>{CORE_CSS} body{{display:flex; justify-content:center; align-items:center; min-height:100vh; padding:20px;}} .reg {{ max-width:400px; width:100%; }} label{{display:block; margin:10px 0 4px; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase;}} .manual-field {{ display: none; }}</style></head><body><div class="glass-panel reg" style="padding:35px;"><h2>Register Security Node</h2><p style="color:#64748b; font-size:12px; margin-top:-10px; margin-bottom:20px;">Provide dropdown data OR skip fields and just type your city below.</p><form action="/submit-registration" method="post"><label>Name</label><input type="text" name="name" required><label>Phone</label><input type="text" name="phone" required><label>City / Town (Smart Autofill Input)</label><input type="text" name="city_manual" placeholder="e.g. Osogbo or Ogbomoso" required><div style="border: 1px solid rgba(255,255,255,0.05); padding:10px; border-radius:8px; margin-bottom:15px;"><label style="margin:0 0 5px;">Optional Cascade Dropdowns</label><select id="c_select" name="country" onchange="updateStates()"><option value="">-- Country --</option><option value="Nigeria">Nigeria</option></select><select id="s_select" name="state" onchange="updateCities()"><option value="">-- State --</option></select><select id="city_select" name="city" onchange="updateLGAs()"><option value="">-- City --</option></select><select id="lga_select" name="lga" onchange="updateAreas()"><option value="">-- LGA --</option></select><select id="area_select" name="area"><option value="">-- Area --</option></select></div><button type="submit" class="btn btn-emerald" style="width:100%;">Complete Request</button></form></div>
     <script>
         const geoDb = {str(GLOBAL_GEO_DB)};
-        function toggleManual(selectId, manualId, checkValue) {{
-            const el = document.getElementById(selectId); const man = document.getElementById(manualId);
-            if(el.value === checkValue) {{ man.style.display = "block"; man.required = true; }} else {{ man.style.display = "none"; man.required = false; }}
-        }}
         function updateStates() {{
-            toggleManual("c_select", "c_manual", "MANUAL"); const c = document.getElementById("c_select").value; const s = document.getElementById("s_select");
+            const c = document.getElementById("c_select").value; const s = document.getElementById("s_select");
             s.innerHTML = '<option value="">-- State --</option>'; document.getElementById("city_select").innerHTML = '<option value="">-- City --</option>';
             document.getElementById("lga_select").innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>';
-            if(c === "MANUAL") {{ s.options.add(new Option("Type Manually", "MANUAL")); }}
-            if(c && geoDb[c]) {{ Object.keys(geoDb[c]).forEach(k => {{ s.options.add(new Option(k, k)); }}); s.options.add(new Option("Other", "MANUAL")); }}
+            if(c && geoDb[c]) {{ Object.keys(geoDb[c]).forEach(k => {{ s.options.add(new Option(k, k)); }}); }}
         }}
         function updateCities() {{
-            toggleManual("s_select", "s_manual", "MANUAL"); const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select");
+            const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select");
             city.innerHTML = '<option value="">-- City --</option>'; document.getElementById("lga_select").innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>';
-            if(s === "MANUAL") {{ city.options.add(new Option("Type Manually", "MANUAL")); }}
-            if(c && s && geoDb[c][s]) {{ Object.keys(geoDb[c][s]).forEach(k => {{ city.options.add(new Option(k, k)); }}); city.options.add(new Option("Other", "MANUAL")); }}
+            if(c && s && geoDb[c][s]) {{ Object.keys(geoDb[c][s]).forEach(k => {{ city.options.add(new Option(k, k)); }}); }}
         }}
         function updateLGAs() {{
-            toggleManual("city_select", "city_manual", "MANUAL"); const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select");
+            const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select");
             lga.innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>';
-            if(city === "MANUAL") {{ lga.options.add(new Option("Type Manually", "MANUAL")); }}
-            if(c && s && city && geoDb[c][s][city]) {{ Object.keys(geoDb[c][s][city]).forEach(k => {{ lga.options.add(new Option(k, k)); }}); lga.options.add(new Option("Other", "MANUAL")); }}
+            if(c && s && city && geoDb[c][s][city]) {{ Object.keys(geoDb[c][s][city]).forEach(k => {{ lga.options.add(new Option(k, k)); }}); }}
         }}
         function updateAreas() {{
-            toggleManual("lga_select", "lga_manual", "MANUAL"); const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select").value; const area = document.getElementById("area_select");
+            const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select").value; const area = document.getElementById("area_select");
             area.innerHTML = '<option value="">-- Area --</option>';
-            if(lga === "MANUAL") {{ area.options.add(new Option("Type Manually", "MANUAL")); toggleManual("area_select", "area_manual", "MANUAL"); }}
-            if(c && s && city && lga && geoDb[c][s][city][lga]) {{ geoDb[c][s][city][lga].forEach(v => {{ area.options.add(new Option(v, v)); }}); area.options.add(new Option("Other", "MANUAL")); }}
-            toggleManual("area_select", "area_manual", "MANUAL");
+            if(c && s && city && lga && geoDb[c][s][city][lga]) {{ geoDb[c][s][city][lga].forEach(v => {{ area.options.add(new Option(v, v)); }}); }}
         }}
-        document.getElementById("area_select").onchange = function() {{ toggleManual("area_select", "area_manual", "MANUAL"); }};
     </script></body></html>"""
 
+
 @app.post("/submit-registration")
-def handle_registration(name: str = Form(...), phone: str = Form(...), country: str = Form(...), state: str = Form(...), city: str = Form(...), lga: str = Form(...), area: str = Form(...), country_manual: str = Form(None), state_manual: str = Form(None), city_manual: str = Form(None), lga_manual: str = Form(None), area_manual: str = Form(None)):
-    is_custom = "MANUAL" in [country, state, city, lga, area]
-    c = country_manual if country == "MANUAL" else country
-    s = state_manual if state == "MANUAL" else state
-    ci = city_manual if city == "MANUAL" else city
-    lg = lga_manual if lga == "MANUAL" else lga
-    ar = area_manual if area == "MANUAL" else area
+def handle_registration(name: str = Form(...), phone: str = Form(...), city_manual: str = Form(...),
+                        country: str = Form(None), state: str = Form(None), city: str = Form(None),
+                        lga: str = Form(None), area: str = Form(None)):
+    lookup_token = city_manual.strip().lower()
+    if lookup_token in CITY_AUTOFILL_MAP:
+        geo = CITY_AUTOFILL_MAP[lookup_token]
+        c, s, ci, lg, ar = geo["country"], geo["state"], city_manual, geo["lga"], geo["area"]
+    else:
+        c = country if country else "Nigeria"
+        s = state if state else "Unknown Region"
+        ci = city_manual
+        lg = lga if lga else f"{city_manual} Sector"
+        ar = area if area else "General Farm Hub"
+
     db = db_engine.load_db()
     clean_phone = db_engine.clean_phone_number(phone)
-    db["farmers"][clean_phone] = {"name": name, "country": c, "state": s, "city": ci, "lga": lg, "area": ar, "zone": lg, "status": "Pending"}
+    db["farmers"][clean_phone] = {"name": name, "country": c, "state": s, "city": ci, "lga": lg, "area": ar, "zone": lg,
+                                  "status": "Pending"}
     db_engine.save_db(db)
-    if is_custom:
-        webhook_payload = {"text": f"🚧 *CUSTOM REGISTRATION RADAR*: New user *{name}* ({phone}) signed up outside index map. Context: {c} -> {s} -> {lg}."}
-        send_admin_webhook(webhook_payload)
-    return HTMLResponse(content=f"""<html><body style="font-family:sans-serif; background:#020617; color:white; text-align:center; padding-top:100px;"><div class="glass-panel" style="display:inline-block; padding:40px; max-width:420px;"><h2 style="color:#eab308; margin-top:0;">⏳ Operational Node Staged</h2><p style="color:#94a3b8;">Thank you, {name}. Your account is assigned under the <strong>{lg} Sector</strong>. Access keys will be generated automatically once your administrator trace review clears.</p><a href="/" class="btn btn-emerald" style="margin-top:15px;">Back Home</a></div></body></html>""")
+
+    if lookup_token not in CITY_AUTOFILL_MAP:
+        send_admin_webhook({
+                               "text": f"🚧 *UNMAPPED CITY ALERT*: *{name}* ({phone}) just registered using city text input: *{city_manual}*. Boundary parameters assigned defaults."})
+
+    return HTMLResponse(
+        content=f"""<html><body style="font-family:sans-serif; background:#020617; color:white; text-align:center; padding-top:100px;"><div class="glass-panel" style="display:inline-block; padding:40px; max-width:420px;"><h2 style="color:#eab308; margin-top:0;">⏳ Profile Mapped Successfully</h2><p style="color:#94a3b8;">Thank you, {name}. The system automatically mapped you to <strong>{lg}</strong> based on your city input. Awaiting administrator gateway clearance.</p><a href="/" class="btn btn-emerald" style="margin-top:15px;">Back Home</a></div></body></html>""")
