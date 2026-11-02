@@ -10,14 +10,15 @@ security = HTTPBasic()
 
 db_engine.initialize_db()
 
-# Set your secure administrative login credentials here!
-ADMIN_USERNAME = "chief"
-ADMIN_PASSWORD = "securepassword123"
+# ---------------------------------------------------------
+# 🔑 CUSTOM SECRET ADMINISTRATIVE CREDENTIALS
+# ---------------------------------------------------------
+ADMIN_USERNAME = "Admin"  # 👈 Change this to your custom username
+ADMIN_PASSWORD = "279901"  # 👈 Change this to your custom password
 
 # Local Android Gateway configuration properties
 ANDROID_GATEWAY_IP = "http://192.168.1.50:8080"
 ANDROID_API_TOKEN = "YOUR_ANDROID_APP_PASSWORD_OR_TOKEN"
-
 
 def send_production_alert(to_number: str, message_text: str):
     """Sends a wireless command packet to your local Android Phone to fire an SMS."""
@@ -44,7 +45,6 @@ def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic"},
         )
     return credentials.username
-
 
 @app.get("/", response_class=HTMLResponse)
 def community_homepage():
@@ -87,7 +87,14 @@ def admin_dashboard(username: str = Depends(authenticate_admin)):
     active_alerts_html = ""
     resolved_history_html = ""
     for idx, incident in enumerate(alerts_log):
-        badge_color = "#e74c3c" if incident.get("type") == "Critical" else "#e67e22"
+        # Color code the alert card badge dynamically based on threat selection category
+        if incident.get("type") in ["Critical Disaster", "Armed Attack"]:
+            badge_color = "#e74c3c"  # Bright Red for extreme critical events
+        elif incident.get("type") == "Intruder Spotted":
+            badge_color = "#e67e22"  # Orange for active security threat
+        else:
+            badge_color = "#f1c40f"  # Yellow for theft or asset damage
+
         if incident.get("status") == "Active":
             active_alerts_html += f'<div style="background:#fadbd8; border-left:5px solid {badge_color}; padding:15px; margin-bottom:12px; border-radius:4px; display:flex; justify-content:space-between; align-items:center;"><div><strong>🚨 [{incident.get("type")}] ({incident["zone"]}):</strong> "{incident["message"]}"<br><span style="font-size:12px; color:#555;">Reported by: {incident["sender"]}</span></div><form action="/resolve-alert" method="post" style="margin:0;"><input type="hidden" name="alert_id" value="{idx}"><button type="submit" style="background:#27ae60; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:bold;">⚡ Clear</button></form></div>'
         else:
@@ -114,45 +121,48 @@ def admin_dashboard(username: str = Depends(authenticate_admin)):
 
 @app.post("/incoming-alert")
 def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
-    # 🌟 THE PERMANENT FIX: Force-load the absolute freshest database snapshot from the disk file!
     db = db_engine.load_db()
-
     sender_number = db_engine.clean_phone_number(From.replace("whatsapp:", ""))
     alert_message = Body
 
-    # Search for the sender inside our fresh disk snapshot
     if sender_number not in db["farmers"]:
-        print(f"\n❌ [SECURITY REJECTED] Unknown lookup token key: '{sender_number}'")
+        print(f"\\n❌ [SECURITY REJECTED] Cleaned lookup token key missing from storage index: '{sender_number}'")
         return Response(content="<Response></Response>", media_type="application/xml")
 
     sender_name = db["farmers"][sender_number]["name"]
     sender_zone = db["farmers"][sender_number]["zone"]
 
-    # Intelligent emergency priority sorting
-    alert_type = "Standard"
+    # --- UPGRADED INTELLIGENT ALERTS CLASSIFICATION FILTER ---
+    alert_type = "General Threat"
     is_master_override = False
-    if any(k in alert_message.lower() for k in ["fire", "flood", "attack", "armed"]):
-        alert_type = "Critical"
-        is_master_override = True
+
+    msg_lower = alert_message.lower()
+    if "fire" in msg_lower or "flood" in msg_lower:
+        alert_type = "Critical Disaster"
+        is_master_override = True  # Fire & flood bypass all zone barriers instantly!
+    elif "thief" in msg_lower or "intruder" in msg_lower or "someone" in msg_lower or "stranger" in msg_lower:
+        alert_type = "Intruder Spotted"
+    elif "cow" in msg_lower or "cattle" in msg_lower or "goat" in msg_lower or "crop" in msg_lower:
+        alert_type = "Asset Damage"
+    elif "attack" in msg_lower or "armed" in msg_lower:
+        alert_type = "Armed Attack"
+        is_master_override = True  # High priority security threat overrides all zone filters
 
     db_engine.archive_incident(sender_name, sender_zone, alert_message, alert_type)
 
-    # Pull the neighbor lists from our fresh snapshot as well!
     neighbors_to_alert = []
     for number, data in db["farmers"].items():
         if number != sender_number:
             if is_master_override or data["zone"] == sender_zone:
                 neighbors_to_alert.append((number, data["name"]))
 
-    print(f"\n🚨 [AUTHORIZED TRIGGER ALERT] {sender_name} ({sender_zone}): '{alert_message}'")
+    print(f"\\n🚨 [AUTHORIZED ALERT LAYER: {alert_type.upper()}] {sender_name} ({sender_zone}): '{alert_message}'")
 
     if neighbors_to_alert:
         print(f"📡 [HARDWARE OUTBOX ROUTER SECTORS POPULATED]...")
-        broadcast_text = f"FARM WATCH ALERT from {sender_name} ({sender_zone}): {alert_message}"
+        broadcast_text = f"FARM WATCH ALERT [{alert_type.upper()}] from {sender_name} ({sender_zone}): {alert_message}"
         for neighbor_number, neighbor_name in neighbors_to_alert:
             print(f"   💬 Broadcast Target Node: {neighbor_name} ({neighbor_number})")
-
-            # This calls whichever paid Twilio function you have active
             send_production_alert(neighbor_number, broadcast_text)
 
     print("-" * 60)
@@ -176,7 +186,7 @@ def registration_form():
     return """
     <html><body style="font-family:sans-serif; background:#f4f7f6; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; padding:20px; box-sizing:border-box;">
         <div style="background:white; padding:30px; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.08); width:100%; max-width:360px;">
-            <h2>Register New Farm</h2>
+            <h2 style="color:#2c3e50; text-align:center; margin-top:0;">Register New Farm</h2>
             <form action="/submit-registration" method="post">
                 <label style="font-weight:bold; color:#34495e;">Farmer Name</label><input type="text" name="name" style="width:100%; padding:10px; margin:5px 0 15px 0; border:1px solid #ccc; border-radius:6px;" placeholder="Kwame" required><br>
                 <label style="font-weight:bold; color:#34495e;">Phone Number</label><input type="text" name="phone" style="width:100%; padding:10px; margin:5px 0 15px 0; border:1px solid #ccc; border-radius:6px;" placeholder="e.g. +2348030001111" required><br>
@@ -184,7 +194,7 @@ def registration_form():
                     <option value="Zone_North">Zone_North (Maize/Cocoa)</option>
                     <option value="Zone_South">Zone_South (Yam/Livestock)</option>
                 </select><br>
-                <button type="submit" style="width:100%; background:#27ae60; color:white; padding:12px; border:none; border-radius:6px; font-weight:bold; cursor:pointer;">Register</button>
+                <button type="submit" style="width:100%; background:#27ae60; color:white; padding:12px; border:none; border-radius:6px; font-weight:bold; cursor:pointer;">Complete Sign Up</button>
             </form>
         </div>
     </body></html>
@@ -193,31 +203,21 @@ def registration_form():
 
 @app.post("/submit-registration")
 def handle_registration(name: str = Form(...), phone: str = Form(...), zone: str = Form(...)):
-    # 1. Load the live database layout file straight from disk
     db = db_engine.load_db()
-
-    # 2. Normalize and format the input phone number string
     clean_phone = db_engine.clean_phone_number(phone)
-
-    # 3. Save the new profile data directly into the permanent "farmers" dictionary block
     db["farmers"][clean_phone] = {"name": name, "zone": zone}
-
-    # 4. Commit the composite updates right back onto your hard drive file disk
     db_engine.save_db(db)
 
-    print(
-        f"\n💾 [LIVE WEB REGISTRATION SUCCESS] {name} permanently saved into hard drive database mapping under {zone}.")
+    print(f"\\n💾 [WEB REGISTRATION SUCCESS] {name} added under {zone} with number: {clean_phone}")
 
-    # Render the public green validation page response layout card
     return HTMLResponse(content=f"""
     <html>
         <body style="font-family: sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; padding: 20px; box-sizing: border-box;">
-            <div style="background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); width: 100%; max-width: 400px; text-align: center;">
-                <h2 style="color: #27ae60; margin-top: 0;">✅ Registration Successful!</h2>
-                <p style="color: #34495e; line-height: 1.5;">Thank you, <strong>{name}</strong>. Your device has been successfully linked to the <strong>{zone}</strong> Security Watch Network.</p>
-                <hr style="border: 0; border-top: 1px solid #cbd5e1; margin: 20px 0;">
-                <a href="/" style="display: inline-block; background: #34495e; color: white; padding: 12px 20px; text-decoration: none; border-radius: 6px; font-weight: bold;">⬅️ Back to Homepage</a>
-            </div>
-        </body>
-    </html>
+    ✅ Registration Successful!
+    Thank you, {name}. Your device has been successfully linked to the {zone} Security Watch Network.
+
+    ⬅️ Back to Homepage
+
+
+
     """)
