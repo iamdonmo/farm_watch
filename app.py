@@ -99,10 +99,13 @@ CORE_CSS = """
 @app.get("/", response_class=HTMLResponse)
 def community_homepage():
     return f"""<html><head><style>{CORE_CSS}</style></head><body><div class="hero glass-panel" style="max-width: 500px; text-align: center; padding: 40px;"><h1>📡 Farm Watch Ecosystem</h1><p style="color: #94a3b8; margin-bottom: 30px;">Next-generation georeferenced multi-tenant network.</p><div style="display:flex; flex-direction:column; gap:12px;"><a href="/register" class="btn btn-emerald">➕ Register Operational Node</a><a href="/portal/login" class="btn btn-blue">👩‍🌾 Member Authentication Portal</a><a href="/dashboard" class="btn" style="background:rgba(255,255,255,0.03); color:#cbd5e1; border:1px solid rgba(255,255,255,0.1);">🖥️ Access Admin Control Center</a></div></div></body></html>"""
+
+
 @app.get("/portal/login", response_class=HTMLResponse)
 def farmer_login_page(error: str = None):
     err_box = f'<div style="color:#f87171; background:rgba(239,68,68,0.1); padding:10px; border-radius:6px; font-size:13px; margin-bottom:15px; font-weight:600;">⚠️ {error}</div>' if error else ""
     return f"""<html><head><style>{CORE_CSS}</style></head><body><div class="login-card glass-panel" style="padding:40px; width:100%; max-width:360px;"><h2>Member Login</h2>{err_box}<form action="/portal/auth" method="post"><label style="font-size:11px; color:#64748b; font-weight:700; display:block; margin-bottom:5px;">PHONE NUMBER</label><input type="text" name="phone" required><button type="submit" class="btn btn-blue" style="width: 100%;">Secure Sign In</button></form></div></body></html>"""
+
 
 @app.post("/portal/auth")
 def farmer_authentication(phone: str = Form(...)):
@@ -110,21 +113,57 @@ def farmer_authentication(phone: str = Form(...)):
     clean_phone = db_engine.clean_phone_number(phone)
     if clean_phone in db["farmers"]:
         if db["farmers"][clean_phone].get("status", "Pending") == "Pending":
-            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting administrator review.", status_code=303)
+            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting administrator review.",
+                                    status_code=303)
         res = RedirectResponse(url="/portal/feed", status_code=303)
         res.set_cookie(key="farmer_session", value=clean_phone, max_age=2592000, httponly=True)
         return res
     return RedirectResponse(url="/portal/login?error=Phone number not recognized.", status_code=303)
 
+
 @app.get("/portal/feed", response_class=HTMLResponse)
 def farmer_feed_portal(current_user=Depends(get_current_farmer)):
     if not current_user: return RedirectResponse(url="/portal/login?error=Session expired.", status_code=303)
     f_phone, f_name, d = current_user["phone"], current_user["data"]["name"], current_user["data"]
-    country, state, city, lga, area = d.get("country","?"), d.get("state","?"), d.get("city","?"), d.get("lga","?"), d.get("area","?")
+    country, state, city, lga, area = d.get("country", "?"), d.get("state", "?"), d.get("city", "?"), d.get("lga",
+                                                                                                            "?"), d.get(
+        "area", "?")
     db = db_engine.load_db()
-    feed_html = "".join([f'<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:14px; margin-bottom:10px; border-radius:10px;"><div style="display:flex; justify-content:space-between; font-size:11px; color:#64748b;"><span>⏱️ {i["timestamp"]}</span><span style="color:#ef4444; font-weight:800;">{i["status"]}</span></div><strong style="color:#f97316; font-size:13px;">[{i.get("type")}]</strong><span style="display:block; margin:4px 0; color:#e2e8f0;">"{i["message"]}"</span><span style="font-size:11px; color:#475569;">Origin: {i["sender"]} | Branch: {i.get("area","General")}</span></div>' for i in reversed(db["alerts_log"]) if i.get("lga") == lga])
-    nb_html = "".join([f'<div style="background:rgba(59,130,246,0.03); padding:12px; margin-bottom:8px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;"><div><strong style="color:white; display:block;">{info["name"]}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:6px 12px; font-size:12px;">🤝 Verify</button></form></div>' for p, info in db["farmers"].items() if info.get("lga") == lga and info.get("status", "Pending") == "Pending" and p != f_phone])
-    return f"""<html><head><style>{CORE_CSS} body {{ display:block; padding:30px 20px; }} .container {{ max-width:800px; margin:0 auto; }}</style></head><body><div class="container glass-panel" style="padding:30px;"><div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:15px; margin-bottom:25px;"><div><h2 style="margin:0;">👨‍🌾 Node Terminal: {f_name}</h2><span style="background:rgba(16,185,129,0.1); color:#10b981; padding:3px 8px; border-radius:5px; font-size:11px; font-weight:700;">📍 Index: {country} / {state} / {lga} / {area}</span></div><a href="/portal/logout" class="btn" style="background:rgba(239,68,68,0.1); color:#f87171;">Disconnect</a></div><div style="display:grid; grid-template-columns:1fr; gap:25px;"><div style="background:rgba(239,68,68,0.02); border:1px solid rgba(239,68,68,0.1); padding:20px; border-radius:16px;"><h3>🚨 Broadcast Emergency</h3><form action="/portal/alert/raise" method="post" style="display:flex; flex-direction:column; gap:12px;"><select name="alert_type"><option value="Intruder Spotted">Intruder Spotted</option><option value="Critical Disaster">Critical Disaster</option><option value="Armed Attack">Armed Attack</option></select><input type="text" name="message" placeholder="Situation details..." required><button type="submit" class="btn btn-emerald">📡 Dispatch Alert Matrix</button></form></div><div><h3>🤝 Peer Authentication Desk</h3>{nb_html or "<p style='color:#475569; font-size:13px;'>Clear ring.</p>"}<h3>📡 Security Feed</h3>{feed_html or "<p style='color:#475569; font-size:13px;'>Quiet sector.</p>"}</div></div></div></body></html>"""
+    feed_html = "".join([
+                            f'<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:14px; margin-bottom:10px; border-radius:10px;"><div style="display:flex; justify-content:space-between; font-size:11px; color:#64748b;"><span>⏱️ {i["timestamp"]}</span><span style="color:#ef4444; font-weight:800;">{i["status"]}</span></div><strong style="color:#f97316; font-size:13px;">[{i.get("type")}]</strong><span style="display:block; margin:4px 0; color:#e2e8f0;">"{i["message"]}"</span><span style="font-size:11px; color:#475569;">Origin: {i["sender"]} | Branch: {i.get("area", "General")}</span></div>'
+                            for i in reversed(db["alerts_log"]) if i.get("lga") == lga])
+    nb_html = "".join([
+                          f'<div style="background:rgba(59,130,246,0.03); padding:12px; margin-bottom:8px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;"><div><strong style="color:white; display:block;">{info["name"]}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:6px 12px; font-size:12px;">🤝 Verify</button></form></div>'
+                          for p, info in db["farmers"].items() if
+                          info.get("lga") == lga and info.get("status", "Pending") == "Pending" and p != f_phone])
+    return f"""<html><head><style>{CORE_CSS} body {{ display:block; padding:30px 20px; }} .container {{ max-width:800px; margin:0 auto; }}
+        @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+        .spinner {{ display: none; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: white; animation: spin 0.8s linear infinite; margin-right: 10px; }}
+    </style></head><body><div class="container glass-panel" style="padding:30px;"><div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:15px; margin-bottom:25px;"><div><h2 style="margin:0;">👨‍🌾 Node Terminal: {f_name}</h2><span style="background:rgba(16,185,129,0.1); color:#10b981; padding:3px 8px; border-radius:5px; font-size:11px; font-weight:700;">📍 Index: {country} / {state} / {lga} / {area}</span></div><a href="/portal/logout" class="btn" style="background:rgba(239,68,68,0.1); color:#f87171;">Disconnect</a></div><div style="display:grid; grid-template-columns:1fr; gap:25px;"><div style="background:rgba(239,68,68,0.02); border:1px solid rgba(239,68,68,0.1); padding:20px; border-radius:16px;"><h3>🚨 Broadcast Emergency</h3>
+
+    <form id="broadcast_form" action="/portal/alert/raise" method="post" onsubmit="handleBroadcastSubmit(event)" style="display:flex; flex-direction:column; gap:12px;">
+        <select name="alert_type"><option value="Intruder Spotted">Intruder Spotted</option><option value="Critical Disaster">Critical Disaster</option><option value="Armed Attack">Armed Attack</option></select>
+        <input type="text" name="message" placeholder="Situation details..." required>
+        <button type="submit" id="dispatch_btn" class="btn btn-emerald" style="display: inline-flex; align-items: center; justify-content: center;">
+            <div id="btn_spinner" class="spinner"></div>
+            <span id="btn_text">📡 Dispatch Alert Matrix</span>
+        </button>
+    </form>
+
+    </div><div><h3>🤝 Peer Authentication Desk</h3>{nb_html or "<p style='color:#475569; font-size:13px;'>Clear ring.</p>"}<h3>📡 Security Feed</h3>{feed_html or "<p style='color:#475569; font-size:13px;'>Quiet sector.</p>"}</div></div></div>
+    <script>
+        function handleBroadcastSubmit(e) {{
+            const btn = document.getElementById("dispatch_btn");
+            const spinner = document.getElementById("btn_spinner");
+            const text = document.getElementById("btn_text");
+
+            // Visual feedback loop updates instantly
+            btn.style.opacity = "0.7";
+            btn.style.pointerEvents = "none";
+            spinner.style.display = "inline-block";
+            text.innerText = "Transmitting Alert Grid Packet...";
+        }}
+    </script></body></html>"""
 
 
 @app.post("/portal/alert/raise")
