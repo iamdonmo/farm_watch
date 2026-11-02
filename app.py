@@ -13,8 +13,8 @@ db_engine.initialize_db()
 # ---------------------------------------------------------
 # 🔑 CUSTOM SECRET ADMINISTRATIVE CREDENTIALS
 # ---------------------------------------------------------
-ADMIN_USERNAME = "your_secret_username"  # 👈 Change this to your custom username
-ADMIN_PASSWORD = "your_secret_password"  # 👈 Change this to your custom password
+ADMIN_USERNAME = "admin"  # 👈 Change this to your custom username
+ADMIN_PASSWORD = "2799"  # 👈 Change this to your custom password
 
 # Local Android Gateway configuration properties
 ANDROID_GATEWAY_IP = "http://192.168.1.50:8080"
