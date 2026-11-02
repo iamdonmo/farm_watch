@@ -9,26 +9,38 @@ def clean_phone_number(phone: str) -> str:
     """Removes spaces, dashes, brackets, and formatting to normalize keys."""
     return phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
 
+def get_default_data():
+    """Returns the baseline structure for the database layout template."""
+    return {
+        "farmers": {
+            "+2348030001111": {"name": "Kofi", "zone": "Zone_North"},
+            "+2348030002222": {"name": "Amadi", "zone": "Zone_North"},
+            "+2348030003333": {"name": "Chidi", "zone": "Zone_North"},
+            "+2348030004444": {"name": "Musa", "zone": "Zone_South"},
+        },
+        "alerts_log": []
+    }
+
 def initialize_db():
-    """Seeds default testing farmers directly into your local JSON file if it doesn't exist."""
-    if not os.path.exists(DB_FILE):
-        initial_data = {
-            "farmers": {
-                "+2348030001111": {"name": "Kofi", "zone": "Zone_North"},
-                "+2348030002222": {"name": "Amadi", "zone": "Zone_North"},
-                "+2348030003333": {"name": "Chidi", "zone": "Zone_North"},
-                "+2348030004444": {"name": "Musa", "zone": "Zone_South"},
-            },
-            "alerts_log": []
-        }
+    """Seeds default testing farmers directly into your local JSON file if it doesn't exist or is empty."""
+    # Check if file is missing OR if it is completely empty (0 bytes)
+    if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
         with open(DB_FILE, "w") as f:
-            json.dump(initial_data, f, indent=4)
+            json.dump(get_default_data(), f, indent=4)
+        print("🆕 [DATABASE CREATED] Formatted a fresh fallback blueprint template onto disk storage.")
 
 def load_db():
-    """Forces the script to pull data straight from the physical hard drive file every time."""
+    """Pulls data from the physical hard drive file with built-in crash protection."""
     initialize_db()
-    with open(DB_FILE, "r") as f:
-        return json.load(f)
+    try:
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        # 🌟 CRASH PROTECTION LAYER: If the file exists but contains corrupted blank code, heal it instantly!
+        print("⚠️ [CORRUPT FILE DETECTED] Repairing empty json data matrix structures...")
+        fallback_data = get_default_data()
+        save_db(fallback_data)
+        return fallback_data
 
 def save_db(data):
     """Commits updates instantly into the physical hard drive json file."""
