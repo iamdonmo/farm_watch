@@ -2,34 +2,38 @@ import json
 import os
 from datetime import datetime
 
-# Absolute hard-locked path switch on your MacBook vs. Render Cloud
-IF_RENDER_CLOUD = "/data/farmers_db.json"
-IF_MACKBOOK_LOCAL = "/Users/mackbook/Documents/farm watch/farmers_db.json"
-
-DB_FILE = IF_RENDER_CLOUD if os.path.exists("/data") else IF_MACKBOOK_LOCAL
+# Automated environment detection switch
+if os.getenv("RENDER"):
+    DB_FILE = "render_farmers_db.json"
+else:
+    DB_FILE = "/Users/mackbook/Documents/farm watch/farmers_db.json"
 
 def clean_phone_number(phone: str) -> str:
     """Removes spaces, dashes, brackets, and formatting to normalize keys."""
     return phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace("whatsapp:", "")
 
 def get_default_data():
+    """Generates foundational members who are ALREADY approved to break the login loop!"""
     return {
         "farmers": {
-            "+2348030001111": {"name": "Kofi", "zone": "Zone_North", "status": "Approved"},
-            "+2348030002222": {"name": "Amadi", "zone": "Zone_North", "status": "Approved"},
-            "+2348030003333": {"name": "Chidi", "zone": "Zone_North", "status": "Approved"},
-            "+2348030004444": {"name": "Musa", "zone": "Zone_South", "status": "Approved"},
+            "2348030001111": {"name": "Kofi", "zone": "Zone_North", "status": "Approved"},
+            "2348030002222": {"name": "Amadi", "zone": "Zone_North", "status": "Approved"},
+            "2348030003333": {"name": "Chidi", "zone": "Zone_North", "status": "Approved"},
+            "2348030004444": {"name": "Musa", "zone": "Zone_South", "status": "Approved"},
         },
         "alerts_log": []
     }
 
 def initialize_db():
+    """Seeds the baseline network structure if the file is missing or corrupted."""
     folder_path = os.path.dirname(DB_FILE)
     if folder_path and not os.path.exists(folder_path):
         os.makedirs(folder_path, exist_ok=True)
+        
     if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
         with open(DB_FILE, "w") as f:
             json.dump(get_default_data(), f, indent=4)
+        print(f"🆕 [DATABASE ENGINE] Seeded structural file matrix at: {DB_FILE}")
 
 def load_db():
     initialize_db()
@@ -39,6 +43,7 @@ def load_db():
 def save_db(data):
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=4)
+    print(f"💾 [DISK UPDATE] Successfully saved data changes to: {DB_FILE}")
 
 def remove_farmer(phone_number):
     db = load_db()
@@ -50,7 +55,7 @@ def remove_farmer(phone_number):
     return False
 
 def approve_farmer_node(phone_number):
-    """Upgrades a pending farmer node to approved status once trusted by a neighbor."""
+    """Upgrades a pending farmer node to approved status."""
     db = load_db()
     clean_phone = clean_phone_number(phone_number)
     if clean_phone in db["farmers"]:
