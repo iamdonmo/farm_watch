@@ -417,3 +417,16 @@ def handle_registration(name: str = Form(...), phone: str = Form(...), zone: str
         </body>
     </html>
     """)
+@app.get("/admin/master-unlock")
+def master_unlock_all_farmers(username: str = Depends(authenticate_admin)):
+    """A master shortcut route that instantly approves every pending farmer on disk."""
+    db = db_engine.load_db()
+    unlocked_count = 0
+    
+    for phone in db["farmers"]:
+        if db["farmers"][phone].get("status") == "Pending":
+            db["farmers"][phone]["status"] = "Approved"
+            unlocked_count += 1
+            
+    db_engine.save_db(db)
+    return HTMLResponse(content=f"<h3>🔓 Master Unlock Complete! {unlocked_count} farmers have been permanently activated to 'Approved' status.</h3>")
