@@ -2,54 +2,45 @@ import json
 import os
 from datetime import datetime
 
-# Forces the application to target your exact hard drive json file path
-DB_FILE = "farmers_db.json"
+# Absolute hard-locked path on your MacBook
+DB_FILE = "/Users/mackbook/Documents/farm watch/farmers_db.json"
 
 def clean_phone_number(phone: str) -> str:
     """Removes spaces, dashes, brackets, and formatting to normalize keys."""
-    return phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-
-def get_default_data():
-    """Returns the baseline structure for the database layout template."""
-    return {
-        "farmers": {
-            "+2348030001111": {"name": "Kofi", "zone": "Zone_North"},
-            "+2348030002222": {"name": "Amadi", "zone": "Zone_North"},
-            "+2348030003333": {"name": "Chidi", "zone": "Zone_North"},
-            "+2348030004444": {"name": "Musa", "zone": "Zone_South"},
-        },
-        "alerts_log": []
-    }
+    return phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace("whatsapp:", "")
 
 def initialize_db():
-    """Seeds default testing farmers directly into your local JSON file if it doesn't exist or is empty."""
-    # Check if file is missing OR if it is completely empty (0 bytes)
+    """
+    Creates a clean, blank database framework ONLY if the file does not exist.
+    It no longer carries the starter numbers, so it will NEVER overwrite your edits!
+    """
+    folder_path = os.path.dirname(DB_FILE)
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path, exist_ok=True)
+        
     if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
+        # We start with a completely empty ledger framework
+        blank_structure = {
+            "farmers": {},
+            "alerts_log": []
+        }
         with open(DB_FILE, "w") as f:
-            json.dump(get_default_data(), f, indent=4)
-        print("🆕 [DATABASE CREATED] Formatted a fresh fallback blueprint template onto disk storage.")
+            json.dump(blank_structure, f, indent=4)
+        print(f"🆕 Created a clean, permanent database file ledger at: {DB_FILE}")
 
 def load_db():
-    """Pulls data from the physical hard drive file with built-in crash protection."""
+    """Pulls directly from your MacBook file disk with zero default overrides."""
     initialize_db()
-    try:
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        # 🌟 CRASH PROTECTION LAYER: If the file exists but contains corrupted blank code, heal it instantly!
-        print("⚠️ [CORRUPT FILE DETECTED] Repairing empty json data matrix structures...")
-        fallback_data = get_default_data()
-        save_db(fallback_data)
-        return fallback_data
+    with open(DB_FILE, "r") as f:
+        return json.load(f)
 
 def save_db(data):
-    """Commits updates instantly into the physical hard drive json file."""
+    """Writes changes instantly and directly onto your MacBook disk file."""
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=4)
-    print("💾 [DATABASE FILE SYNCED] Changes written successfully to farmers_db.json")
+    print(f"💾 [DISK UPDATE COMPLETE] Saved directly to: {DB_FILE}")
 
 def remove_farmer(phone_number):
-    """Safely erases a farmer from the json file mapping."""
     db = load_db()
     clean_phone = clean_phone_number(phone_number)
     if clean_phone in db["farmers"]:
@@ -59,7 +50,6 @@ def remove_farmer(phone_number):
     return False
 
 def archive_incident(sender_name, zone, message, alert_type="Standard"):
-    """Appends an operational threat record straight to the file timeline archive."""
     db = load_db()
     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     incident_record = {
@@ -75,7 +65,6 @@ def archive_incident(sender_name, zone, message, alert_type="Standard"):
     return incident_record
 
 def update_incident_status(alert_id, target_status="Resolved"):
-    """Updates active triage status variables inside the physical file."""
     db = load_db()
     if 0 <= alert_id < len(db["alerts_log"]):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
