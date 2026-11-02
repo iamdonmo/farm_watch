@@ -2,45 +2,43 @@ import json
 import os
 from datetime import datetime
 
-# 🌟 THE ABSOLUTE FIX: Force your machine to use ONE exact folder path on your MacBook!
-# This stops Python from reading and writing to different hidden directories.
+# Absolute hard-locked path on your MacBook
 DB_FILE = "/Users/mackbook/Documents/farm watch/farmers_db.json"
 
 def clean_phone_number(phone: str) -> str:
     """Removes spaces, dashes, brackets, and formatting to normalize keys."""
     return phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace("whatsapp:", "")
 
-def get_default_data():
-    return {
-        "farmers": {
-            "+2348030001111": {"name": "Kofi", "zone": "Zone_North"},
-            "+2348030002222": {"name": "Amadi", "zone": "Zone_North"},
-            "+2348030003333": {"name": "Chidi", "zone": "Zone_North"},
-            "+2348030004444": {"name": "Musa", "zone": "Zone_South"},
-        },
-        "alerts_log": []
-    }
-
 def initialize_db():
-    # Double-check that the target folder pathway actually exists on your Mac
+    """
+    Creates a clean, blank database framework ONLY if the file does not exist.
+    It no longer carries the starter numbers, so it will NEVER overwrite your edits!
+    """
     folder_path = os.path.dirname(DB_FILE)
     if not os.path.exists(folder_path):
         os.makedirs(folder_path, exist_ok=True)
         
     if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
+        # We start with a completely empty ledger framework
+        blank_structure = {
+            "farmers": {},
+            "alerts_log": []
+        }
         with open(DB_FILE, "w") as f:
-            json.dump(get_default_data(), f, indent=4)
-        print(f"🆕 Created a fresh master file layout straight at: {DB_FILE}")
+            json.dump(blank_structure, f, indent=4)
+        print(f"🆕 Created a clean, permanent database file ledger at: {DB_FILE}")
 
 def load_db():
+    """Pulls directly from your MacBook file disk with zero default overrides."""
     initialize_db()
     with open(DB_FILE, "r") as f:
         return json.load(f)
 
 def save_db(data):
+    """Writes changes instantly and directly onto your MacBook disk file."""
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=4)
-    print(f"💾 [DISK STORAGE SECURED] Data hard-written straight to: {DB_FILE}")
+    print(f"💾 [DISK UPDATE COMPLETE] Saved directly to: {DB_FILE}")
 
 def remove_farmer(phone_number):
     db = load_db()
