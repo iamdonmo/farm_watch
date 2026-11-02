@@ -19,4 +19,4 @@ def handle_registration(name: str = Form(...), phone: str = Form(...), zone: str
             </div>
         </body>
     </html>
-    """)
+    """) 
