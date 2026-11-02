@@ -4,7 +4,7 @@ from datetime import datetime
 
 # 🌟 THE ABSOLUTE FIX: Force your machine to use ONE exact folder path on your MacBook!
 # This stops Python from reading and writing to different hidden directories.
-DB_FILE = "/Users/mackbook/Documents/farm watch/farmers_db.json"
+DB_FILE = "/Users/mackbook/Documents/farm watch/farmers_db.json" 
 
 
 def clean_phone_number(phone: str) -> str:
