@@ -23,6 +23,18 @@ GLOBAL_GEO_DB = {
         "Lagos": {
             "Ikeja": ["Alausa", "Oregun", "Computer Village"],
             "Lekki": ["Phase 1", "Ikate", "Chevron Node"]
+        },
+        "Osun": {
+            "Osogbo": ["Olorunda Central", "Capital Hub Ring", "Ataoja Sector"],
+            "Ile-Ife": ["Ife Central Town", "Modakeke Border", "University Outpost"],
+            "Ilesa": ["Ilesa East Sector", "Ilesa West Farm Ring", "Ijebu-Jesa Road"],
+            "Ede": ["Ede South Agrarian", "Timi Market Node", "Federal Poly Outskirt"]
+        },
+        "Oyo": {
+            "Ibadan": ["Ido Farming Grid", "Oluyole Frontier", "Lagelu Outpost Area"],
+            "Ogbomoso": ["Ogbomoso North LAUTECH", "Ogbomoso South Central", "Ajawa Sector"],
+            "Iseyin": ["Iseyin-Okeogun Central", "Ado-Awaye Route", "Agrarian North"],
+            "Saki": ["Saki West Grid", "Saki East Valley", "Oke-Ogun Boundary Ring"]
         }
     },
     "Ghana": {
@@ -65,7 +77,7 @@ CORE_CSS = """
     .btn { display: inline-flex; align-items: center; justify-content: center; padding: 12px 24px; border-radius: 12px; font-weight: 700; text-decoration: none; cursor: pointer; border: none; transition: 0.2s; font-size: 14px; text-align: center; }
     .btn-emerald { background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; }
     .btn-blue { background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); color: white; }
-    input, select { width:100%; padding:11px; background:#020617; border:1px solid rgba(255,255,255,0.1); color:white; border-radius:8px; box-sizing:border-box; margin-bottom:15px; }
+    input, select { width:100%; padding:11px; background:#020617; border: 1px solid rgba(255,255,255,0.1); color:white; border-radius:8px; box-sizing:border-box; margin-bottom:15px; }
 """
 
 @app.get("/", response_class=HTMLResponse)
@@ -139,7 +151,7 @@ def admin_dashboard(username: str = Depends(authenticate_admin)):
         m_list = "".join([f'<li style="display:flex; justify-content:space-between; padding:8px; background:rgba(255,255,255,0.01); margin-bottom:4px; border-radius:4px;"><span>👤 <strong>{m["name"]}</strong> ({m.get("area")}) <small style="color:#64748b;">{phone}</small></span><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:none; border:none; color:#ef4444; cursor:pointer;">❌</button></form></li>' for phone, m in members])
         grouped_html += f'<div style="margin-bottom:15px; border-left:3px solid #3b82f6; padding-left:10px;"><h4 style="margin:0 0 6px; color:#38bdf8; font-size:12px; text-transform:uppercase;">🗺️ {path}</h4><ul style="padding:0; margin:0; list-style:none;">{m_list}</ul></div>'
     al_html = "".join([f'<div style="background:rgba(239,68,68,0.03); border:1px solid rgba(239,68,68,0.1); padding:12px; margin-bottom:8px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;"><div><strong>🚨 {i["type"]} ({i.get("lga")}):</strong> "{i["message"]}"</div><form action="/resolve-alert" method="post" style="margin:0;"><input type="hidden" name="alert_id" value="{idx}"><button type="submit" class="btn" style="background:#10b981; color:white; padding:4px 10px; font-size:11px;">Clear</button></form></div>' for idx, i in enumerate(db["alerts_log"]) if i.get("status") == "Active"])
-    return f"""<html><head><style>{CORE_CSS} body {{ display:block; padding:40px 20px; }} .box {{ max-width:900px; margin:0 auto; }} .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:15px; margin:20px 0; }} .card {{ padding:20px; text-align:center; }}</style></head><body><div class="box glass-panel" style="padding:30px;"><h2>📡 Global Command Dashboard</h2><div class="grid"><div class="card glass-panel" style="border-top:3px solid #10b981;"><h2>{total}</h2><small style="color:#64748b; font-weight:700;">REGISTRATIONS</small></div><div class="card glass-panel" style="border-top:3px solid #ef4444;"><h2>{active}</h2><small style="color:#64748b; font-weight:700;">ACTIVE THREATS</small></div><div class="card glass-panel" style="border-top:3px solid #3b82f6;"><h2>{resolved}</h2><small style="color:#64748b; font-weight:700;">CONTAINED</small></div></div><h3>🚨 Active Alarms Ledger</h3>{al_html or "<p style='color:#475569;'>No open alarms.</p>"}<h3>🗂️ Map Infrastructure</h3>{grouped_html or "<p style='color:#475569;'>Map unmapped.</p>"}</div></body></html>"""
+    return f"""<html><head><style>{CORE_CSS} body {{ display:block; padding:40px 20px; }} .box {{ max-width:900px; margin:0 auto; }} .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:15px; margin:20px 0; }} .card {{ padding:20px; text-align:center; }}</style></head><body><div class="box glass-panel" style="padding:30px;"><h2>📡 Global Command Dashboard</h2><div class="grid"><div class="card glass-panel" style="border-top:3px solid #10b981;"><h2>{total}</h2><small style="color:#64748b; font-weight:700;">REGISTRATIONS</small></div><div class="card glass-panel" style="border-top:3px solid #ef4444;"><h2>{active}</h2><small style="color:#64748b; font-weight:700;">ACTIVE THREATS</small></div><div class="card glass-panel" style="border-top:3px solid #3b82f6;"><h2>{resolved}</h2><small style="color:#64748b; font-weight:700;">CONTAINED</small></div></div><h2>🚨 Active Alarms Ledger</h2>{al_html or "<p style='color:#475569;'>No open alarms.</p>"}<h3>🗂️ Map Infrastructure</h3>{grouped_html or "<p style='color:#475569;'>Map unmapped.</p>"}</div></body></html>"""
 @app.post("/incoming-alert")
 def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
     db = db_engine.load_db()
@@ -179,36 +191,51 @@ def resolve_alert(alert_id: int = Form(...)):
 
 @app.get("/register", response_class=HTMLResponse)
 def registration_form():
-    return f"""<html><head><style>{CORE_CSS} body{{display:flex; justify-content:center; align-items:center; min-height:100vh; padding:20px;}} .reg {{ max-width:400px; width:100%; }} label{{display:block; margin:10px 0 4px; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase;}}</style></head><body><div class="glass-panel reg" style="padding:35px;"><h2>Register Security Node</h2><form action="/submit-registration" method="post"><label>Name</label><input type="text" name="name" required><label>Phone</label><input type="text" name="phone" required><label>Country</label><select id="c_select" name="country" onchange="updateStates()"><option value="">-- Country --</option><option value="Nigeria">Nigeria</option><option value="Ghana">Ghana</option></select><label>State</label><select id="s_select" name="state" onchange="updateCities()"><option value="">-- State --</option></select><label>City</label><select id="city_select" name="city" onchange="updateLGAs()"><option value="">-- City --</option></select><label>LGA</label><select id="lga_select" name="lga" onchange="updateAreas()"><option value="">-- LGA --</option></select><label>Sector Area</label><select id="area_select" name="area"><option value="">-- Area --</option></select><button type="submit" class="btn btn-emerald" style="width:100%; margin-top:15px;">Complete Request</button></form></div>
+    return f"""<html><head><style>{CORE_CSS} body{{display:flex; justify-content:center; align-items:center; min-height:100vh; padding:20px;}} .reg {{ max-width:400px; width:100%; }} label{{display:block; margin:10px 0 4px; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase;}} .manual-field {{ display: none; }}</style></head><body><div class="glass-panel reg" style="padding:35px;"><h2>Register Security Node</h2><form action="/submit-registration" method="post"><label>Name</label><input type="text" name="name" required><label>Phone</label><input type="text" name="phone" required><label>Country</label><select id="c_select" name="country" onchange="updateStates()"><option value="">-- Country --</option><option value="Nigeria">Nigeria</option><option value="Ghana">Ghana</option><option value="MANUAL">Other (Type Manually)</option></select><input type="text" id="c_manual" name="country_manual" class="manual-field" placeholder="Type Country..."><label>State</label><select id="s_select" name="state" onchange="updateCities()"><option value="">-- State --</option></select><input type="text" id="s_manual" name="state_manual" class="manual-field" placeholder="Type State..."><label>City / Town</label><select id="city_select" name="city" onchange="updateLGAs()"><option value="">-- City --</option></select><input type="text" id="city_manual" name="city_manual" class="manual-field" placeholder="Type City..."><label>LGA / District</label><select id="lga_select" name="lga" onchange="updateAreas()"><option value="">-- LGA --</option></select><input type="text" id="lga_manual" name="lga_manual" class="manual-field" placeholder="Type LGA..."><label>Sector Area</label><select id="area_select" name="area"><option value="">-- Area --</option></select><input type="text" id="area_manual" name="area_manual" class="manual-field" placeholder="Type Area Sector..."><button type="submit" class="btn btn-emerald" style="width:100%; margin-top:15px;">Complete Request</button></form></div>
     <script>
         const geoDb = {str(GLOBAL_GEO_DB)};
+        function toggleManual(selectId, manualId, checkValue) {{
+            const el = document.getElementById(selectId); const man = document.getElementById(manualId);
+            if(el.value === checkValue) {{ man.style.display = "block"; man.required = true; }} else {{ man.style.display = "none"; man.required = false; }}
+        }}
         function updateStates() {{
-            const c = document.getElementById("c_select").value; const s = document.getElementById("s_select");
+            toggleManual("c_select", "c_manual", "MANUAL"); const c = document.getElementById("c_select").value; const s = document.getElementById("s_select");
             s.innerHTML = '<option value="">-- State --</option>'; document.getElementById("city_select").innerHTML = '<option value="">-- City --</option>';
             document.getElementById("lga_select").innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>';
-            if(c && geoDb[c]) {{ Object.keys(geoDb[c]).forEach(k => {{ s.options.add(new Option(k, k)); }}); }}
+            if(c === "MANUAL") {{ s.options.add(new Option("Type Manually", "MANUAL")); }}
+            if(c && geoDb[c]) {{ Object.keys(geoDb[c]).forEach(k => {{ s.options.add(new Option(k, k)); }}); s.options.add(new Option("Other", "MANUAL")); }}
         }}
         function updateCities() {{
-            const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select");
+            toggleManual("s_select", "s_manual", "MANUAL"); const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select");
             city.innerHTML = '<option value="">-- City --</option>'; document.getElementById("lga_select").innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>';
-            if(c && s && geoDb[c][s]) {{ Object.keys(geoDb[c][s]).forEach(k => {{ city.options.add(new Option(k, k)); }}); }}
+            if(s === "MANUAL") {{ city.options.add(new Option("Type Manually", "MANUAL")); }}
+            if(c && s && geoDb[c][s]) {{ Object.keys(geoDb[c][s]).forEach(k => {{ city.options.add(new Option(k, k)); }}); city.options.add(new Option("Other", "MANUAL")); }}
         }}
         function updateLGAs() {{
-            const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select");
+            toggleManual("city_select", "city_manual", "MANUAL"); const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select");
             lga.innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>';
-            if(c && s && city && geoDb[c][s][city]) {{ Object.keys(geoDb[c][s][city]).forEach(k => {{ lga.options.add(new Option(k, k)); }}); }}
+            if(city === "MANUAL") {{ lga.options.add(new Option("Type Manually", "MANUAL")); }}
+            if(c && s && city && geoDb[c][s][city]) {{ Object.keys(geoDb[c][s][city]).forEach(k => {{ lga.options.add(new Option(k, k)); }}); lga.options.add(new Option("Other", "MANUAL")); }}
         }}
         function updateAreas() {{
-            const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select").value; const area = document.getElementById("area_select");
+            toggleManual("lga_select", "lga_manual", "MANUAL"); const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select").value; const area = document.getElementById("area_select");
             area.innerHTML = '<option value="">-- Area --</option>';
-            if(c && s && city && lga && geoDb[c][s][city][lga]) {{ geoDb[c][s][city][lga].forEach(v => {{ area.options.add(new Option(v, v)); }}); }}
+            if(lga === "MANUAL") {{ area.options.add(new Option("Type Manually", "MANUAL")); toggleManual("area_select", "area_manual", "MANUAL"); }}
+            if(c && s && city && lga && geoDb[c][s][city][lga]) {{ geoDb[c][s][city][lga].forEach(v => {{ area.options.add(new Option(v, v)); }}); area.options.add(new Option("Other", "MANUAL")); }}
+            toggleManual("area_select", "area_manual", "MANUAL");
         }}
+        document.getElementById("area_select").onchange = function() {{ toggleManual("area_select", "area_manual", "MANUAL"); }};
     </script></body></html>"""
 
 @app.post("/submit-registration")
-def handle_registration(name: str = Form(...), phone: str = Form(...), country: str = Form(...), state: str = Form(...), city: str = Form(...), lga: str = Form(...), area: str = Form(...)):
+def handle_registration(name: str = Form(...), phone: str = Form(...), country: str = Form(...), state: str = Form(...), city: str = Form(...), lga: str = Form(...), area: str = Form(...), country_manual: str = Form(None), state_manual: str = Form(None), city_manual: str = Form(None), lga_manual: str = Form(None), area_manual: str = Form(None)):
+    c = country_manual if country == "MANUAL" else country
+    s = state_manual if state == "MANUAL" else state
+    ci = city_manual if city == "MANUAL" else city
+    lg = lga_manual if lga == "MANUAL" else lga
+    ar = area_manual if area == "MANUAL" else area
     db = db_engine.load_db()
     clean_phone = db_engine.clean_phone_number(phone)
-    db["farmers"][clean_phone] = {"name": name, "country": country, "state": state, "city": city, "lga": lga, "area": area, "zone": lga, "status": "Pending"}
+    db["farmers"][clean_phone] = {"name": name, "country": c, "state": s, "city": ci, "lga": lg, "area": ar, "zone": lg, "status": "Pending"}
     db_engine.save_db(db)
-    return HTMLResponse(content=f"""<html><body style="font-family:sans-serif; background:#020617; color:white; text-align:center; padding-top:100px;"><div class="glass-panel" style="display:inline-block; padding:40px; max-width:420px;"><h2 style="color:#eab308; margin-top:0;">⏳ Operational Node Active</h2><p style="color:#94a3b8;">Thank you, {name}. Your account is assigned under the <strong>{lga} Sector</strong>. Ask an active verified member inside your LGA district to authenticate your device.</p><a href="/" class="btn btn-emerald" style="margin-top:15px;">Back Home</a></div></body></html>""")
+    return HTMLResponse(content=f"""<html><body style="font-family:sans-serif; background:#020617; color:white; text-align:center; padding-top:100px;"><div class="glass-panel" style="display:inline-block; padding:40px; max-width:420px;"><h2 style="color:#eab308; margin-top:0;">⏳ Operational Node Active</h2><p style="color:#94a3b8;">Thank you, {name}. Your account is mapped under the <strong>{lg} Sector</strong>. Ask an active verified member inside your LGA to authenticate your node link.</p><a href="/" class="btn btn-emerald" style="margin-top:15px;">Back Home</a></div></body></html>""")
