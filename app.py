@@ -112,10 +112,13 @@ CORE_CSS = """
 @app.get("/", response_class=HTMLResponse)
 def community_homepage():
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="hero glass-panel" style="max-width: 550px; text-align: center; padding: 40px 30px;"><h1>📡 Farm Watch Ecosystem</h1><p style="color: #94a3b8; margin-bottom: 30px; line-height: 1.6; font-size: 15px;">Next-generation georeferenced multi-tenant protection network protecting local smallholder livelihoods.</p><div style="display:flex; flex-direction:column; gap:14px;"><a href="/register" class="btn btn-emerald">➕ Register Operational Node</a><a href="/portal/login" class="btn btn-blue">👩‍🌾 Member Authentication Portal</a><a href="/dashboard" class="btn" style="background:rgba(255,255,255,0.03); color:#cbd5e1; border:1px solid rgba(255,255,255,0.1);">🖥️ Access Admin Control Center</a></div></div></body></html>"""
+
+
 @app.get("/portal/login", response_class=HTMLResponse)
 def farmer_login_page(error: str = None):
     err_box = f'<div style="color:#f87171; background:rgba(239,68,68,0.1); padding:12px; border-radius:8px; font-size:13px; margin-bottom:20px; font-weight:600; border: 1px solid rgba(239,68,68,0.15);">⚠️ {error}</div>' if error else ""
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="login-card glass-panel" style="padding:40px 25px; width:100%; max-width:380px;"><h2>Member Login</h2>{err_box}<form action="/portal/auth" method="post"><label style="font-size:11px; color:#64748b; font-weight:700; display:block; margin-bottom:6px; letter-spacing: 0.5px;">PHONE NUMBER</label><input type="text" name="phone" placeholder="e.g. 23480..." required><button type="submit" class="btn btn-blue" style="width: 100%;">Secure Sign In</button></form></div></body></html>"""
+
 
 @app.post("/portal/auth")
 def farmer_authentication(phone: str = Form(...)):
@@ -123,22 +126,87 @@ def farmer_authentication(phone: str = Form(...)):
     clean_phone = db_engine.clean_phone_number(phone)
     if clean_phone in db["farmers"]:
         if db["farmers"][clean_phone].get("status", "Pending") == "Pending":
-            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting administrator review.", status_code=303)
+            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting administrator review.",
+                                    status_code=303)
         res = RedirectResponse(url="/portal/feed", status_code=303)
         res.set_cookie(key="farmer_session", value=clean_phone, max_age=2592000, httponly=True)
         return res
     return RedirectResponse(url="/portal/login?error=Phone number not recognized.", status_code=303)
 
+
 @app.get("/portal/feed", response_class=HTMLResponse)
 def farmer_feed_portal(current_user=Depends(get_current_farmer)):
     if not current_user: return RedirectResponse(url="/portal/login?error=Session expired.", status_code=303)
     f_phone, f_name, d = current_user["phone"], current_user["data"]["name"], current_user["data"]
-    country, state, city, lga, area = d.get("country","?"), d.get("state","?"), d.get("city","?"), d.get("lga","?"), d.get("area","?")
+    country, state, city, lga, area = d.get("country", "?"), d.get("state", "?"), d.get("city", "?"), d.get("lga",
+                                                                                                            "?"), d.get(
+        "area", "?")
     db = db_engine.load_db()
-    nb_html = "".join([f'<div style="background:rgba(59,130,246,0.03); padding:14px; margin-bottom:8px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; gap:10px;"><div><strong style="color:white; display:block; font-size:14px;">{info["name"]}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:8px 14px; font-size:12px; border-radius:6px;">Verify</button></form></div>' for p, info in db["farmers"].items() if info.get("lga") == lga and info.get("status", "Pending") == "Pending" and p != f_phone])
-    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS} body {{ display:block; padding:15px; }} .container {{ max-width:950px; margin:0 auto; width:100%; }} @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }} .spinner {{ display: none; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: white; animation: spin 0.8s linear infinite; margin-right: 10px; }}</style></head><body><div class="container glass-panel" style="padding:25px 20px;"><div style="display:flex; justify-content:space-between; align-items:flex-start; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:20px; margin-bottom:25px; flex-wrap:wrap; gap:15px;"><div><h2 style="margin:0; font-size:20px;">👨‍🌾 Node Terminal: {f_name}</h2><span style="background:rgba(16,185,129,0.1); color:#10b981; padding:4px 8px; border-radius:6px; font-size:12px; font-weight:700; display:inline-block; margin-top:5px;">📍 Index: {country} / {state} / {lga} / {area}</span></div><a href="/portal/logout" class="btn" style="background:rgba(239,68,68,0.1); color:#f87171; padding:8px 16px; font-size:13px;">Disconnect</a></div><div class="responsive-grid"><div style="background:rgba(239,68,68,0.02); border:1px solid rgba(239,68,68,0.1); padding:20px; border-radius:16px; height:fit-content;"><h3 style="margin-top:0;">🚨 Broadcast Emergency</h3><form id="broadcast_form" action="/portal/alert/raise" method="post" onsubmit="handleBroadcastSubmit(event)" style="display:flex; flex-direction:column; gap:12px; margin:0;"><select name="alert_type"><option value="Intruder Spotted">Intruder Spotted</option><option value="Critical Disaster">Critical Disaster</option><option value="Armed Attack">Armed Attack</option></select><input type="text" name="message" placeholder="Situation details..." required><button type="submit" id="dispatch_btn" class="btn btn-emerald" style="display: inline-flex; align-items: center; justify-content: center; width:100%;"><div id="btn_spinner" class="spinner"></div><span id="btn_text">📡 Dispatch Alert Matrix</span></button></form></div><div><h3 style="margin-top:0;">🤝 Peer Authentication Desk</h3>{nb_html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>Clear ring.</p>"}<h3 style="margin-top:20px;">📡 Live Security Feed (<span style="color:#10b981; font-weight:bold;">● Live Auto-Sync</span>)</h3><div id="live_stream_container"><p style="color:#64748b; font-size:13px; font-style:italic;">Initializing connection matrix...</p></div></div></div></div>
+    nb_html = "".join([
+                          f'<div style="background:rgba(59,130,246,0.03); padding:14px; margin-bottom:8px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; gap:10px;"><div><strong style="color:white; display:block; font-size:14px;">{info["name"]}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:8px 14px; font-size:12px; border-radius:6px;">Verify</button></form></div>'
+                          for p, info in db["farmers"].items() if
+                          info.get("lga") == lga and info.get("status", "Pending") == "Pending" and p != f_phone])
+    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS} body {{ display:block; padding:15px; }} .container {{ max-width:950px; margin:0 auto; width:100%; }} @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }} .spinner {{ display: none; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: white; animation: spin 0.8s linear infinite; margin-right: 10px; }}</style></head><body>
+
+    <div id="main_terminal_container" class="container glass-panel" style="padding:25px 20px;">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:20px; margin-bottom:25px; flex-wrap:wrap; gap:15px;">
+            <div><h2 style="margin:0; font-size:20px;">👨‍🌾 Node Terminal: {f_name}</h2><span style="background:rgba(16,185,129,0.1); color:#10b981; padding:4px 8px; border-radius:6px; font-size:12px; font-weight:700; display:inline-block; margin-top:5px;">📍 Index: {country} / {state} / {lga} / {area}</span></div>
+            <a href="/portal/logout" class="btn" style="background:rgba(239,68,68,0.1); color:#f87171; padding:8px 16px; font-size:13px;">Disconnect</a>
+        </div>
+        <div class="responsive-grid">
+            <div style="background:rgba(239,68,68,0.02); border:1px solid rgba(239,68,68,0.1); padding:20px; border-radius:16px; height:fit-content;">
+                <h3 style="margin-top:0;">🚨 Broadcast Emergency</h3>
+                <form id="broadcast_form" method="post" onsubmit="handleBroadcastSubmit(event)" style="display:flex; flex-direction:column; gap:12px; margin:0;">
+                    <select id="alert_type" name="alert_type"><option value="Intruder Spotted">Intruder Spotted</option><option value="Critical Disaster">Critical Disaster</option><option value="Armed Attack">Armed Attack</option></select>
+                    <input type="text" id="message" name="message" placeholder="Situation details..." required>
+                    <button type="submit" id="dispatch_btn" class="btn btn-emerald" style="display: inline-flex; align-items: center; justify-content: center; width:100%;">
+                        <div id="btn_spinner" class="spinner"></div>
+                        <span id="btn_text">📡 Dispatch Alert Matrix</span>
+                    </button>
+                </form>
+            </div>
+            <div>
+                <h3 style="margin-top:0;">🤝 Peer Authentication Desk</h3>{nb_html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>Clear ring.</p>"}
+                <h3 style="margin-top:20px;">📡 Live Security Feed (<span style="color:#10b981; font-weight:bold;">● Live Auto-Sync</span>)</h3>
+                <div id="live_stream_container"><p style="color:#64748b; font-size:13px; font-style:italic;">Initializing connection matrix...</p></div>
+            </div>
+        </div>
+    </div>
+
     <script>
-        function handleBroadcastSubmit(e){{const b=document.getElementById("dispatch_btn");const s=document.getElementById("btn_spinner");const t=document.getElementById("btn_text");b.style.opacity="0.7";b.style.pointerEvents="none";s.style.display="inline-block";t.innerText="Transmitting Alert Grid...";}}
+        function handleBroadcastSubmit(e) {{
+            e.preventDefault();
+            const btn = document.getElementById("dispatch_btn");
+            const spinner = document.getElementById("btn_spinner");
+            const text = document.getElementById("btn_text");
+            const type = document.getElementById("alert_type").value;
+            const msg = document.getElementById("message").value;
+
+            // 1. Instant loading feedback loop trigger
+            btn.style.opacity = "0.7";
+            btn.style.pointerEvents = "none";
+            spinner.style.display = "inline-block";
+            text.innerText = "Transmitting Alert Grid...";
+
+            // 2. Dispatch background AJAX request immediately
+            const formData = new FormData();
+            formData.append("alert_type", type);
+            formData.append("message", msg);
+            fetch("/portal/alert/raise", {{ method: "POST", body: formData }});
+
+            // 3. Force stop rolling after exactly 3000ms and swap layouts seamlessly
+            setTimeout(() => {{
+                document.getElementById("main_terminal_container").innerHTML = `
+                    <div style="padding:40px 25px; text-align:center; max-width:450px; margin: 40px auto; width:100%;" class="glass-panel">
+                        <div style="font-size:48px; margin-bottom:15px;">✅</div>
+                        <h2 style="color:#10b981; margin:0 0 10px;">Broadcast Dispatched</h2>
+                        <p style="color:#94a3b8; line-height:1.6; font-size:14px;">Your incident report has been securely transmitted across the <strong>{lga} Lookout Grid</strong>.</p>
+                        <a href="/portal/feed" class="btn btn-blue" style="margin-top:20px; width:100%;">Return to Guard Station</a>
+                    </div>
+                `;
+            }}, 3000);
+        }}
+
         async function fetchLiveFeedStream() {{
             try {{
                 const res = await fetch("/portal/feed/stream");
@@ -148,10 +216,11 @@ def farmer_feed_portal(current_user=Depends(get_current_farmer)):
                 }}
             }} catch(err) {{}}
         }}
-        // Secure background loop queries state alterations seamlessly every 2000ms
         setInterval(fetchLiveFeedStream, 2000);
         fetchLiveFeedStream();
     </script></body></html>"""
+
+
 @app.get("/portal/feed/stream")
 def portal_async_feed_stream(current_user=Depends(get_current_farmer)):
     """Background high-performance engine that returns HTML fragments securely without refreshing the client browser."""
