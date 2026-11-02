@@ -1,6 +1,6 @@
 import secrets
 import requests
-from fastapi import FastAPI, Form, Response, Depends, HTTPException, status
+from fastapi import FastAPI, Form, Response, Depends, HTTPException, status, Cookie
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import database as db_engine
@@ -35,7 +35,7 @@ def send_production_alert(to_number: str, message_text: str):
     return False
 
 def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    """Locks the dashboard panel behind HTTP Basic Authentication."""
+    """Locks the central master control panel behind admin credentials."""
     is_correct_username = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
     is_correct_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
     if not (is_correct_username and is_correct_password):
@@ -46,36 +46,47 @@ def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
-
+def get_current_farmer(farmer_session: str = Cookie(None)):
+    """Validates the browser cookie to check if a farmer is currently logged in."""
+    if not farmer_session:
+        return None
+    db = db_engine.load_db()
+    clean_phone = db_engine.clean_phone_number(farmer_session)
+    if clean_phone in db["farmers"]:
+        return {"phone": clean_phone, "data": db["farmers"][clean_phone]}
+    return None
 @app.get("/", response_class=HTMLResponse)
 def community_homepage():
-    """Renders a visual, responsive landing portal homepage for the root domain URL."""
+    """Renders a responsive, dark-themed welcome dashboard gateway portal."""
     return """
     <html>
         <head>
             <title>Farm Watch - Security Network</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style>
-                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: linear-gradient(135deg, #111827 0%, #1f2937 100%); color: white; margin: 0; padding: 0; display: flex; justify-content: center; align-items: center; min-height: 100vh; box-sizing: border-box; }
-                .hero-container { background: rgba(255, 255, 255, 0.03); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); padding: 40px; border-radius: 24px; max-width: 600px; width: 100%; text-align: center; box-sizing: border-box; }
-                h1 { font-size: 38px; margin-top: 0; font-weight: 800; letter-spacing: -1px; color: #fff; }
+                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: linear-gradient(135deg, #0b0f19 0%, #111827 100%); color: white; margin: 0; padding: 0; display: flex; justify-content: center; align-items: center; min-height: 100vh; box-sizing: border-box; }
+                .hero-container { background: #111827; border: 1px solid rgba(255, 255, 255, 0.05); padding: 40px; border-radius: 24px; max-width: 600px; width: 100%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+                h1 { font-size: 36px; margin-top: 0; font-weight: 800; }
                 h1 span { color: #10b981; }
                 p.tagline { font-size: 16px; color: #9ca3af; margin-bottom: 35px; line-height: 1.6; }
                 .action-box { display: flex; flex-direction: column; gap: 15px; }
                 .btn { display: block; padding: 16px; text-decoration: none; font-weight: 700; font-size: 16px; border-radius: 12px; transition: all 0.2s; text-align: center; }
                 .btn-register { background: #10b981; color: white; }
                 .btn-register:hover { background: #059669; transform: translateY(-2px); }
-                .btn-dashboard { background: rgba(255, 255, 255, 0.05); color: white; border: 1px solid rgba(255,255,255,0.2); }
+                .btn-portal { background: #3b82f6; color: white; }
+                .btn-portal:hover { background: #2563eb; transform: translateY(-2px); }
+                .btn-dashboard { background: rgba(255, 255, 255, 0.05); color: white; border: 1px solid rgba(255,255,255,0.1); }
                 .btn-dashboard:hover { background: rgba(255, 255, 255, 0.1); transform: translateY(-2px); }
-                .footer { margin-top: 30px; font-size: 12px; color: #4b5563; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
+                .footer { margin-top: 30px; font-size: 11px; color: #4b5563; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; }
             </style>
         </head>
         <body>
             <div class="hero-container">
-                <h1>📡 <span>Farm Watch</span> Central</h1>
-                <p class="tagline">Protecting our fields together. An automated, community-driven lookout network safeguarding local smallholder agricultural livelihoods.</p>
+                <h1>📡 <span>Farm Watch</span> Ecosystem</h1>
+                <p class="tagline">Protecting our fields together. An automated lookout grid safeguarding local smallholder agricultural livelihoods.</p>
                 <div class="action-box">
-                    <a href="/register" class="btn btn-register">➕ Join Network (Register Farm)</a>
+                    <a href="/register" class="btn btn-register">➕ Join Network (New Farm)</a>
+                    <a href="/portal/login" class="btn btn-portal">👩‍🌾 Enter Farmer Member Portal</a>
                     <a href="/dashboard" class="btn btn-dashboard">🖥️ Access Admin Control Center</a>
                 </div>
                 <div class="footer">Ecosystem Node Guard Active</div>
@@ -84,10 +95,159 @@ def community_homepage():
     </html>
     """
 
+@app.get("/portal/login", response_class=HTMLResponse)
+def farmer_login_page(error: str = None):
+    """Renders the secure member authentication form card for internet-enabled farmers."""
+    error_msg = f'<p style="color:#ef4444; background:rgba(239,68,68,0.1); padding:10px; border-radius:6px; text-align:center; font-size:14px; font-weight:700;">⚠️ {error}</p>' if error else ""
+    return f"""
+    <html>
+        <head><title>Farmer Login</title><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+        <body style="font-family:sans-serif; background-color:#0b0f19; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; padding:20px; box-sizing:border-box; color:white;">
+            <div style="background:#111827; border:1px solid rgba(255,255,255,0.05); padding:35px; border-radius:20px; width:100%; max-width:360px; box-shadow:0 20px 40px rgba(0,0,0,0.4);">
+                <h2 style="text-align:center; margin-top:0; font-weight:800;">Member Login</h2>
+                {error_msg}
+                <form action="/portal/auth" method="post">
+                    <label style="display:block; margin-bottom:8px; font-size:12px; font-weight:700; color:#9ca3af; text-transform:uppercase;">Registered Phone Number</label>
+                    <input type="text" name="phone" style="width:100%; padding:12px; margin-bottom:20px; border:1px solid rgba(255,255,255,0.1); border-radius:10px; color:white; background:#1f2937;" placeholder="e.g. +234803..." required><br>
+                    <button type="submit" style="width:100%; background:#3b82f6; color:white; padding:14px; border:none; border-radius:10px; font-size:16px; font-weight:700; cursor:pointer;">Secure Sign In</button>
+                </form>
+                <div style="text-align:center; margin-top:20px;"><a href="/" style="color:#9ca3af; text-decoration:none; font-size:14px;">⬅️ Return Home</a></div>
+            </div>
+        </body>
+    </html>
+    """
+
+@app.post("/portal/auth")
+def farmer_authentication(phone: str = Form(...)):
+    """Verifies member exists and handles session cookie injection routing."""
+    db = db_engine.load_db()
+    clean_phone = db_engine.clean_phone_number(phone)
+    if clean_phone in db["farmers"]:
+        response = RedirectResponse(url="/portal/feed", status_code=303)
+        # Sets a tracking cookie session value valid for a rolling 30-day window
+        response.set_cookie(key="farmer_session", value=clean_phone, max_age=2592000, httponly=True)
+        return response
+    return RedirectResponse(url="/portal/login?error=Phone number not recognized on network index.", status_code=303)
+
+
+@app.get("/portal/feed", response_class=HTMLResponse)
+def farmer_feed_portal(current_user=Depends(get_current_farmer)):
+    """Renders the secure internal look-out stream customized for the active logged-in farmer."""
+    if not current_user:
+        return RedirectResponse(url="/portal/login?error=Session expired. Please sign in again.", status_code=303)
+
+    farmer_phone = current_user["phone"]
+    farmer_name = current_user["data"]["name"]
+    farmer_zone = current_user["data"]["zone"]
+    farmer_status = current_user["data"].get("status", "Pending")
+
+    db = db_engine.load_db()
+    farmers = db["farmers"]
+    alerts_log = db["alerts_log"]
+
+    # 🌟 GATE CHECK: If a user is still pending approval, display a clean safety alert notice
+    if farmer_status == "Pending":
+        return f"""
+        <html><body style="font-family:sans-serif; background:#0b0f19; color:white; display:flex; justify-content:center; align-items:center; height:100vh; padding:20px; box-sizing:border-box;">
+            <div style="background:#111827; border:1px solid rgba(234,179,8,0.2); padding:35px; border-radius:20px; max-width:450px; text-align:center;">
+                <h2 style="color:#eab308; margin-top:0; font-weight:800;">⏳ Node Connection Pending</h2>
+                <p style="color:#9ca3af; line-height:1.6;">Hello <strong>{farmer_name}</strong>. Your profile has been added, but to protect against rogue entries, you must have an existing approved neighbor in <strong>{farmer_zone}</strong> log into their portal and verify your device node.</p>
+                <hr style="border:0; border-top:1px solid rgba(255,255,255,0.05); margin:20px 0;">
+                <a href="/" style="display:inline-block; background:rgba(255,255,255,0.05); color:white; padding:10px 20px; text-decoration:none; border-radius:8px; font-weight:700;">Logout / Exit</a>
+            </div>
+        </body></html>"""
+
+    # 1. GENERATE REGIONAL FEED: Filter logs so farmers only see data matching their specific zone sector
+    sector_feed_html = ""
+    for item in reversed(alerts_log):
+        if item["zone"] == farmer_zone:
+            badge_color = "#ef4444" if item.get("type") in ["Critical Disaster",
+                                                            "Armed Attack"] else "#f97316" if item.get(
+                "type") == "Intruder Spotted" else "#eab308"
+            status_text = "🚨 ACTIVE THREAT" if item.get("status") == "Active" else "🟢 RESOLVED / CLEAR"
+            status_style = f"color:{badge_color};" if item.get("status") == "Active" else "color:#10b981;"
+
+            sector_feed_html += f"""
+            <div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:16px; margin-bottom:12px; border-radius:12px;">
+                <div style="display:flex; justify-content:space-between; font-size:11px; color:#6b7280; margin-bottom:6px;">
+                    <span>⏱️ {item['timestamp']}</span>
+                    <span style="{status_style} font-weight:800; text-transform:uppercase;">{status_text}</span>
+                </div>
+                <strong style="color:{badge_color}; font-size:13px; text-transform:uppercase;">[{item.get('type')}]</strong>
+                <span style="font-size:15px; color:#f3f4f6; display:block; margin:6px 0;">"{item['message']}"</span>
+                <span style="font-size:12px; color:#4b5563;">Broadcast Node Origin: {item['sender']}</span>
+            </div>"""
+
+    # 2. GENERATE DESK PENDING LIST: Find brand-new neighbors inside this same zone waiting for verification
+    pending_neighbors_html = ""
+    for phone, info in farmers.items():
+        if info["zone"] == farmer_zone and info.get("status", "Pending") == "Pending" and phone != farmer_phone:
+            pending_neighbors_html += f"""
+            <div style="background:rgba(59,130,246,0.05); border:1px solid rgba(59,130,246,0.2); padding:14px; margin-bottom:10px; border-radius:10px; display:flex; justify-content:space-between; align-items:center;">
+                <div>
+                    <strong style="color:#fff; display:block;">{info['name']}</strong>
+                    <span style="font-size:12px; color:#9ca3af;">{phone}</span>
+                </div>
+                <form action="/portal/approve-node" method="post" style="margin:0;">
+                    <input type="hidden" name="target_phone" value="{phone}">
+                    <button type="submit" style="background:#3b82f6; color:white; border:none; padding:8px 12px; border-radius:6px; cursor:pointer; font-weight:700; font-size:13px;">🤝 Verify Neighbor</button>
+                </form>
+            </div>"""
+
+    return f"""
+    <html>
+        <head><title>Farmer Lookout Room</title><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+        <body style="font-family:sans-serif; background:#0b0f19; color:#e2e8f0; padding:20px; margin:0;">
+            <div style="max-width:800px; margin:0 auto; background:#111827; border:1px solid rgba(255,255,255,0.05); padding:25px; border-radius:20px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:15px; margin-bottom:25px;">
+                    <div>
+                        <h1 style="font-size:24px; color:#fff; margin:0;">👨‍🌾 {farmer_name}'s Guard Station</h1>
+                        <span style="color:#10b981; font-weight:700; font-size:13px;">🛰️ Sector Sync Channel: {farmer_zone}</span>
+                    </div>
+                    <a href="/portal/logout" style="color:#9ca3af; font-size:13px; text-decoration:none; background:rgba(255,255,255,0.03); padding:6px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.05);">Exit Station</a>
+                </div>
+
+                <div style="display:grid; grid-template-columns:1fr; gap:20px;">
+                    <div>
+                        <h3 style="margin-top:0; border-left:4px solid #3b82f6; padding-left:10px; color:#fff;">🤝 Neighbor Trust Verification Desk</h3>
+                        <p style="font-size:13px; color:#9ca3af; margin-bottom:15px;">Approve new regional signups here to authorize their emergency text privileges.</p>
+                        {pending_neighbors_html or "<p style='color:#6b7280; font-style:italic; font-size:13px;'>No pending authentication files found for this zone.</p>"}
+                    </div>
+
+                    <hr style="border:0; border-top:1px solid rgba(255,255,255,0.05); margin:10px 0;">
+
+                    <div>
+                        <h3 style="margin-top:0; border-left:4px solid #10b981; padding-left:10px; color:#fff;">📡 Live Regional Security Incident Feed</h3>
+                        {sector_feed_html or "<p style='color:#6b7280; font-style:italic; font-size:13px;'>All sectors reporting fully quiet.</p>"}
+                    </div>
+                </div>
+            </div>
+        </body>
+    </html>
+    """
+
+
+@app.post("/portal/approve-node")
+def handle_node_approval(target_phone: str = Form(...), current_user=Depends(get_current_farmer)):
+    """Processes dynamic neighborhood token confirmations over verified channels."""
+    if not current_user:
+        return RedirectResponse(url="/portal/login", status_code=303)
+    db_engine.approve_farmer_node(target_phone)
+    print(f"\n🤝 [NEIGHBOR NODE AUTHENTICATED] Verified by team lead member session.")
+    return RedirectResponse(url="/portal/feed", status_code=303)
+
+
+@app.get("/portal/logout")
+def handle_member_logout():
+    """Wipes browser runtime memory session cookies and forces a graceful redirect home."""
+    response = RedirectResponse(url="/", status_code=303)
+    response.delete_cookie(key="farmer_session")
+    return response
+
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def admin_dashboard(username: str = Depends(authenticate_admin)):
-    """Displays active registered farmers, stats meters, triage modules, and case archives."""
+    """Displays comprehensive multi-node matrix maps for global control center heads."""
     db = db_engine.load_db()
     farmers = db["farmers"]
     alerts_log = db["alerts_log"]
@@ -103,113 +263,34 @@ def admin_dashboard(username: str = Depends(authenticate_admin)):
     north_zone_html = ""
     for phone, info in farmers.items():
         if info['zone'] == "Zone_North":
-            honor_score = sum(
-                1 for a in alerts_log if a.get("sender") == info["name"] and a.get("status") == "Resolved")
-            stars = "⭐" * min(honor_score + 1, 5)
-            north_zone_html += f'<li style="margin-bottom:12px; background:rgba(255,255,255,0.02); padding:12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; border:1px solid rgba(255,255,255,0.03);"><div><span style="font-weight:700; color:#f3f4f6;">{info["name"]}</span> <span style="font-size:12px;">{stars}</span><br><span style="font-size:12px; color:#9ca3af;">{phone}</span></div><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:none; border:none; color:#f87171; cursor:pointer; font-weight:700;">❌ Remove</button></form></li>'
+            badge_lbl = f"<span style='color:#10b981; font-size:11px;'>[Approved]</span>" if info.get("status",
+                                                                                                      "Pending") == "Approved" else f"<span style='color:#eab308; font-size:11px;'>[Pending Approval]</span>"
+            north_zone_html += f'<li style="margin-bottom:12px; background:rgba(255,255,255,0.02); padding:12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;"><div><strong>{info["name"]}</strong> {badge_lbl}<br><span style="font-size:12px; color:#9ca3af;">{phone}</span></div><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:none; border:none; color:#f87171; cursor:pointer; font-weight:700;">❌ Remove</button></form></li>'
 
     south_zone_html = ""
     for phone, info in farmers.items():
         if info['zone'] == "Zone_South":
-            honor_score = sum(
-                1 for a in alerts_log if a.get("sender") == info["name"] and a.get("status") == "Resolved")
-            stars = "⭐" * min(honor_score + 1, 5)
-            south_zone_html += f'<li style="margin-bottom:12px; background:rgba(255,255,255,0.02); padding:12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; border:1px solid rgba(255,255,255,0.03);"><div><span style="font-weight:700; color:#f3f4f6;">{info["name"]}</span> <span style="font-size:12px;">{stars}</span><br><span style="font-size:12px; color:#9ca3af;">{phone}</span></div><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:none; border:none; color:#f87171; cursor:pointer; font-weight:700;">❌ Remove</button></form></li>'
+            badge_lbl = f"<span style='color:#10b981; font-size:11px;'>[Approved]</span>" if info.get("status",
+                                                                                                      "Pending") == "Approved" else f"<span style='color:#eab308; font-size:11px;'>[Pending Approval]</span>"
+            south_zone_html += f'<li style="margin-bottom:12px; background:rgba(255,255,255,0.02); padding:12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center;"><div><strong>{info["name"]}</strong> {badge_lbl}<br><span style="font-size:12px; color:#9ca3af;">{phone}</span></div><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:none; border:none; color:#f87171; cursor:pointer; font-weight:700;">❌ Remove</button></form></li>'
+
     active_alerts_html = ""
     resolved_history_html = ""
-
     for idx, incident in enumerate(alerts_log):
-        if incident.get("type") in ["Critical Disaster", "Armed Attack"]:
-            badge_color = "#ef4444"
-            bg_color = "rgba(239, 68, 68, 0.15)"
-            border_color = "rgba(239, 68, 68, 0.4)"
-        elif incident.get("type") == "Intruder Spotted":
-            badge_color = "#f97316"
-            bg_color = "rgba(249, 115, 22, 0.1)"
-            border_color = "rgba(249, 115, 22, 0.3)"
-        else:
-            badge_color = "#eab308"
-            bg_color = "rgba(234, 179, 8, 0.05)"
-            border_color = "rgba(234, 179, 8, 0.2)"
-
+        badge_color = "#ef4444" if incident.get("type") in ["Critical Disaster",
+                                                            "Armed Attack"] else "#f97316" if incident.get(
+            "type") == "Intruder Spotted" else "#eab308"
         if incident.get("status") == "Active":
-            active_alerts_html += f'<div style="background:{bg_color}; border:1px solid {border_color}; border-left:6px solid {badge_color}; padding:16px; margin-bottom:14px; border-radius:12px; display:flex; justify-content:space-between; align-items:center;"><div><div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;"><span style="background:{badge_color}; color:white; font-size:10px; font-weight:800; padding:3px 8px; border-radius:20px; text-transform:uppercase;">{incident.get("type")}</span><span style="font-size:11px; color:#9ca3af;">⏱️ {incident["timestamp"]}</span></div><span style="font-size:15px; color:#f3f4f6; font-weight:600; display:block; margin:6px 0;">"{incident["message"]}"</span><span style="font-size:12px; color:#6b7280;">Node: <strong>{incident["sender"]} ({incident["zone"]})</strong></span></div><form action="/resolve-alert" method="post" style="margin:0;"><input type="hidden" name="alert_id" value="{idx}"><button type="submit" style="background:#10b981; color:white; border:none; padding:10px 16px; border-radius:8px; cursor:pointer; font-weight:700; font-size:14px;">⚡ Clear Case</button></form></div>'
+            active_alerts_html += f'<div style="background:rgba(255,255,255,0.02); border-left:5px solid {badge_color}; padding:15px; margin-bottom:12px; border-radius:4px; display:flex; justify-content:space-between; align-items:center;"><div><strong>🚨 [{incident.get("type")}] ({incident["zone"]}):</strong> "{incident["message"]}"<br><span style="font-size:12px; color:#9ca3af;">Origin: {incident["sender"]}</span></div><form action="/resolve-alert" method="post" style="margin:0;"><input type="hidden" name="alert_id" value="{idx}"><button type="submit" style="background:#10b981; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:700;">⚡ Clear Case</button></form></div>'
         else:
-            resolved_history_html += f'<div style="background:rgba(255,255,255,0.01); border:1px solid rgba(255,255,255,0.05); border-left:4px solid #4b5563; padding:12px; margin-bottom:10px; border-radius:8px; font-size:13px; color:#9ca3af;"><span style="font-size:11px; color:#4b5563; float:right;">✅ Closed</span><strong>🔒 Archive Case #{idx} [{incident["zone"]}]:</strong> "{incident["message"]}" <br><span style="font-size:11px; color:#4b5563;">Reported by: {incident["sender"]}</span></div>'
+            resolved_history_html += f'<div style="background:rgba(255,255,255,0.01); border-left:4px solid #4b5563; padding:10px; margin-bottom:8px; border-radius:4px; font-size:12px; color:#9ca3af;"><strong>⚠️ Closed [{incident["zone"]}]:</strong> "{incident["message"]}" ({incident["sender"]})</div>'
 
     audio_matrix_trigger = ""
     if has_critical_disaster:
-        audio_matrix_trigger = """
-        <script>
-            function fireSiren() {
-                var context = new (window.AudioContext || window.webkitAudioContext)();
-                var osc = context.createOscillator();
-                var gain = context.createGain();
-                osc.type = 'sawtooth';
-                osc.frequency.setValueAtTime(440, context.currentTime);
-                osc.frequency.linearRampToValueAtTime(880, context.currentTime + 0.5);
-                osc.frequency.linearRampToValueAtTime(440, context.currentTime + 1.0);
-                osc.connect(gain);
-                gain.gain.setValueAtTime(0.03, context.currentTime);
-                gain.connect(context.destination);
-                osc.start();
-                setTimeout(function() { context.close(); }, 1000);
-            }
-            setInterval(fireSiren, 2000);
-        </script>
-        """
+        audio_matrix_trigger = "<script>function fireSiren(){var c=new(window.AudioContext||window.webkitAudioContext)();var o=c.createOscillator();var g=c.createGain();o.type='sawtooth';o.frequency.setValueAtTime(440,c.currentTime);o.frequency.linearRampToValueAtTime(880,c.currentTime+.5);o.frequency.linearRampToValueAtTime(440,c.currentTime+1);o.connect(g);g.gain.setValueAtTime(.02,c.currentTime);g.connect(c.destination);o.start();setTimeout(function(){c.close();},1000);}setInterval(fireSiren,2000);</script>"
 
     return f"""
-    <html>
-        <head>
-            <title>Smart Guard Dashboard</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#0b0f19; padding:25px; color:#e2e8f0; margin:0; }}
-                .app-wrapper {{ max-width: 1200px; margin: 0 auto; }}
-                header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 20px; }}
-                h1 {{ font-size: 28px; font-weight: 800; margin: 0; }}
-                h1 span {{ color: #10b981; }}
-                .stats-panel {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 30px; }}
-                .stat-card {{ background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 16px; padding: 20px; }}
-                .stat-num {{ font-size: 32px; font-weight: 800; color: #fff; }}
-                .stat-lbl {{ font-size: 13px; color: #9ca3af; text-transform: uppercase; font-weight:600; }}
-                .section-box {{ background: #111827; border: 1px solid rgba(255,255,255,0.05); border-radius: 16px; padding: 24px; margin-bottom:25px; }}
-                .section-title {{ font-size: 18px; font-weight: 700; margin: 0 0 20px 0; border-left: 4px solid #10b981; padding-left: 10px; }}
-                ul {{ list-style: none; padding: 0; margin: 0; }}
-            </style>
-            {audio_matrix_trigger}
-        </head>
-        <body>
-            <div class="app-wrapper">
-                <header>
-                    <div><h1>📡 Smart Guard <span>Center</span></h1><span style="font-size:12px; color:#4b5563; font-weight:700;">LIVE LOG INTERLOCK TRACKER ACTIVE</span></div>
-                    <a href="/" style="background:rgba(255,255,255,0.05); color:white; padding:10px 18px; text-decoration:none; border-radius:8px; border:1px solid rgba(255,255,255,0.1); font-weight:700;">🏠 Sign Out</a>
-                </header>
-                <div class="stats-panel">
-                    <div class="stat-card" style="border-top: 4px solid #10b981;"><div class="stat-num">{total_protected}</div><div class="stat-lbl">Protected Farms</div></div>
-                    <div class="stat-card" style="border-top: 4px solid #ef4444;"><div class="stat-num">{active_incidents}</div><div class="stat-lbl">Active Threats</div></div>
-                    <div class="stat-card" style="border-top: 4px solid #3b82f6;"><div class="stat-num">{resolved_incidents}</div><div class="stat-lbl">Settled Logs</div></div>
-                </div>
-                <div class="section-box">
-                    <h3 class="section-title" style="border-color:#f97316;">🚨 Incident Triage Stream</h3>
-                    {active_alerts_html or "<p style='color:#10b981; font-style:italic;'>🟢 Grid secure. Anomaly metrics quiet.</p>"}
-                </div>
-                <div class="section-box">
-                    <h3 class="section-title" style="border-color:#4b5563;">📜 Resolution Ledger Archive</h3>
-                    {resolved_history_html or "<p style='color:#4b5563;'>Log empty.</p>"}
-                </div>
-                <div class="section-box">
-                    <h3 class="section-title" style="border-color:#10b981;">🟢 Sector_North Nodes</h3>
-                    <ul>{north_zone_html or "<li>Empty</li>"}</ul>
-                </div>
-                <div class="section-box">
-                    <h3 class="section-title" style="border-color:#eab308;">🟡 Sector_South Nodes</h3>
-                    <ul>{south_zone_html or "<li>Empty</li>"}</ul>
-                </div>
-            </div>
-        </body>
-    </html>
+    <html><head><title>Master Control Dashboard</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>body{{font-family:sans-serif; background:#0b0f19; padding:25px; color:#e2e8f0;}} .box{{background:#111827; padding:20px; border-radius:16px; border:1px solid rgba(255,255,255,0.05); margin-bottom:20px;}} .title{{border-left:4px solid #10b981; padding-left:10px; font-weight:700; margin-top:0;}}</style>{audio_matrix_trigger}</head><body><div style="max-width:1000px; margin:0 auto;"><header style="display:flex; justify-content:between; margin-bottom:25px;"><div><h1>📡 Global Control Center</h1></div></header><div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:15px; margin-bottom:25px;"><div class="box" style="border-top:4px solid #10b981;"><h2>{total_protected}</h2><span>Protected Devices</span></div><div class="box" style="border-top:4px solid #ef4444;"><h2>{active_incidents}</h2><span>Active Alarms</span></div><div class="box" style="border-top:4px solid #3b82f6;"><h2>{resolved_incidents}</h2><span>Settled Cases</span></div></div><div class="box"><h3 class="title" style="border-color:#f97316;">🚨 Incident Triage Stream</h3>{active_alerts_html or "<p>🟢 System Secure.</p>"}</div><div class="box"><h3 class="title" style="border-color:#4b5563;">📜 Resolution Ledger Archive</h3>{resolved_history_html or "<p>Empty.</p>"}</div><div class="box"><h3 class="title">🟢 Zone_North</h3><ul>{north_zone_html or "<li>None</li>"}</ul></div><div class="box"><h3 class="title" style="border-color:#eab308;">🟡 Zone_South</h3><ul>{south_zone_html or "<li>None</li>"}</ul></div></div></body></html>
     """
 
 
@@ -221,6 +302,11 @@ def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
 
     if sender_number not in db["farmers"]:
         print(f"\n❌ [SECURITY REJECTED] Unknown lookup token key: '{sender_number}'")
+        return Response(content="<Response></Response>", media_type="application/xml")
+
+    # If a node hasn't been approved by a neighbor yet, block out alert privileges!
+    if db["farmers"][sender_number].get("status", "Pending") == "Pending":
+        print(f"\n⚠️ [ALERT BLOCKED] {db['farmers'][sender_number]['name']} is still pending verification.")
         return Response(content="<Response></Response>", media_type="application/xml")
 
     sender_name = db["farmers"][sender_number]["name"]
@@ -245,7 +331,7 @@ def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
 
     neighbors_to_alert = []
     for number, data in db["farmers"].items():
-        if number != sender_number:
+        if number != sender_number and data.get("status", "Pending") == "Approved":
             if is_master_override or data["zone"] == sender_zone:
                 neighbors_to_alert.append((number, data["name"]))
 
@@ -313,17 +399,18 @@ def registration_form():
 def handle_registration(name: str = Form(...), phone: str = Form(...), zone: str = Form(...)):
     db = db_engine.load_db()
     clean_phone = db_engine.clean_phone_number(phone)
-    db["farmers"][clean_phone] = {"name": name, "zone": zone}
+    # New users default to pending status until trusted by an active neighbour node
+    db["farmers"][clean_phone] = {"name": name, "zone": zone, "status": "Pending"}
     db_engine.save_db(db)
 
-    print(f"\n💾 [WEB REGISTRATION SUCCESS] {name} added under {zone} with number: {clean_phone}")
+    print(f"\n💾 [WEB REGISTRATION SUCCESS] {name} added under {zone} as PENDING.")
 
     return HTMLResponse(content=f"""
     <html>
         <body style="font-family: sans-serif; background-color: #0b0f19; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; padding: 20px;">
             <div style="background: #111827; border: 1px solid rgba(255,255,255,0.05); padding: 35px; border-radius: 20px; width: 100%; max-width: 400px; text-align: center; color: white;">
-                <h2 style="color: #10b981; margin-top: 0;">✅ Registration Secured!</h2>
-                <p style="color: #9ca3af; line-height: 1.6;">Welcome, <strong>{name}</strong>. Your device node has been successfully verified and mapped to the <strong>{zone}</strong> grid matrix.</p>
+                <h2 style="color: #eab308; margin-top: 0;">⏳ Connection Pending</h2>
+                <p style="color: #9ca3af; line-height: 1.6;">Thank you, <strong>{name}</strong>. Your account has been initialized. Please ask an already active approved farmer inside <strong>{zone}</strong> to log into their member portal and approve your connection node.</p>
                 <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.05); margin: 25px 0;">
                 <a href="/" style="display: inline-block; background: #1f2937; color: white; padding: 12px 24px; text-decoration: none; border-radius: 10px; font-weight: 700;">⬅️ Back Home</a>
             </div>
