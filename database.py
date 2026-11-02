@@ -2,47 +2,59 @@ import json
 import os
 from datetime import datetime
 
-# 🌟 THE ABSOLUTE ENV SEPARATION FIX:
-# Render automatically injects an environment variable called "RENDER" into its cloud servers.
-# If "RENDER" is detected, it locks onto an isolated cloud file path.
-# Otherwise, it locks onto your local MacBook folder path. They can NEVER overwrite each other again!
-if os.getenv("RENDER"):
-    DB_FILE = "render_farmers_db.json"  # Isolated entirely to your Render cloud node instance
-else:
-    DB_FILE = "/Users/mackbook/Documents/farm watch/farmers_db.json"  # Isolated entirely to your MacBook laptop
+# Absolute hard-locked path switch on your MacBook vs. Render Cloud
+IF_RENDER_CLOUD = "/data/farmers_db.json"
+IF_MACKBOOK_LOCAL = "/Users/mackbook/Documents/farm watch/farmers_db.json"
+
+DB_FILE = IF_RENDER_CLOUD if os.path.exists("/data") else IF_MACKBOOK_LOCAL
 
 def clean_phone_number(phone: str) -> str:
     """Removes spaces, dashes, brackets, and formatting to normalize keys."""
     return phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace("whatsapp:", "")
 
+def get_default_data():
+    return {
+        "farmers": {
+            "+2348030001111": {"name": "Kofi", "zone": "Zone_North", "status": "Approved"},
+            "+2348030002222": {"name": "Amadi", "zone": "Zone_North", "status": "Approved"},
+            "+2348030003333": {"name": "Chidi", "zone": "Zone_North", "status": "Approved"},
+            "+2348030004444": {"name": "Musa", "zone": "Zone_South", "status": "Approved"},
+        },
+        "alerts_log": []
+    }
+
 def initialize_db():
-    """Initializes a clean database JSON structure if the file doesn't exist or is empty."""
+    folder_path = os.path.dirname(DB_FILE)
+    if folder_path and not os.path.exists(folder_path):
+        os.makedirs(folder_path, exist_ok=True)
     if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
-        blank_structure = {
-            "farmers": {},
-            "alerts_log": []
-        }
         with open(DB_FILE, "w") as f:
-            json.dump(blank_structure, f, indent=4)
-        print(f"🆕 [DATABASE ENGINE] Initialized clean, isolated data file ledger at: {DB_FILE}")
+            json.dump(get_default_data(), f, indent=4)
 
 def load_db():
-    """Pulls data straight from the active environment file path."""
     initialize_db()
     with open(DB_FILE, "r") as f:
         return json.load(f)
 
 def save_db(data):
-    """Writes updates instantly directly onto the active disk storage path."""
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=4)
-    print(f"💾 [DISK UPDATE] Successfully saved data changes to: {DB_FILE}")
 
 def remove_farmer(phone_number):
     db = load_db()
     clean_phone = clean_phone_number(phone_number)
     if clean_phone in db["farmers"]:
         del db["farmers"][clean_phone]
+        save_db(db)
+        return True
+    return False
+
+def approve_farmer_node(phone_number):
+    """Upgrades a pending farmer node to approved status once trusted by a neighbor."""
+    db = load_db()
+    clean_phone = clean_phone_number(phone_number)
+    if clean_phone in db["farmers"]:
+        db["farmers"][clean_phone]["status"] = "Approved"
         save_db(db)
         return True
     return False
