@@ -4,13 +4,11 @@ from datetime import datetime
 
 # 🌟 THE ABSOLUTE FIX: Force your machine to use ONE exact folder path on your MacBook!
 # This stops Python from reading and writing to different hidden directories.
-DB_FILE = "/Users/mackbook/Documents/farm watch/farmers_db.json" 
-
+DB_FILE = "/Users/mackbook/Documents/farm watch/farmers_db.json"
 
 def clean_phone_number(phone: str) -> str:
     """Removes spaces, dashes, brackets, and formatting to normalize keys."""
     return phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace("whatsapp:", "")
-
 
 def get_default_data():
     return {
@@ -23,30 +21,26 @@ def get_default_data():
         "alerts_log": []
     }
 
-
 def initialize_db():
     # Double-check that the target folder pathway actually exists on your Mac
     folder_path = os.path.dirname(DB_FILE)
     if not os.path.exists(folder_path):
         os.makedirs(folder_path, exist_ok=True)
-
+        
     if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
         with open(DB_FILE, "w") as f:
             json.dump(get_default_data(), f, indent=4)
         print(f"🆕 Created a fresh master file layout straight at: {DB_FILE}")
-
 
 def load_db():
     initialize_db()
     with open(DB_FILE, "r") as f:
         return json.load(f)
 
-
 def save_db(data):
     with open(DB_FILE, "w") as f:
         json.dump(data, f, indent=4)
     print(f"💾 [DISK STORAGE SECURED] Data hard-written straight to: {DB_FILE}")
-
 
 def remove_farmer(phone_number):
     db = load_db()
@@ -56,7 +50,6 @@ def remove_farmer(phone_number):
         save_db(db)
         return True
     return False
-
 
 def archive_incident(sender_name, zone, message, alert_type="Standard"):
     db = load_db()
@@ -72,7 +65,6 @@ def archive_incident(sender_name, zone, message, alert_type="Standard"):
     db["alerts_log"].append(incident_record)
     save_db(db)
     return incident_record
-
 
 def update_incident_status(alert_id, target_status="Resolved"):
     db = load_db()
