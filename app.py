@@ -9,14 +9,22 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import database as db_engine
 
-app = FastAPI(title="Farm Watch Enterprise Node", version="3.9.5")
+app = FastAPI(title="Farm Watch Enterprise Node", version="4.3.0")
 security = HTTPBasic()
 db_engine.initialize_db()
 
 ADMIN_USERNAME = "chief"
 ADMIN_PASSWORD = "securepassword123"
-ANDROID_GATEWAY_IP = "http://192.168.1.50:8080"
-ANDROID_API_TOKEN = "YOUR_ANDROID_APP_PASSWORD_OR_TOKEN"
+
+# ---------------------------------------------------------
+# 📞 TWILIO PRODUCTION TELEPHONY CONFIGURATION PROFILE
+# ---------------------------------------------------------
+TWILIO_ACCOUNT_SID = "AC436cb01fff8036da72eda4b89ef1366d"
+TWILIO_AUTH_TOKEN = "af3fe376d935cca33ea3ce5cb4360f6a"
+
+# ✅ GLOBAL SANDBOX PROFILE: Using Twilio's official shared WhatsApp Sandbox number
+TWILIO_PHONE_NUMBER = "whatsapp:+14155238886"
+
 ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
 
 GLOBAL_GEO_DB = {
@@ -63,19 +71,39 @@ def start_db_watchdog():
     observer.start()
 
 threading.Thread(target=start_db_watchdog, daemon=True).start()
+
+
 def mask_phone_number(phone: str) -> str:
     clean = str(phone).strip()
     if len(clean) <= 6: return "••••" + clean[-2:] if len(clean) > 2 else "••••"
     return f"{clean[:4]}••••{clean[-3:]}"
 
+
 def send_production_alert(to_number: str, message_text: str):
-    url = f"{ANDROID_GATEWAY_IP}/api/v1/sms/send"
-    payload = {"phone": to_number, "message": message_text}
-    headers = {"Authorization": f"Bearer {ANDROID_API_TOKEN}", "Content-Type": "application/json"}
+    """Fires real-time WhatsApp emergency alert payloads using Twilio's Sandbox REST engine."""
+    url = f"https://twilio.com{TWILIO_ACCOUNT_SID}/Messages.json"
+
+    # Ensure targets are completely formatted for WhatsApp string indexing
+    clean_target = str(to_number).strip()
+    if not clean_target.startswith("whatsapp:"):
+        clean_target = f"whatsapp:{clean_target}"
+
+    payload = {
+        "To": clean_target,
+        "From": TWILIO_PHONE_NUMBER,
+        "Body": message_text
+    }
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=3.5)
-        return res.status_code == 200
-    except Exception: return False
+        res = requests.post(
+            url,
+            data=payload,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            timeout=5.0
+        )
+        return res.status_code == 201
+    except Exception:
+        return False
+
 
 def get_realtime_weather(lga: str) -> dict:
     geo_coordinates = {
@@ -92,26 +120,34 @@ def get_realtime_weather(lga: str) -> dict:
             temp = w_data.get("temperature", 28.5)
             desc = "Optimal Growth" if 22 <= temp <= 32 else "Monitor Soil Hydration"
             return {"temp": f"{temp}°C", "desc": desc}
-    except Exception: pass
+    except Exception:
+        pass
     return {"temp": "28.5°C", "desc": "Optimal Conditions"}
+
 
 def send_admin_webhook(payload: dict):
     if "://slack.com" in ADMIN_ALERT_WEBHOOK_URL or "://discord.com" in ADMIN_ALERT_WEBHOOK_URL:
-        try: requests.post(ADMIN_ALERT_WEBHOOK_URL, json=payload, timeout=3)
-        except Exception: pass
+        try:
+            requests.post(ADMIN_ALERT_WEBHOOK_URL, json=payload, timeout=3)
+        except Exception:
+            pass
+
 
 def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
     is_user = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
     is_pass = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
     if not (is_user and is_pass):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bad credentials.", headers={"WWW-Authenticate": "Basic"})
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bad credentials.",
+                            headers={"WWW-Authenticate": "Basic"})
     return credentials.username
+
 
 def get_current_farmer(farmer_session: str = Cookie(None)):
     if not farmer_session: return None
     db = db_engine.load_db()
     clean_phone = db_engine.clean_phone_number(farmer_session)
     return {"phone": clean_phone, "data": db["farmers"][clean_phone]} if clean_phone in db["farmers"] else None
+
 
 CORE_CSS = """
     body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: radial-gradient(circle at 10% 20%, #0f172a 0%, #020617 90%); color: #f8fafc; margin: 0; padding: 20px; min-height: 100vh; display: flex; justify-content: center; align-items: center; box-sizing: border-box; }
@@ -123,13 +159,11 @@ CORE_CSS = """
     .responsive-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; width: 100%; }
 """
 
+
 @app.get("/", response_class=HTMLResponse)
 def community_homepage():
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="hero glass-panel" style="max-width: 550px; text-align: center; padding: 40px 30px;"><h1>📡 Farm Watch Ecosystem</h1><p style="color: #94a3b8; margin-bottom: 30px; line-height: 1.6; font-size: 15px;">Next-generation protection grid protecting local livelihoods.</p><div style="display:flex; flex-direction:column; gap:14px;"><a href="/register" class="btn btn-emerald">➕ Register Operational Node</a><a href="/portal/login" class="btn btn-blue">👩‍🌾 Member Authentication Portal</a><a href="/dashboard" class="btn" style="background:rgba(255,255,255,0.03); color:#cbd5e1; border:1px solid rgba(255,255,255,0.1);">🖥️ Access Admin Control Center</a></div></div></body></html>"""
-@app.get("/portal/login", response_class=HTMLResponse)
-def farmer_login_page(error: str = None):
-    err_box = f'<div style="color:#f87171; background:rgba(239,68,68,0.1); padding:12px; border-radius:8px; font-size:13px; margin-bottom:20px; font-weight:600; border: 1px solid rgba(239,68,68,0.15);">⚠️ {error}</div>' if error else ""
-    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="login-card glass-panel" style="padding:40px 25px; width:100%; max-width:380px;"><h2>Member Login</h2>{err_box}<form action="/portal/auth" method="post"><label style="font-size:11px; color:#64748b; font-weight:700; display:block; margin-bottom:6px;">PHONE NUMBER</label><input type="text" name="phone" required><button type="submit" class="btn btn-blue" style="width: 100%;">Secure Sign In</button></form></div></body></html>"""
+
 
 @app.post("/portal/auth")
 def farmer_authentication(phone: str = Form(...)):
