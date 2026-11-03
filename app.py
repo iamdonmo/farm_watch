@@ -79,7 +79,6 @@ def mask_phone_number(phone: str) -> str:
 
 def send_production_alert(to_number: str, message_text: str):
     """Fires a structural title-case template payload directly to Twilio's REST API."""
-    # ✅ FIX: Notice the slashes and subdomains are explicitly separated here
     url = f"https://twilio.com{TWILIO_ACCOUNT_SID}/Messages.json"
 
     clean_target = str(to_number).strip()
@@ -105,6 +104,7 @@ def send_production_alert(to_number: str, message_text: str):
     except Exception as e:
         print(f"❌ Network Exception during Twilio dispatch: {e}")
         return False
+
 
 
 def get_realtime_weather(lga: str) -> dict:
