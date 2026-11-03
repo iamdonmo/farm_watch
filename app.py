@@ -78,20 +78,19 @@ def mask_phone_number(phone: str) -> str:
     return f"{clean[:4]}••••{clean[-3:]}"
 
 def send_production_alert(to_number: str, message_text: str):
-    """Fires native Twilio REST API requests matching correct sandbox parameter keys."""
+    """Fires native Twilio REST API requests matching lowercase sandbox template parameter keys."""
     url = f"https://twilio.com{TWILIO_ACCOUNT_SID}/Messages.json"
     
     clean_target = str(to_number).strip()
     if not clean_target.startswith("whatsapp:"):
         clean_target = f"whatsapp:{clean_target}"
         
-    # We clean up the message and map parameters to the exact raw API format Twilio expects
+    # ✅ FIX: Swapped payload parameter arguments to lowercase keys for direct API form encoding
     payload = {
         "To": clean_target,
         "From": TWILIO_PHONE_NUMBER,
-        "Body": message_text,  # Fallback text parameter in case Content Templates are strict
-        "ContentSid": "HXb5b62575e6e4ff6129ad7c8efe1f983e",
-        "ContentVariables": '{"1":"FarmWatch","2":"Alert"}'
+        "content_sid": "HXb5b62575e6e4ff6129ad7c8efe1f983e",
+        "content_variables": '{"1":"' + str(message_text[:15]) + '","2":"3pm"}'
     }
     
     try:
@@ -101,7 +100,7 @@ def send_production_alert(to_number: str, message_text: str):
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), 
             timeout=5.0
         )
-        # Twilio sends a 201 Created status code on successful delivery hook handshakes
+        # Returns True if Twilio successfully queues the payload dispatch
         return res.status_code == 201
     except Exception:
         return False
