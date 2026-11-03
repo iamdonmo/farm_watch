@@ -8,6 +8,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import database as db_engine
+import geonamescache
 
 app = FastAPI(title="Farm Watch Enterprise Node", version="4.6.0")
 security = HTTPBasic()
@@ -28,36 +29,28 @@ TWILIO_CONTENT_SID = "HXb5b62575e6e4ff6129ad7c8efe1f983e"
 
 ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
 
-GLOBAL_GEO_DB = {
-    "Nigeria": {
-        "Kano": {
-            "Kano Municipal": ["Gandun Albasa", "Kano City Center", "Tudun Wada"],
-            "Fagge": ["Fagge D2", "Waje", "Sabon Gari"]
-        },
-        "Lagos": {
-            "Ikeja": ["Alausa", "Oregun", "Computer Village"],
-            "Lekki": ["Phase 1", "Ikate", "Chevron Node"]
-        },
-        "Osun": {
-            "Osogbo": ["Olorunda Central", "Capital Hub Ring", "Ataoja Sector"],
-            "Ile-Ife": ["Ife Central Town", "Modakeke Border", "University Outpost"],
-            "Ilesa": ["Ilesa East Sector", "Ilesa West Farm Ring", "Ijebu-Jesa Road"],
-            "Ede": ["Ede South Agrarian", "Timi Market Node", "Federal Poly Outskirt"]
-        },
-        "Oyo": {
-            "Ibadan": ["Ido Farming Grid", "Oluyole Frontier", "Lagelu Outpost Area"],
-            "Ogbomoso": ["Ogbomoso North LAUTECH", "Ogbomoso South Central"],
-            "Iseyin": ["Iseyin-Okeogun Central", "Ado-Awaye Route", "Agrarian North"],
-            "Saki": ["Saki West Grid", "Saki East Valley", "Oke-Ogun Boundary Ring"]
-        }
-    }
-}
-CITY_AUTOFILL_MAP = {
-    "osogbo": {"country": "Nigeria", "state": "Osun", "lga": "Osogbo", "area": "Ataoja Sector"},
-    "ile-ife": {"country": "Nigeria", "state": "Osun", "lga": "Ile-Ife", "area": "Ife Central Town"},
-    "ibadan": {"country": "Nigeria", "state": "Oyo", "lga": "Ibadan", "area": "Ido Farming Grid"},
-    "ogbomoso": {"country": "Nigeria", "state": "Oyo", "lga": "Ogbomoso", "area": "Ogbomoso South Central"}
-}
+# Initialize the global geography database automatically
+gc = geonamescache.GeonamesCache()
+
+# Let's extract the countries and cities
+all_countries = gc.get_countries()
+all_cities = gc.get_cities()
+
+# Build a dynamic structure for your dropdowns
+GLOBAL_GEO_DB = {}
+for city_id, city_info in all_cities.items():
+    country_name = all_countries.get(city_info['countrycode'], {}).get('name', 'Unknown')
+    # You can use 'admin1code' or similar mapping to extract states if needed
+    state_name = city_info.get('admin1code', 'General Region') 
+
+    if country_name not in GLOBAL_GEO_DB:
+        GLOBAL_GEO_DB[country_name] = {}
+    if state_name not in GLOBAL_GEO_DB[country_name]:
+        GLOBAL_GEO_DB[country_name][state_name] = {}
+
+    # Map the city name to your existing structure
+    city_name = city_info['name']
+    GLOBAL_GEO_DB[country_name][state_name][city_name] = ["Central Sector", "Agrarian Grid"]
 
 class DatabaseChangeHandler(FileSystemEventHandler):
     def on_modified(self, event):
