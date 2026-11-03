@@ -29,14 +29,6 @@ TWILIO_CONTENT_SID = "HXb5b62575e6e4ff6129ad7c8efe1f983e"
 
 ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
 
-# Initialize the global geography database automatically
-gc = geonamescache.GeonamesCache()
-
-# Let's extract the countries and cities
-all_countries = gc.get_countries()
-all_cities = gc.get_cities()
-
-import geonamescache
 
 # Initialize the global geography database automatically
 gc = geonamescache.GeonamesCache()
@@ -72,6 +64,7 @@ for city_id, city_info in all_cities.items():
     GLOBAL_GEO_DB[country_name][state_name][city_name] = {
         "General Sector": ["Central Sector", "Agrarian Grid"]
     }
+
 
 
 class DatabaseChangeHandler(FileSystemEventHandler):
