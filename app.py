@@ -19,8 +19,8 @@ ADMIN_PASSWORD = "securepassword123"
 # ---------------------------------------------------------
 # 📞 TWILIO PRODUCTION TELEPHONY CONFIGURATION PROFILE
 # ---------------------------------------------------------
-TWILIO_ACCOUNT_SID = "AC436cb01fff8036da72eda4b89ef1366d"
-TWILIO_AUTH_TOKEN = "af3fe376d935cca33ea3ce5cb4360f6a"
+TWILIO_ACCOUNT_SID = "YOUR_TWILIO_ACCOUNT_SID_HERE"
+TWILIO_AUTH_TOKEN = "YOUR_TWILIO_AUTH_TOKEN_HERE"
 
 # ✅ GLOBAL SANDBOX PROFILE: Using Twilio's official shared WhatsApp Sandbox number
 TWILIO_PHONE_NUMBER = "whatsapp:+14155238886"
@@ -165,65 +165,71 @@ def community_homepage():
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="hero glass-panel" style="max-width: 550px; text-align: center; padding: 40px 30px;"><h1>📡 Farm Watch Ecosystem</h1><p style="color: #94a3b8; margin-bottom: 30px; line-height: 1.6; font-size: 15px;">Next-generation protection grid protecting local livelihoods.</p><div style="display:flex; flex-direction:column; gap:14px;"><a href="/register" class="btn btn-emerald">➕ Register Operational Node</a><a href="/portal/login" class="btn btn-blue">👩‍🌾 Member Authentication Portal</a><a href="/dashboard" class="btn" style="background:rgba(255,255,255,0.03); color:#cbd5e1; border:1px solid rgba(255,255,255,0.1);">🖥️ Access Admin Control Center</a></div></div></body></html>"""
 
 
+@app.get("/portal/login", response_class=HTMLResponse)
+def farmer_login_page(error: str = None):
+    err_box = f'<div style="color:#f87171; background:rgba(239,68,68,0.1); padding:12px; border-radius:8px; font-size:13px; margin-bottom:20px; font-weight:600; border: 1px solid rgba(239,68,68,0.15);">⚠️ {error}</div>' if error else ""
+    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="login-card glass-panel" style="padding:40px 25px; width:100%; max-width:380px;"><h2>Member Login</h2>{err_box}<form action="/portal/auth" method="post"><label style="font-size:11px; color:#64748b; font-weight:700; display:block; margin-bottom:6px;">PHONE NUMBER</label><input type="text" name="phone" placeholder="e.g. 23480..." required><button type="submit" class="btn btn-blue" style="width: 100%;">Secure Sign In</button></form></div></body></html>"""
+
+
 @app.post("/portal/auth")
 def farmer_authentication(phone: str = Form(...)):
     db = db_engine.load_db()
     clean_phone = db_engine.clean_phone_number(phone)
     if clean_phone in db["farmers"]:
-        if db["farmers"][clean_phone].get("status", "Pending") == "Pending":
-            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting administrator review.", status_code=303)
+        # ✅ HARDENED CHECK: If dictionary properties are blank, inject standard fallback layout properties to prevent crashes
+        farmer_record = db["farmers"][clean_phone]
+        if not isinstance(farmer_record, dict):
+            db["farmers"][clean_phone] = {"name": "Registered Farmer", "status": "Approved"}
+            db_engine.save_db(db)
+            farmer_record = db["farmers"][clean_phone]
+
+        if farmer_record.get("status", "Pending") == "Pending":
+            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting administrator review.",
+                                    status_code=303)
+
         res = RedirectResponse(url="/portal/feed", status_code=303)
         res.set_cookie(key="farmer_session", value=clean_phone, max_age=2592000, httponly=True)
         return res
-    return RedirectResponse(url="/portal/login?error=Phone number not recognized.", status_code=303)
+    return RedirectResponse(url="/portal/login?error=Phone number not recognized on network scale.", status_code=303)
+
 
 @app.get("/portal/feed", response_class=HTMLResponse)
 def farmer_feed_portal(current_user=Depends(get_current_farmer)):
-    if not current_user: return RedirectResponse(url="/portal/login?error=Session expired.", status_code=303)
+    if not current_user:
+        return RedirectResponse(url="/portal/login?error=Session expired or profile mismatched.", status_code=303)
     f_phone, f_name, d = current_user["phone"], current_user["data"]["name"], current_user["data"]
-    country, state, city, lga, area = d.get("country","?"), d.get("state","?"), d.get("city","?"), d.get("lga","?"), d.get("area","?")
+    country, state, city, lga, area = d.get("country", "Nigeria"), d.get("state", "Osun"), d.get("city",
+                                                                                                 "Osogbo"), d.get("lga",
+                                                                                                                  "Osogbo"), d.get(
+        "area", "General Farm Hub")
     db = db_engine.load_db()
-    total_neighbors = sum(1 for p, info in db["farmers"].items() if info.get("lga") == lga and info.get("status") == "Approved")
+    total_neighbors = sum(1 for p, info in db["farmers"].items() if
+                          isinstance(info, dict) and info.get("lga") == lga and info.get("status") == "Approved")
     weather = get_realtime_weather(lga)
-    nb_html = "".join([f'<div style="background:rgba(59,130,246,0.03); padding:14px; margin-bottom:8px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; gap:10px;"><div><strong style="color:white; display:block; font-size:14px;">{info["name"]}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:8px 14px; font-size:12px; border-radius:6px;">Verify</button></form></div>' for p, info in db["farmers"].items() if info.get("lga") == lga and info.get("status", "Pending") == "Pending" and p != f_phone])
+    nb_html = "".join([
+                          f'<div style="background:rgba(59,130,246,0.03); padding:14px; margin-bottom:8px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; gap:10px;"><div><strong style="color:white; display:block; font-size:14px;">{info["name"]}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area", "General")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:8px 14px; font-size:12px; border-radius:6px;">Verify</button></form></div>'
+                          for p, info in db["farmers"].items() if
+                          isinstance(info, dict) and info.get("lga") == lga and info.get("status",
+                                                                                         "Pending") == "Pending" and p != f_phone])
     return render_farmer_complete_html(f_name, country, state, city, lga, area, total_neighbors, weather, nb_html)
+
+
 def render_farmer_complete_html(f_name, country, state, city, lga, area, total_neighbors, weather, nb_html):
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS} body {{ display:block; padding:15px; }} .container {{ max-width:950px; margin:0 auto; width:100%; }} @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }} .spinner {{ display: none; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: white; animation: spin 0.8s linear infinite; margin-right: 10px; }} .fun-widget {{ display:flex; gap:15px; margin-bottom:20px; flex-wrap:wrap; }} .widget-card {{ flex:1; min-width:140px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); padding:15px; border-radius:14px; text-align:center; }}
         .trivia-box {{ display:none; background:rgba(15,23,42,0.9); border:1px solid rgba(255,255,255,0.1); padding:20px; border-radius:16px; margin-bottom:25px; }}
         .social-link {{ display:inline-flex; align-items:center; gap:6px; color:#38bdf8; text-decoration:none; background:rgba(255,255,255,0.02); padding:8px 16px; border-radius:8px; border:1px solid rgba(255,255,255,0.05); font-size:13px; font-weight:700; transition:0.2s; }} .social-link:hover {{ background:rgba(255,255,255,0.08); transform:translateY(-1px); }}
     </style></head><body><div id="main_terminal_container" class="container glass-panel" style="padding:25px 20px;"><div style="display:flex; justify-content:space-between; align-items:flex-start; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:20px; margin-bottom:25px; flex-wrap:wrap; gap:15px;"><div><h2 style="margin:0; font-size:20px;">👨‍🌾 Node Terminal: {f_name}</h2><span style="background:rgba(16,185,129,0.1); color:#10b981; padding:4px 8px; border-radius:6px; font-size:12px; font-weight:700; display:inline-block; margin-top:5px;">📍 Index: {country} / {state} / {lga} / {area}</span></div><button onclick="handleManualLogout()" class="btn" style="background:rgba(239,68,68,0.1); color:#f87171; padding:8px 16px; font-size:13px;">Disconnect</button></div>
+
+    <div style="background:rgba(59,130,246,0.05); border:1px solid rgba(59,130,246,0.2); padding:15px; border-radius:12px; margin-bottom:20px; font-size:13px; line-height:1.5;">
+        📱 <strong>WhatsApp Sandbox Activation Required:</strong> To receive wireless grid broadcasts, text the phrase configured in your Twilio Dashboard Console (e.g. <code>join choice-something</code>) to <strong>+1 415 523 8886</strong> from your mobile device.
+    </div>
+
     <div class="fun-widget"><div class="widget-card">🌤️<br><strong style="font-size:13px;color:#38bdf8;">Live Weather API</strong><br><span style="font-size:14px;font-weight:bold;color:#10b981;">{weather['temp']} - {weather['desc']}</span></div><div class="widget-card">🛡️<br><strong style="font-size:13px;color:#10b981;">Grid Sync</strong><br><span style="font-size:14px;font-weight:bold;">{total_neighbors} Peers Active</span></div><div class="widget-card">🎮<br><strong style="font-size:13px;color:#a855f7;">Breakout Terminal</strong><br><span style="font-size:12px;cursor:pointer;text-decoration:underline;color:#a855f7;font-weight:bold;" onclick="toggleTriviaGame()">Launch Training Quiz</span></div></div>
     <div id="trivia_module" class="trivia-box"><div style="display:flex; justify-content:space-between; align-items:center;"><h4 style="margin:0; color:#38bdf8;">🌾 Operational Security Training Quiz</h4><span id="quiz_progress" style="font-size:12px; color:#64748b; font-weight:bold;">Question 1/3</span></div><p id="trivia_question" style="margin:15px 0; font-weight:600; min-height:40px;"></p><div id="trivia_options" style="display:grid; gap:8px; margin-bottom:15px;"></div><p id="trivia_feedback" style="font-weight:bold; font-size:14px; min-height:20px; margin:10px 0;"></p><div style="display:flex; justify-content:space-between; margin-top:10px;"><button id="quiz_back_btn" class="btn" style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); padding:6px 14px; font-size:12px;" onclick="navigateQuiz(-1)">⬅️ Back</button><button id="quiz_next_btn" class="btn btn-blue" style="padding:6px 14px; font-size:12px;" onclick="navigateQuiz(1)">Next ➡️</button></div></div>
     <div class="responsive-grid"><div style="background:rgba(239,68,68,0.02); border:1px solid rgba(239,68,68,0.1); padding:20px; border-radius:16px; height:fit-content;"><h3>🚨 Broadcast Emergency</h3><form id="broadcast_form" method="post" onsubmit="handleBroadcastSubmit(event)" style="display:flex; flex-direction:column; gap:12px; margin:0;"><select id="alert_type" name="alert_type"><option value="Intruder Spotted">Intruder Spotted</option><option value="Critical Disaster">Critical Disaster</option><option value="Armed Attack">Armed Attack</option></select><input type="text" id="message" name="message" placeholder="Situation details..." required><button type="submit" id="dispatch_btn" class="btn btn-emerald" style="width:100%;"><div id="btn_spinner" class="spinner"></div><span id="btn_text">📡 Dispatch Alert Matrix</span></button></form></div><div><h3>🤝 Peer Authentication Desk</h3>{nb_html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>Clear ring.</p>"}<h3>📡 Live Feed (● Live Auto-Sync)</h3><div id="live_stream_container"></div></div></div>
-    <div style="margin-top:30px; padding-top:20px; border-top:1px solid rgba(255,255,255,0.05);"><h4 style="margin:0 0 12px; color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:1px;">🛡️ Community Safety Connect Hub</h4><div style="display:flex; gap:10px; flex-wrap:wrap;"><a href="https://wa.me" target="_blank" class="social-link">💬 WhatsApp Group</a><a href="https://telegram.org" target="_blank" class="social-link">✈️ Telegram Alert Channel</a><a href="https://facebook.com" target="_blank" class="social-link">👥 Facebook Union</a></div></div></div>
-    <script>
-        const quizData = [
-            {{ q: "What should a farmer do first if an unknown intruder is spotted near boundaries?", options: ["📡 Instantly broadcast an alarm inside the Farm Watch portal", "🏃 Investigate the location alone without signaling neighbors"], correct: 0 }},
-            {{ q: "Which type of alert triggers a Master Override broadcast to all sectors across the country database?", options: ["🌾 Asset Damage (Cattle/Crops)", "🔥 Critical Disaster (Fire/Flood) or Armed Attack"], correct: 1 }},
-            {{ q: "What is the primary criteria required for a new registered node to activate their portal feed?", options: ["⏳ Complete approval clearance from an approved admin or neighbor node", "🔑 Entering the master chief panel credentials"], correct: 0 }}
-        ];
-        let currentQuizIndex = 0;
-        function toggleTriviaGame() {{ const box = document.getElementById("trivia_module"); box.style.display = box.style.display === "block" ? "none" : "block"; if(box.style.display === "block") renderQuizQuestion(); }}
-        function renderQuizQuestion() {{
-            const item = quizData[currentQuizIndex]; document.getElementById("quiz_progress").innerText = `Question ${{currentQuizIndex + 1}}/${{quizData.length}}`; document.getElementById("trivia_question").innerText = item.q; document.getElementById("trivia_feedback").innerText = "";
-            const optsContainer = document.getElementById("trivia_options"); optsContainer.innerHTML = "";
-            item.options.forEach((opt, idx) => {{ optsContainer.innerHTML += `<button class="btn" style="background:#1f2937; text-align:left; justify-content:flex-start; width:100%; font-size:13px;" onclick="evaluateQuizAnswer(${{idx}})">${{opt}}</button>`; }});
-            document.getElementById("quiz_back_btn").style.visibility = currentQuizIndex === 0 ? "hidden" : "visible";
-            document.getElementById("quiz_next_btn").innerText = currentQuizIndex === quizData.length - 1 ? "Finish 🎉" : "Next ➡️";
-        }}
-        function evaluateQuizAnswer(selectedIdx) {{
-            const item = quizData[currentQuizIndex]; const fb = document.getElementById("trivia_feedback");
-            if(selectedIdx === item.correct) {{ fb.style.color = "#10b981"; fb.innerText = "🟢 Correct answer! Excellent security protocol tracking."; }} 
-            else {{ fb.style.color = "#ef4444"; fb.innerText = "❌ Incorrect option. Review network protocols for maximum grid protection."; }}
-        }}
-        function navigateQuiz(dir) {{
-            currentQuizIndex += dir; if(currentQuizIndex >= quizData.length) {{ currentQuizIndex = 0; toggleTriviaGame(); return; }} if(currentQuizIndex < 0) currentQuizIndex = 0; renderQuizQuestion();
-        }}
-        function handleManualLogout() {{ window.location.href = "/portal/logout"; }}
-        function handleBroadcastSubmit(e) {{ e.preventDefault(); const b=document.getElementById("dispatch_btn"); const s=document.getElementById("btn_spinner"); const t=document.getElementById("btn_text"); b.style.opacity="0.7"; b.style.pointerEvents="none"; s.style.display="inline-block"; t.innerText="Transmitting Alert Grid..."; const f=new FormData(); f.append("alert_type", document.getElementById("alert_type").value); f.append("message", document.getElementById("message").value); fetch("/portal/alert/raise", {{ method: "POST", body: f }}); setTimeout(() => {{ document.getElementById("main_terminal_container").innerHTML = `<div style="padding:40px 25px; text-align:center; max-width:450px; margin:40px auto; width:100%;" class="glass-panel"><div style="font-size:48px; margin-bottom:15px;">✅</div><h2 style="color:#10b981; margin:0 0 10px;">Broadcast Dispatched</h2><p style="color:#94a3b8; font-size:14px;">Your incident report has been securely transmitted across the Grid.</p><a href="/portal/feed" class="btn btn-blue" style="margin-top:20px; width:100%;">Return to Guard Station</a></div>`; }}, 3000); }}
-        async function fetchLiveFeedStream() {{ try {{ const res = await fetch("/portal/feed/stream"); if (res.status === 200) {{ document.getElementById("live_stream_container").innerHTML = await res.text(); }} }} catch(e) {{}} }}
-        setInterval(fetchLiveFeedStream, 2000); fetchLiveFeedStream();
-    </script></body></html>"""
+"""
+
+
 @app.get("/portal/feed/stream")
 def portal_async_feed_stream(current_user=Depends(get_current_farmer)):
     if not current_user: return Response(status_code=401)
