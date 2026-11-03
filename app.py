@@ -30,29 +30,47 @@ TWILIO_CONTENT_SID = "HXb5b62575e6e4ff6129ad7c8efe1f983e"
 ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
 
 
-# Initialize the global geography database automatically
-gc = geonamescache.GeonamesCache()
+import geonamescache
 
+# 1. Initialize the dataset
+gc = geonamescache.GeonamesCache()
 all_countries = gc.get_countries()
 all_cities = gc.get_cities()
 
-# This sub-database holds the actual text names for the state codes
-all_subdivisions = gc.get_subdivisions()
+# 2. Local mapper translating internal ISO numerical admin codes directly into clean strings
+NIGERIA_STATE_MAP = {
+    "15": "Osun",
+    "24": "Oyo",
+    "05": "Kano",
+    "25": "Lagos",
+    "30": "FCT Abuja",
+    "01": "Abia", "02": "Adamawa", "03": "Akwa Ibom", "04": "Anambra", "06": "Bauchi", 
+    "07": "Bayelsa", "08": "Benue", "09": "Borno", "10": "Cross River", "11": "Delta", 
+    "12": "Ebonyi", "13": "Edo", "14": "Ekiti", "16": "Enugu", "17": "Gombe", "18": "Imo", 
+    "19": "Jigawa", "20": "Kaduna", "21": "Katsina", "22": "Kebbi", "23": "Kogi", 
+    "26": "Nasarawa", "27": "Niger", "28": "Ogun", "29": "Ondo", "31": "Plateau", 
+    "32": "Rivers", "33": "Sokoto", "34": "Taraba", "35": "Yobe", "36": "Zamfara"
+}
 
 GLOBAL_GEO_DB = {}
 
+# 3. Process and structure the geographic nodes on startup
 for city_id, city_info in all_cities.items():
     country_code = city_info.get('countrycode', '')
     country_name = all_countries.get(country_code, {}).get('name', 'Unknown')
     
-    # Get the raw code (e.g., '15' or 'LA')
-    state_code = city_info.get('admin1code', 'General Region') 
+    # Grab the raw administrative integer string
+    state_code = str(city_info.get('admin1code', ''))
     
-    # 🔄 Look up the real state name using the country code and state code combined
-    subdivision_info = all_subdivisions.get(country_code, {}).get(state_code, {})
-    state_name = subdivision_info.get('name', f"Region {state_code}") if subdivision_info else f"Region {state_code}"
-    
-    # Group everything nicely into your dropdown structure
+    # Translate if it's Nigeria, fallback to "Region XX" for other global locations
+    if country_code == "NG" and state_code in NIGERIA_STATE_MAP:
+        state_name = NIGERIA_STATE_MAP[state_code]
+    elif state_code:
+        state_name = f"Region {state_code}"
+    else:
+        state_name = "General Region"
+        
+    # Inject systematically into your existing frontend dropdown dictionary scheme
     if country_name not in GLOBAL_GEO_DB:
         GLOBAL_GEO_DB[country_name] = {}
     if state_name not in GLOBAL_GEO_DB[country_name]:
@@ -60,11 +78,11 @@ for city_id, city_info in all_cities.items():
         
     city_name = city_info['name']
     
-    # Keeping your original layout structure so your javascript dropdown maps don't break
-    GLOBAL_GEO_DB[country_name][state_name][city_name] = {
-        "General Sector": ["Central Sector", "Agrarian Grid"]
-    }
-
+    # Preserve the deep local sector breakdown array so your registration scripts match up
+    GLOBAL_GEO_DB[country_name][state_name][city_name] = [
+        "Central Sector", 
+        "Agrarian Grid Zone"
+    ]
 
 
 class DatabaseChangeHandler(FileSystemEventHandler):
