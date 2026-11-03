@@ -9,19 +9,25 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import database as db_engine
 
-app = FastAPI(title="Farm Watch Enterprise Node", version="4.5.0")
+app = FastAPI(title="Farm Watch Enterprise Node", version="4.6.0")
 security = HTTPBasic()
 db_engine.initialize_db()
 
 ADMIN_USERNAME = "chief"
 ADMIN_PASSWORD = "securepassword123"
 
-# 📞 TWILIO WHATSAPP SANDBOX PRODUCTION CREDENTIALS
+# 📞 ---------------------------------------------------------
+# ACTIVE PRODUCTION TWILIO PROFILE INDEX
+# ---------------------------------------------------------
 TWILIO_ACCOUNT_SID = "AC436cb01fff8036da72eda4b89ef1366d"
 TWILIO_AUTH_TOKEN = "9beab2f0af9f6e78b079e27348073269"
 TWILIO_PHONE_NUMBER = "whatsapp:+14155238886"
 
+# Pre-approved meta sandbox notification schema container
+TWILIO_CONTENT_SID = "HXb5b62575e6e4ff6129ad7c8efe1f983e"
+
 ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
+
 GLOBAL_GEO_DB = {
     "Nigeria": {
         "Kano": {
@@ -72,15 +78,32 @@ def mask_phone_number(phone: str) -> str:
     return f"{clean[:4]}••••{clean[-3:]}"
 
 def send_production_alert(to_number: str, message_text: str):
+    """Fires native Twilio REST requests matching Content Template Schema boundaries."""
     url = f"https://twilio.com{TWILIO_ACCOUNT_SID}/Messages.json"
+    
     clean_target = str(to_number).strip()
     if not clean_target.startswith("whatsapp:"):
         clean_target = f"whatsapp:{clean_target}"
-    payload = {"To": clean_target, "From": TWILIO_PHONE_NUMBER, "Body": message_text}
+        
+    # Mapping custom threat layouts cleanly inside your pre-approved Twilio variables matrix
+    payload = {
+        "To": clean_target,
+        "From": TWILIO_PHONE_NUMBER,
+        "ContentSid": TWILIO_CONTENT_SID,
+        "ContentVariables": '{"1":"' + message_text[:20] + '","2":"FarmGrid"}'
+    }
+    
     try:
-        res = requests.post(url, data=payload, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=5.0)
+        res = requests.post(
+            url, 
+            data=payload, 
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), 
+            timeout=5.0
+        )
         return res.status_code == 201
-    except Exception: return False
+    except Exception:
+        return False
+
 def get_realtime_weather(lga: str) -> dict:
     geo_coordinates = {
         "osogbo": {"lat": 7.7827, "lon": 4.5418}, "ile-ife": {"lat": 7.4667, "lon": 4.5667},
