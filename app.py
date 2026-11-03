@@ -132,10 +132,13 @@ CORE_CSS = """
 @app.get("/", response_class=HTMLResponse)
 def community_homepage():
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="hero glass-panel" style="max-width: 550px; text-align: center; padding: 40px 30px;"><h1>📡 Farm Watch Ecosystem</h1><p style="color: #94a3b8; margin-bottom: 30px; line-height: 1.6; font-size: 15px;">Next-generation protection grid protecting local livelihoods.</p><div style="display:flex; flex-direction:column; gap:14px;"><a href="/register" class="btn btn-emerald">➕ Register Operational Node</a><a href="/portal/login" class="btn btn-blue">👩‍🌾 Member Authentication Portal</a><a href="/dashboard" class="btn" style="background:rgba(255,255,255,0.03); color:#cbd5e1; border:1px solid rgba(255,255,255,0.1);">🖥️ Access Admin Control Center</a></div></div></body></html>"""
+
+
 @app.get("/portal/login", response_class=HTMLResponse)
 def farmer_login_page(error: str = None):
     err_box = f'<div style="color:#f87171; background:rgba(239,68,68,0.1); padding:12px; border-radius:8px; font-size:13px; margin-bottom:20px; font-weight:600; border: 1px solid rgba(239,68,68,0.15);">⚠️ {error}</div>' if error else ""
-    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="login-card glass-panel" style="padding:40px 25px; width:100%; max-width:380px;"><h2>Member Login</h2>{err_box}<form action="/portal/auth" method="post"><label style="font-size:11px; color:#64748b; font-weight:700; display:block; margin-bottom:6px;">PHONE NUMBER</label><input type="text" name="phone" required><button type="submit" class="btn btn-blue" style="width: 100%;">Secure Sign In</button></form></div></body></html>"""
+    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="login-card glass-panel" style="padding:40px 25px; width:100%; max-width:380px;"><h2>Member Login</h2>{err_box}<form action="/portal/auth" method="post"><label style="font-size:11px; color:#64748b; font-weight:700; display:block; margin-bottom:6px;">PHONE NUMBER</label><input type="text" name="phone" placeholder="e.g. 23480..." required><button type="submit" class="btn btn-blue" style="width: 100%;">Secure Sign In</button></form></div></body></html>"""
+
 
 @app.post("/portal/auth")
 def farmer_authentication(phone: str = Form(...)):
@@ -143,27 +146,60 @@ def farmer_authentication(phone: str = Form(...)):
     clean_phone = db_engine.clean_phone_number(phone)
     if clean_phone in db["farmers"]:
         farmer_record = db["farmers"][clean_phone]
+
+        # 🛡️ ENGINE INTERCEPTOR AUTOMATIC REPAIR BLOCK: Prevents 500 errors if records are corrupted or raw text
         if not isinstance(farmer_record, dict):
-            db["farmers"][clean_phone] = {"name": "Registered Farmer", "status": "Approved"}
-            db_engine.save_db(db)
-            farmer_record = db["farmers"][clean_phone]
-        if farmer_record.get("status", "Pending") == "Pending":
-            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting administrator review.", status_code=303)
+            farmer_record = {{"name": "Registered Node"}}
+
+        # Ensure all data properties are completely populated before logging in
+        farmer_record["name"] = farmer_record.get("name", "Registered Node")
+        farmer_record["status"] = farmer_record.get("status", "Approved")
+        farmer_record["country"] = farmer_record.get("country", "Nigeria")
+        farmer_record["state"] = farmer_record.get("state", "Osun")
+        farmer_record["city"] = farmer_record.get("city", "Osogbo")
+        farmer_record["lga"] = farmer_record.get("lga", "Osogbo")
+        farmer_record["area"] = farmer_record.get("area", "General Farm Hub")
+
+        # Save the repaired record back to file so it never errors out again
+        db["farmers"][clean_phone] = farmer_record
+        db_engine.save_db(db)
+
+        if farmer_record.get("status") == "Pending":
+            return RedirectResponse(
+                url="/portal/login?error=Access Restricted. Your application is still awaiting executive admin clearance.",
+                status_code=303)
+
         res = RedirectResponse(url="/portal/feed", status_code=303)
         res.set_cookie(key="farmer_session", value=clean_phone, max_age=2592000, httponly=True)
         return res
-    return RedirectResponse(url="/portal/login?error=Phone number not recognized.", status_code=303)
+    return RedirectResponse(url="/portal/login?error=Phone number not recognized on network scale.", status_code=303)
+
 
 @app.get("/portal/feed", response_class=HTMLResponse)
 def farmer_feed_portal(current_user=Depends(get_current_farmer)):
-    if not current_user: return RedirectResponse(url="/portal/login?error=Session expired.", status_code=303)
+    if not current_user:
+        return RedirectResponse(url="/portal/login?error=Session expired or profile mismatched.", status_code=303)
     f_phone, f_name, d = current_user["phone"], current_user["data"]["name"], current_user["data"]
-    country, state, city, lga, area = d.get("country","Nigeria"), d.get("state","Osun"), d.get("city","Osogbo"), d.get("lga","Osogbo"), d.get("area","General Farm Hub")
+
+    # Secure string properties if record entries are entirely missing key indexes
+    country = d.get("country", "Nigeria")
+    state = d.get("state", "Osun")
+    city = d.get("city", "Osogbo")
+    lga = d.get("lga", "Osogbo")
+    area = d.get("area", "General Farm Hub")
+
     db = db_engine.load_db()
-    total_neighbors = sum(1 for p, info in db["farmers"].items() if isinstance(info, dict) and info.get("lga") == lga and info.get("status") == "Approved")
+    total_neighbors = sum(1 for p, info in db["farmers"].items() if
+                          isinstance(info, dict) and info.get("lga") == lga and info.get("status") == "Approved")
     weather = get_realtime_weather(lga)
-    nb_html = "".join([f'<div style="background:rgba(59,130,246,0.03); padding:14px; margin-bottom:8px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; gap:10px;"><div><strong style="color:white; display:block; font-size:14px;">{info["name"]}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area","General")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:8px 14px; font-size:12px; border-radius:6px;">Verify</button></form></div>' for p, info in db["farmers"].items() if isinstance(info, dict) and info.get("lga") == lga and info.get("status", "Pending") == "Pending" and p != f_phone])
+    nb_html = "".join([
+                          f'<div style="background:rgba(59,130,246,0.03); padding:14px; margin-bottom:8px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; gap:10px;"><div><strong style="color:white; display:block; font-size:14px;">{{info.get("name", "Node")}}</strong><span style="font-size:12px; color:#64748b;">{{mask_phone_number(p)}} • Sector: {{info.get("area","General")}}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{{p}}"><button type="submit" class="btn btn-blue" style="padding:8px 14px; font-size:12px; border-radius:6px;">Verify</button></form></div>'
+                          for p, info in db["farmers"].items() if
+                          isinstance(info, dict) and info.get("lga") == lga and info.get("status",
+                                                                                         "Pending") == "Pending" and p != f_phone])
     return render_farmer_complete_html(f_name, country, state, city, lga, area, total_neighbors, weather, nb_html)
+
+
 @app.post("/admin/approve-farmer")
 def admin_direct_approve_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
     db_engine.approve_farmer_node(phone)
