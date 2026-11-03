@@ -16,8 +16,8 @@ def get_default_data():
     """Generates foundational members who are ALREADY approved to break the login loop!"""
     return {
         "farmers": {
-            "+2347015614407": {"name": "Kofi", "zone": "Zone_North", "status": "Approved"},
-            "+2347015614407": {"name": "Amadi", "zone": "Zone_North", "status": "Approved"},
+            "+2347089799379": {"name": "Kofi", "zone": "Zone_North", "status": "Approved"},
+            "+2347089799379": {"name": "Amadi", "zone": "Zone_North", "status": "Approved"},
             "2348030003333": {"name": "Chidi", "zone": "Zone_North", "status": "Approved"},
             "2348030004444": {"name": "Musa", "zone": "Zone_South", "status": "Approved"},
         },
