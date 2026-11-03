@@ -29,7 +29,7 @@ TWILIO_CONTENT_SID = "HXb5b62575e6e4ff6129ad7c8efe1f983e"
 
 ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
 
-import geonamescache
+
 
 # 1. Initialize the dataset
 gc = geonamescache.GeonamesCache()
@@ -555,21 +555,52 @@ def database_autofill_diagnostic_test():
 
 
 @app.post("/submit-registration")
-def handle_registration(name: str = Form(...), phone: str = Form(...), city_manual: str = Form(...),
-                        country: str = Form(None), state: str = Form(None), city: str = Form(None),
-                        lga: str = Form(None), area: str = Form(None)):
-    lookup_token = city_manual.strip().lower()
+def handle_registration(
+        name: str = Form(...),
+        phone: str = Form(...),
+        city_manual: str = Form(...),
+        country: str = Form(None),
+        state: str = Form(None),
+        city: str = Form(None),
+        lga: str = Form(None),
+        area: str = Form(None)
+):
+    # Fallback to whatever text string the user typed or selected in the searchable form
+    c = country or "Nigeria"
+    s = state or "Unknown Region"
+    # Prioritize the city selected from the datalist, fallback to manual input field
+    ci = city or city_manual
+    lg = lga or f"{ci} Sector"
+    ar = area or "General Farm Hub"
+
+    # Check against your historic quick autofill map if it matches a pre-configured local node
+    lookup_token = ci.strip().lower()
     if lookup_token in CITY_AUTOFILL_MAP:
         geo = CITY_AUTOFILL_MAP[lookup_token]
-        c, s, ci, lg, ar = geo["country"], geo["state"], city_manual, geo["lga"], geo["area"]
-    else:
-        c, s, ci, lg, ar = country or "Nigeria", state or "Unknown Region", city_manual, lga or f"{city_manual} Sector", area or "General Farm Hub"
+        c, s, lg, ar = geo["country"], geo["state"], geo["lga"], geo["area"]
+
+    # Open up your database engine file ledger
     db = db_engine.load_db()
     clean_phone = db_engine.clean_phone_number(phone)
-    db["farmers"][clean_phone] = {"name": name, "country": c, "state": s, "city": ci, "lga": lg, "area": ar, "zone": lg,
-                                  "status": "Pending"}
+
+    # Structure the new farmer record cleanly with simple string parameters
+    db["farmers"][clean_phone] = {
+        "name": name,
+        "country": str(c),
+        "state": str(s),
+        "city": str(ci),
+        "lga": str(lg),
+        "area": str(ar),
+        "zone": str(lg),
+        "status": "Pending"
+    }
     db_engine.save_db(db)
+
+    # Fire off notification logs to administration channels
     if lookup_token not in CITY_AUTOFILL_MAP:
-        send_admin_webhook({"text": f"🚧 *UNMAPPED CITY ALERT*: *{name}* ({phone}) signed up using: *{city_manual}*."})
+        send_admin_webhook(
+            {"text": f"🚧 *NEW LOCATION REGISTERED*: *{name}* ({phone}) signed up under: {ci}, {s}, {c}."})
+
     return HTMLResponse(
-        content=f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="glass-panel" style="padding:40px 25px; text-align:center; max-width:440px; width:100%;"><h2 style="color:#eab308; margin-top:0;">⏳ Profile Mapped</h2><p style="color:#94a3b8; font-size:14px;">Thank you, {name}. System mapped you under <strong>{lg} Sector</strong> based on your city input. Awaiting administrator gate clearance.</p><a href="/" class="btn btn-emerald" style="margin-top:20px; width:100%;">Back Home</a></div></body></html>""")
+        content=f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="glass-panel" style="padding:40px 25px; text-align:center; max-width:440px; width:100%;"><h2 style="color:#eab308; margin-top:0;">⏳ Profile Mapped</h2><p style="color:#94a3b8; font-size:14px;">Thank you, {name}. System mapped your node under <strong>{lg}</strong> based on your location values. Awaiting administrator gate clearance.</p><a href="/" class="btn btn-emerald" style="margin-top:20px; width:100%;">Back Home</a></div></body></html>"""
+    )
