@@ -8,7 +8,6 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import database as db_engine
-import geonamescache
 
 app = FastAPI(title="Farm Watch Enterprise Node", version="4.6.0")
 security = HTTPBasic()
@@ -29,66 +28,41 @@ TWILIO_CONTENT_SID = "HXb5b62575e6e4ff6129ad7c8efe1f983e"
 
 ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
 
-
-
-# 1. Initialize the dataset
-gc = geonamescache.GeonamesCache()
-all_countries = gc.get_countries()
-all_cities = gc.get_cities()
-
-# 2. Local mapper translating internal ISO numerical admin codes directly into clean strings
-NIGERIA_STATE_MAP = {
-    "15": "Osun",
-    "24": "Oyo",
-    "05": "Kano",
-    "25": "Lagos",
-    "30": "FCT Abuja",
-    "01": "Abia", "02": "Adamawa", "03": "Akwa Ibom", "04": "Anambra", "06": "Bauchi",
-    "07": "Bayelsa", "08": "Benue", "09": "Borno", "10": "Cross River", "11": "Delta",
-    "12": "Ebonyi", "13": "Edo", "14": "Ekiti", "16": "Enugu", "17": "Gombe", "18": "Imo",
-    "19": "Jigawa", "20": "Kaduna", "21": "Katsina", "22": "Kebbi", "23": "Kogi",
-    "26": "Nasarawa", "27": "Niger", "28": "Ogun", "29": "Ondo", "31": "Plateau",
-    "32": "Rivers", "33": "Sokoto", "34": "Taraba", "35": "Yobe", "36": "Zamfara"
+GLOBAL_GEO_DB = {
+    "Nigeria": {
+        "Kano": {
+            "Kano Municipal": ["Gandun Albasa", "Kano City Center", "Tudun Wada"],
+            "Fagge": ["Fagge D2", "Waje", "Sabon Gari"]
+        },
+        "Lagos": {
+            "Ikeja": ["Alausa", "Oregun", "Computer Village"],
+            "Lekki": ["Phase 1", "Ikate", "Chevron Node"]
+        },
+        "Osun": {
+            "Osogbo": ["Olorunda Central", "Capital Hub Ring", "Ataoja Sector"],
+            "Ile-Ife": ["Ife Central Town", "Modakeke Border", "University Outpost"],
+            "Ilesa": ["Ilesa East Sector", "Ilesa West Farm Ring", "Ijebu-Jesa Road"],
+            "Ede": ["Ede South Agrarian", "Timi Market Node", "Federal Poly Outskirt"]
+        },
+        "Oyo": {
+            "Ibadan": ["Ido Farming Grid", "Oluyole Frontier", "Lagelu Outpost Area"],
+            "Ogbomoso": ["Ogbomoso North LAUTECH", "Ogbomoso South Central"],
+            "Iseyin": ["Iseyin-Okeogun Central", "Ado-Awaye Route", "Agrarian North"],
+            "Saki": ["Saki West Grid", "Saki East Valley", "Oke-Ogun Boundary Ring"]
+        }
+    }
 }
-
-GLOBAL_GEO_DB = {}
-
-# 3. Process and structure the geographic nodes on startup
-for city_id, city_info in all_cities.items():
-    country_code = city_info.get('countrycode', '')
-    country_name = all_countries.get(country_code, {}).get('name', 'Unknown')
-
-    # Grab the raw administrative integer string
-    state_code = str(city_info.get('admin1code', ''))
-
-    # Translate if it's Nigeria, fallback to "Region XX" for other global locations
-    if country_code == "NG" and state_code in NIGERIA_STATE_MAP:
-        state_name = NIGERIA_STATE_MAP[state_code]
-    elif state_code:
-        state_name = f"Region {state_code}"
-    else:
-        state_name = "General Region"
-
-    # Inject systematically into your existing frontend dropdown dictionary scheme
-    if country_name not in GLOBAL_GEO_DB:
-        GLOBAL_GEO_DB[country_name] = {}
-    if state_name not in GLOBAL_GEO_DB[country_name]:
-        GLOBAL_GEO_DB[country_name][state_name] = {}
-
-    city_name = city_info['name']
-
-    # Preserve the deep local sector breakdown array so your registration scripts match up
-    GLOBAL_GEO_DB[country_name][state_name][city_name] = [
-        "Central Sector",
-        "Agrarian Grid Zone"
-    ]
-
+CITY_AUTOFILL_MAP = {
+    "osogbo": {"country": "Nigeria", "state": "Osun", "lga": "Osogbo", "area": "Ataoja Sector"},
+    "ile-ife": {"country": "Nigeria", "state": "Osun", "lga": "Ile-Ife", "area": "Ife Central Town"},
+    "ibadan": {"country": "Nigeria", "state": "Oyo", "lga": "Ibadan", "area": "Ido Farming Grid"},
+    "ogbomoso": {"country": "Nigeria", "state": "Oyo", "lga": "Ogbomoso", "area": "Ogbomoso South Central"}
+}
 
 class DatabaseChangeHandler(FileSystemEventHandler):
     def on_modified(self, event):
         if os.path.basename(event.src_path) == os.path.basename(db_engine.DB_FILE):
             pass
-
 
 def start_db_watchdog():
     db_dir = os.path.dirname(os.path.abspath(db_engine.DB_FILE)) or "."
@@ -96,20 +70,18 @@ def start_db_watchdog():
     observer.schedule(DatabaseChangeHandler(), path=db_dir, recursive=False)
     observer.start()
 
-
 threading.Thread(target=start_db_watchdog, daemon=True).start()
-
 
 def mask_phone_number(phone: str) -> str:
     clean = str(phone).strip()
     if len(clean) <= 6: return "••••" + clean[-2:] if len(clean) > 2 else "••••"
     return f"{clean[:4]}••••{clean[-3:]}"
 
-
 def send_production_alert(to_number: str, message_text: str):
     """Fires a structural title-case template payload directly to Twilio's REST API."""
     url = f"https://twilio.com{TWILIO_ACCOUNT_SID}/Messages.json"
 
+    # Ensure the target format is clean and exactly what Twilio expects
     clean_target = str(to_number).strip()
     if not clean_target.startswith("whatsapp:"):
         clean_target = f"whatsapp:{clean_target}"
@@ -128,6 +100,7 @@ def send_production_alert(to_number: str, message_text: str):
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
             timeout=5.0
         )
+        # Log the response in Render Console so you can see the error code
         print(f"📡 Twilio Dispatch Status: {res.status_code} | Response: {res.text}")
         return res.status_code == 201
     except Exception as e:
@@ -150,35 +123,25 @@ def get_realtime_weather(lga: str) -> dict:
             temp = w_data.get("temperature", 28.5)
             desc = "Optimal Growth" if 22 <= temp <= 32 else "Monitor Soil Hydration"
             return {"temp": f"{temp}°C", "desc": desc}
-    except Exception:
-        pass
+    except Exception: pass
     return {"temp": "28.5°C", "desc": "Optimal Conditions"}
-
 
 def send_admin_webhook(payload: dict):
     if "://slack.com" in ADMIN_ALERT_WEBHOOK_URL or "://discord.com" in ADMIN_ALERT_WEBHOOK_URL:
-        try:
-            requests.post(ADMIN_ALERT_WEBHOOK_URL, json=payload, timeout=3)
-        except Exception:
-            pass
-
-
+        try: requests.post(ADMIN_ALERT_WEBHOOK_URL, json=payload, timeout=3)
+        except Exception: pass
 def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
     is_user = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
     is_pass = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
     if not (is_user and is_pass):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bad credentials.",
-                            headers={"WWW-Authenticate": "Basic"})
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bad credentials.", headers={"WWW-Authenticate": "Basic"})
     return credentials.username
-
 
 def get_current_farmer(farmer_session: str = Cookie(None)):
     if not farmer_session: return None
     db = db_engine.load_db()
     clean_phone = db_engine.clean_phone_number(farmer_session)
     return {"phone": clean_phone, "data": db["farmers"][clean_phone]} if clean_phone in db["farmers"] else None
-
-
 CORE_CSS = """
     body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: radial-gradient(circle at 10% 20%, #0f172a 0%, #020617 90%); color: #f8fafc; margin: 0; padding: 20px; min-height: 100vh; display: flex; justify-content: center; align-items: center; box-sizing: border-box; }
     .glass-panel { background: rgba(15, 23, 42, 0.65); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 24px; box-shadow: 0 20px 50px rgba(0,0,0,0.4); width: 100%; box-sizing: border-box; }
@@ -188,19 +151,14 @@ CORE_CSS = """
     input, select { width:100%; padding:12px; background:#020617; border: 1px solid rgba(255,255,255,0.1); color:white; border-radius:8px; box-sizing:border-box; margin-bottom:15px; font-size: 14px; }
     .responsive-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; width: 100%; }
 """
-
-
 @app.get("/", response_class=HTMLResponse)
 def community_homepage():
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="hero glass-panel" style="max-width: 550px; text-align: center; padding: 40px 30px;"><h1>📡 Farm Watch Ecosystem</h1><p style="color: #94a3b8; margin-bottom: 30px; line-height: 1.6; font-size: 15px;">Next-generation protection grid protecting local livelihoods.</p><div style="display:flex; flex-direction:column; gap:14px;"><a href="/register" class="btn btn-emerald">➕ Register Operational Node</a><a href="/portal/login" class="btn btn-blue">👩‍🌾 Member Authentication Portal</a><a href="/dashboard" class="btn" style="background:rgba(255,255,255,0.03); color:#cbd5e1; border:1px solid rgba(255,255,255,0.1);">🖥️ Access Admin Control Center</a></div></div></body></html>"""
-
 
 @app.get("/portal/login", response_class=HTMLResponse)
 def farmer_login_page(error: str = None):
     err_box = f'<div style="color:#f87171; background:rgba(239,68,68,0.1); padding:12px; border-radius:8px; font-size:13px; margin-bottom:20px; font-weight:600; border: 1px solid rgba(239,68,68,0.15);">⚠️ {error}</div>' if error else ""
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="login-card glass-panel" style="padding:40px 25px; width:100%; max-width:380px;"><h2>Member Login</h2>{err_box}<form action="/portal/auth" method="post"><label style="font-size:11px; color:#64748b; font-weight:700; display:block; margin-bottom:6px;">PHONE NUMBER</label><input type="text" name="phone" placeholder="e.g. 23480..." required><button type="submit" class="btn btn-blue" style="width: 100%;">Secure Sign In</button></form></div></body></html>"""
-
-
 @app.post("/portal/auth")
 def farmer_authentication(phone: str = Form(...)):
     db = db_engine.load_db()
@@ -224,29 +182,17 @@ def farmer_authentication(phone: str = Form(...)):
         res.set_cookie(key="farmer_session", value=clean_phone, max_age=2592000, httponly=True)
         return res
     return RedirectResponse(url="/portal/login?error=Phone number not recognized on network scale.", status_code=303)
-
-
 @app.get("/portal/feed", response_class=HTMLResponse)
 def farmer_feed_portal(current_user=Depends(get_current_farmer)):
     if not current_user:
         return RedirectResponse(url="/portal/login?error=Session expired or profile mismatched.", status_code=303)
     f_phone, f_name, d = current_user["phone"], current_user["data"]["name"], current_user["data"]
-    country, state, city, lga, area = d.get("country", "Nigeria"), d.get("state", "Osun"), d.get("city",
-                                                                                                 "Osogbo"), d.get("lga",
-                                                                                                                  "Osogbo"), d.get(
-        "area", "General Farm Hub")
+    country, state, city, lga, area = d.get("country", "Nigeria"), d.get("state", "Osun"), d.get("city", "Osogbo"), d.get("lga", "Osogbo"), d.get("area", "General Farm Hub")
     db = db_engine.load_db()
-    total_neighbors = sum(1 for p, info in db["farmers"].items() if
-                          isinstance(info, dict) and info.get("lga") == lga and info.get("status") == "Approved")
+    total_neighbors = sum(1 for p, info in db["farmers"].items() if isinstance(info, dict) and info.get("lga") == lga and info.get("status") == "Approved")
     weather = get_realtime_weather(lga)
-    nb_html = "".join([
-                          f'<div style="background:rgba(59,130,246,0.03); padding:14px; margin-bottom:8px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; gap:10px;"><div><strong style="color:white; display:block; font-size:14px;">{info.get("name", "Node")}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area", "General")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:8px 14px; font-size:12px; border-radius:6px;">Verify</button></form></div>'
-                          for p, info in db["farmers"].items() if
-                          isinstance(info, dict) and info.get("lga") == lga and info.get("status",
-                                                                                         "Pending") == "Pending" and p != f_phone])
+    nb_html = "".join([f'<div style="background:rgba(59,130,246,0.03); padding:14px; margin-bottom:8px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; gap:10px;"><div><strong style="color:white; display:block; font-size:14px;">{info.get("name", "Node")}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area","General")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:8px 14px; font-size:12px; border-radius:6px;">Verify</button></form></div>' for p, info in db["farmers"].items() if isinstance(info, dict) and info.get("lga") == lga and info.get("status", "Pending") == "Pending" and p != f_phone])
     return render_farmer_complete_html(f_name, country, state, city, lga, area, total_neighbors, weather, nb_html)
-
-
 def render_farmer_complete_html(f_name, country, state, city, lga, area, total_neighbors, weather, nb_html):
     return f"""
     <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS} body {{ display:block; padding:15px; }} .container {{ max-width:950px; margin:0 auto; width:100%; }} @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }} .spinner {{ display: none; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: white; animation: spin 0.8s linear infinite; margin-right: 10px; }} .fun-widget {{ display:flex; gap:15px; margin-bottom:20px; flex-wrap:wrap; }} .widget-card {{ flex:1; min-width:140px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); padding:15px; border-radius:14px; text-align:center; }} .trivia-box {{ display:none; background:rgba(15,23,42,0.9); border:1px solid rgba(255,255,255,0.1); padding:20px; border-radius:16px; margin-bottom:25px; }} .social-link {{ display:inline-flex; align-items:center; gap:6px; color:#38bdf8; text-decoration:none; background:rgba(255,255,255,0.02); padding:8px 16px; border-radius:8px; border:1px solid rgba(255,255,255,0.05); font-size:13px; font-weight:700; transition:0.2s; }} .social-link:hover {{ background:rgba(255,255,255,0.08); transform:translateY(-1px); }}</style></head>
@@ -329,19 +275,13 @@ def render_farmer_complete_html(f_name, country, state, city, lga, area, total_n
     setInterval(fetchLiveFeedStream, 2000); fetchLiveFeedStream();
 </script></body></html>
 """
-
-
 @app.get("/portal/feed/stream")
 def portal_async_feed_stream(current_user=Depends(get_current_farmer)):
     if not current_user: return Response(status_code=401)
     lga = current_user["data"].get("lga", "Unknown")
     db = db_engine.load_db()
-    html = "".join([
-                       f'<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:16px; margin-bottom:12px; border-radius:12px;"><div style="display:flex; justify-content:space-between; font-size:11px; color:#64748b; margin-bottom:4px;"><span>⏱️ {i["timestamp"]}</span><span style="color:#ef4444; font-weight:800;">{i["status"]}</span></div><strong style="color:#f97316; font-size:13px;">[{i.get("type")}]</strong><span style="display:block; margin:6px 0; color:#e2e8f0; line-height:1.4;">"{i["message"]}"</span><span style="font-size:11px; color:#475569;">Origin: {i["sender"]}</span></div>'
-                       for i in reversed(db["alerts_log"]) if i.get("lga") == lga])
-    return HTMLResponse(
-        content=html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>Sectors quiet across local scope.</p>")
-
+    html = "".join([f'<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:16px; margin-bottom:12px; border-radius:12px;"><div style="display:flex; justify-content:space-between; font-size:11px; color:#64748b; margin-bottom:4px;"><span>⏱️ {i["timestamp"]}</span><span style="color:#ef4444; font-weight:800;">{i["status"]}</span></div><strong style="color:#f97316; font-size:13px;">[{i.get("type")}]</strong><span style="display:block; margin:6px 0; color:#e2e8f0; line-height:1.4;">"{i["message"]}"</span><span style="font-size:11px; color:#475569;">Origin: {i["sender"]}</span></div>' for i in reversed(db["alerts_log"]) if i.get("lga") == lga])
+    return HTMLResponse(content=html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>Sectors quiet across local scope.</p>")
 
 @app.post("/portal/alert/raise")
 def farmer_raise_alert(alert_type: str = Form(...), message: str = Form(...), current_user=Depends(get_current_farmer)):
@@ -355,14 +295,9 @@ def farmer_raise_alert(alert_type: str = Form(...), message: str = Form(...), cu
         for field in ["country", "state", "city", "lga", "area"]: db["alerts_log"][idx][field] = d.get(field, "Unknown")
         db_engine.save_db(db)
     override = alert_type in ["Critical Disaster", "Armed Attack"]
-    targets = [p for p, data in db["farmers"].items() if
-               isinstance(data, dict) and p != f_phone and data.get("status") == "Approved" and (
-                           override or data.get("lga") == d.get("lga"))]
-    threading.Thread(
-        target=lambda: [send_production_alert(n, f"ALERT [{alert_type.upper()}] from {f_name}: {message}") for n in
-                        targets], daemon=True).start()
+    targets = [p for p, data in db["farmers"].items() if isinstance(data, dict) and p != f_phone and data.get("status") == "Approved" and (override or data.get("lga") == d.get("lga"))]
+    threading.Thread(target=lambda: [send_production_alert(n, f"ALERT [{alert_type.upper()}] from {f_name}: {message}") for n in targets], daemon=True).start()
     return Response(status_code=200)
-
 
 @app.get("/admin/export-ledger")
 def admin_export_ledger(username: str = Depends(authenticate_admin)):
@@ -371,30 +306,21 @@ def admin_export_ledger(username: str = Depends(authenticate_admin)):
     for i in db.get("alerts_log", []):
         msg = i.get("message", "").replace('"', '""')
         csv_data += f'"{i.get("timestamp")}","{i.get("type")}","{i.get("sender")}","{i.get("lga")}","{msg}","{i.get("status")}"\n'
-    return StreamingResponse(iter([csv_data]), media_type="text/csv",
-                             headers={"Content-Disposition": "attachment; filename=farm_watch_security_ledger.csv"})
-
-
+    return StreamingResponse(iter([csv_data]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=farm_watch_security_ledger.csv"})
 @app.post("/portal/approve-node")
 def handle_node_approval(target_phone: str = Form(...), current_user=Depends(get_current_farmer)):
-    if not current_user: return HTMLResponse(
-        content="<html><script>window.location.href='/portal/login';</script></html>")
+    if not current_user: return HTMLResponse(content="<html><script>window.location.href='/portal/login';</script></html>")
     db_engine.approve_farmer_node(target_phone)
     return HTMLResponse(content="<html><script>window.location.href='/portal/feed';</script></html>")
 
-
 @app.get("/portal/logout")
 def handle_member_logout():
-    response = HTMLResponse(
-        content="<html><script>document.cookie='farmer_session=; max-age=0; path=/;'; window.location.href='/';</script></html>")
+    response = HTMLResponse(content="<html><script>document.cookie='farmer_session=; max-age=0; path=/;'; window.location.href='/';</script></html>")
     return response
-
-
 @app.get("/dashboard", response_class=HTMLResponse)
 def admin_dashboard(username: str = Depends(authenticate_admin)):
     db = db_engine.load_db()
-    total, active, resolved = len(db["farmers"]), sum(1 for i in db["alerts_log"] if i.get("status") == "Active"), sum(
-        1 for i in db["alerts_log"] if i.get("status") == "Resolved")
+    total, active, resolved = len(db["farmers"]), sum(1 for i in db["alerts_log"] if i.get("status") == "Active"), sum(1 for i in db["alerts_log"] if i.get("status") == "Resolved")
     pending_html = ""
     for phone, m in db["farmers"].items():
         if isinstance(m, dict) and m.get("status", "Pending") == "Pending":
@@ -402,20 +328,14 @@ def admin_dashboard(username: str = Depends(authenticate_admin)):
     grouped_html, by_geo = "", {}
     for p, f in db["farmers"].items():
         if isinstance(f, dict) and f.get("status") == "Approved":
-            g_key = f"{f.get('country', 'Unknown')} → {f.get('state', 'Unknown')} → {f.get('city', 'Unknown')} → {f.get('lga', 'Unknown')}"
+            g_key = f"{f.get('country','Unknown')} → {f.get('state','Unknown')} → {f.get('city','Unknown')} → {f.get('lga','Unknown')}"
             if g_key not in by_geo: by_geo[g_key] = []
             by_geo[g_key].append((p, f))
     for path, members in by_geo.items():
-        m_list = "".join([
-                             f'<li style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:rgba(255,255,255,0.02); margin-bottom:6px; border-radius:8px; gap:10px;"><span style="font-size:14px;">🟢 <strong>{m["name"]}</strong> ({m.get("area")}) <small style="color:#64748b; display:block; margin-top:2px;">{phone}</small></span><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:13px;">❌ Remove</button></form></li>'
-                             for phone, m in members])
+        m_list = "".join([f'<li style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:rgba(255,255,255,0.02); margin-bottom:6px; border-radius:8px; gap:10px;"><span style="font-size:14px;">🟢 <strong>{m["name"]}</strong> ({m.get("area")}) <small style="color:#64748b; display:block; margin-top:2px;">{phone}</small></span><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:13px;">❌ Remove</button></form></li>' for phone, m in members])
         grouped_html += f'<div style="margin-bottom:20px; border-left:3px solid #3b82f6; padding-left:12px;"><h4 style="margin:0 0 10px; color:#38bdf8; font-size:13px; text-transform:uppercase; letter-spacing:0.5px;">🗺️ {path}</h4><ul style="padding:0; margin:0; list-style:none;">{m_list}</ul></div>'
-    al_html = "".join([
-                          f'<div style="background:rgba(239,68,68,0.03); border:1px solid rgba(239,68,68,0.1); padding:16px; margin-bottom:10px; border-radius:12px; display:flex; justify-content:space-between; align-items:center; gap:15px; flex-wrap:wrap;"><div style="font-size:14px; line-height:1.4;"><strong>🚨 {i["type"]} ({i.get("lga")}):</strong> "{i["message"]}"</div><form action="/resolve-alert" method="post" style="margin:0;"><input type="hidden" name="alert_id" value="{idx}"><button type="submit" class="btn" style="background:#10b981; color:white; padding:6px 14px; font-size:12px; border-radius:6px;">Clear</button></form></div>'
-                          for idx, i in enumerate(db["alerts_log"]) if i.get("status") == "Active"])
+    al_html = "".join([f'<div style="background:rgba(239,68,68,0.03); border:1px solid rgba(239,68,68,0.1); padding:16px; margin-bottom:10px; border-radius:12px; display:flex; justify-content:space-between; align-items:center; gap:15px; flex-wrap:wrap;"><div style="font-size:14px; line-height:1.4;"><strong>🚨 {i["type"]} ({i.get("lga")}):</strong> "{i["message"]}"</div><form action="/resolve-alert" method="post" style="margin:0;"><input type="hidden" name="alert_id" value="{idx}"><button type="submit" class="btn" style="background:#10b981; color:white; padding:6px 14px; font-size:12px; border-radius:6px;">Clear</button></form></div>' for idx, i in enumerate(db["alerts_log"]) if i.get("status") == "Active"])
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS} body {{ display:block; padding:15px; }} .box {{ max-width:1000px; margin:0 auto; width:100%; }} .stats-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:16px; margin:25px 0; }} .card {{ padding:20px; text-align:center; }} .card h2 {{ margin:0 0 4px; font-size:32px; font-weight:800; }}</style></head><body><div class="box glass-panel" style="padding:30px 20px;"><div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px;"><h2>📡 Global Command Dashboard</h2><a href="/admin/export-ledger" class="btn btn-emerald" style="padding:8px 16px; font-size:13px;">📊 Export Ledger Spreadsheet</a></div><div class="stats-grid"><div class="card glass-panel" style="border-top:3px solid #10b981;"><h2>{total}</h2><small style="color:#64748b; font-weight:700; letter-spacing:0.5px;">REGISTRATIONS</small></div><div class="card glass-panel" style="border-top:3px solid #ef4444;"><h2>{active}</h2><small style="color:#64748b; font-weight:700; letter-spacing:0.5px;">ACTIVE THREATS</small></div><div class="card glass-panel" style="border-top:3px solid #3b82f6;"><h2>{resolved}</h2><small style="color:#64748b; font-weight:700; letter-spacing:0.5px;">CONTAINED</small></div></div><h3 style="color:#eab308; border-bottom:1px solid rgba(234,179,8,0.1); padding-bottom:8px; margin-top:30px;">⏳ Awaiting Executive Security Authorization</h3>{pending_html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>No new registrations pending clearance.</p>"}<h3>🚨 Active Alarms Ledger</h3>{al_html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>No open alarms.</p>"}<h3>🗂️ Authorized Active Infrastructure Ring Map</h3>{grouped_html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>Map unmapped.</p>"}</div></body></html>"""
-
-
 @app.post("/incoming-alert")
 def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
     db = db_engine.load_db()
@@ -426,181 +346,59 @@ def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
     lga = f_data.get("lga", "Unknown")
     alert_type, override = "General Anomaly", False
     msg_lower = Body.lower()
-    if "fire" in msg_lower or "flood" in msg_lower:
-        alert_type, override = "Critical Disaster", True
-    elif "thief" in msg_lower or "intruder" in msg_lower:
-        alert_type = "Intruder Spotted"
-    elif "attack" in msg_lower or "armed" in msg_lower:
-        alert_type, override = "Armed Attack", True
+    if "fire" in msg_lower or "flood" in msg_lower: alert_type, override = "Critical Disaster", True
+    elif "thief" in msg_lower or "intruder" in msg_lower: alert_type = "Intruder Spotted"
+    elif "attack" in msg_lower or "armed" in msg_lower: alert_type, override = "Armed Attack", True
     db_engine.archive_incident(f_data["name"], lga, Body, alert_type)
     idx = len(db["alerts_log"]) - 1
     if idx >= 0:
         db = db_engine.load_db()
-        for field in ["country", "state", "city", "lga", "area"]: db["alerts_log"][idx][field] = f_data.get(field,
-                                                                                                            "Unknown")
+        for field in ["country", "state", "city", "lga", "area"]: db["alerts_log"][idx][field] = f_data.get(field, "Unknown")
         db_engine.save_db(db)
-    targets = [p for p, d in db["farmers"].items() if
-               isinstance(d, dict) and p != sender_number and d.get("status") == "Approved" and (
-                           override or d.get("lga") == lga)]
-    threading.Thread(
-        target=lambda: [send_production_alert(num, f"ALERT [{alert_type.upper()}] from {f_data['name']}: {Body}") for
-                        num in targets], daemon=True).start()
+    targets = [p for p, d in db["farmers"].items() if isinstance(d, dict) and p != sender_number and d.get("status") == "Approved" and (override or d.get("lga") == lga)]
+    threading.Thread(target=lambda: [send_production_alert(num, f"ALERT [{alert_type.upper()}] from {f_data['name']}: {Body}") for num in targets], daemon=True).start()
     return Response(content="<Response></Response>", media_type="application/xml")
-
-
 @app.post("/admin/approve-farmer")
 def admin_direct_approve_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
     db_engine.approve_farmer_node(phone)
     return RedirectResponse(url="/dashboard", status_code=303)
-
 
 @app.post("/delete-farmer")
 def handle_delete_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
     db_engine.remove_farmer(phone)
     return RedirectResponse(url="/dashboard", status_code=303)
 
-
 @app.post("/resolve-alert")
 def resolve_alert(alert_id: int = Form(...)):
     db_engine.update_incident_status(alert_id)
     return RedirectResponse(url="/dashboard", status_code=303)
-
-
-@app.get("/register", response_class=HTMLResponse)
 @app.get("/register", response_class=HTMLResponse)
 def registration_form():
-    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS} body{{display:flex; justify-content:center; align-items:center; min-height:100vh; padding:15px;}} .reg {{ max-width:440px; width:100%; }} label{{display:block; margin:12px 0 4px; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.5px;}}</style></head><body><div class="glass-panel reg" style="padding:35px 25px;"><h2>Register Security Node</h2><p style="color:#64748b; font-size:13px; margin-top:-10px; margin-bottom:25px; line-height:1.4;">Provide data or type custom parameters directly inside the interactive fields below.</p><form action="/submit-registration" method="post" style="margin:0;"><label>Farmer Name</label><input type="text" name="name" placeholder="Kwame" required><label>Phone Number</label><input type="text" name="phone" placeholder="e.g. +234..." required><label>City / Town (Autofill Input)</label><input type="text" name="city_manual" required>
-
-    <div style="border:1px solid rgba(255,255,255,0.05); padding:15px 12px; border-radius:12px; margin-bottom:20px; background: rgba(0,0,0,0.1);">
-        <label style="margin:0 0 8px; color:#94a3b8;">Location Selection (Type to Search or Click Dropdown)</label>
-
-        <!-- Country Input -->
-        <input type="text" id="c_select" name="country" list="country_list" placeholder="-- Type or Select Country --" oninput="updateStates()">
-        <datalist id="country_list"></datalist>
-
-        <!-- State Input -->
-        <input type="text" id="s_select" name="state" list="state_list" placeholder="-- Type or Select State --" oninput="updateCities()" disabled>
-        <datalist id="state_list"></datalist>
-
-        <!-- City Input -->
-        <input type="text" id="city_select" name="city" list="city_list" placeholder="-- Type or Select City --" disabled>
-        <datalist id="city_list"></datalist>
-    </div>
-
-    <button type="submit" class="btn btn-emerald" style="width:100%;">Complete Request</button></form><br><center><a href="/register/test" style="color:#38bdf8; font-size:12px; text-decoration:underline;">💻 Launch Autofill Diagnostic Simulator</a></center></div>
+    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS} body{{display:flex; justify-content:center; align-items:center; min-height:100vh; padding:15px;}} .reg {{ max-width:440px; width:100%; }} label{{display:block; margin:12px 0 4px; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.5px;}}</style></head><body><div class="glass-panel reg" style="padding:35px 25px;"><h2>Register Security Node</h2><p style="color:#64748b; font-size:13px; margin-top:-10px; margin-bottom:25px; line-height:1.4;">Provide drop data OR skip fields and just type your city below.</p><form action="/submit-registration" method="post" style="margin:0;"><label>Farmer Name</label><input type="text" name="name" placeholder="Kwame" required><label>Phone Number</label><input type="text" name="phone" placeholder="e.g. +234..." required><label>City / Town (Autofill Input)</label><input type="text" name="city_manual" required><div style="border:1px solid rgba(255,255,255,0.05); padding:15px 12px; border-radius:12px; margin-bottom:20px; background: rgba(0,0,0,0.1);"><label style="margin:0 0 8px; color:#94a3b8;">Optional Dropdowns</label><select id="c_select" name="country" onchange="updateStates()"><option value="">-- Country --</option><option value="Nigeria">Nigeria</option></select><select id="s_select" name="state" onchange="updateCities()"><option value="">-- State --</option></select><select id="city_select" name="city" onchange="updateLGAs()"><option value="">-- City --</option></select><select id="lga_select" name="lga" onchange="updateAreas()"><option value="">-- LGA --</option></select><select id="area_select" name="area"><option value="">-- Area --</option></select></div><button type="submit" class="btn btn-emerald" style="width:100%;">Complete Request</button></form><br><center><a href="/register/test" style="color:#38bdf8; font-size:12px; text-decoration:underline;">💻 Launch Autofill Diagnostic Simulator</a></center></div>
     <script>
         const geoDb = {str(GLOBAL_GEO_DB)};
-
-        // Initialize country list arrays instantly on page load
-        window.onload = function() {{
-            const cList = document.getElementById("country_list");
-            cList.innerHTML = "";
-            Object.keys(geoDb).sort().forEach(country => {{
-                let option = document.createElement("option");
-                option.value = country;
-                cList.appendChild(option);
-            }});
-        }};
-
-        function updateStates() {{
-            const countryVal = document.getElementById("c_select").value;
-            const sInput = document.getElementById("s_select");
-            const sList = document.getElementById("state_list");
-
-            sInput.value = ""; sInput.disabled = true; sList.innerHTML = "";
-            document.getElementById("city_select").value = ""; 
-            document.getElementById("city_select").disabled = true;
-            document.getElementById("city_list").innerHTML = "";
-
-            if (countryVal && geoDb[countryVal]) {{
-                sInput.disabled = false;
-                Object.keys(geoDb[countryVal]).sort().forEach(state => {{
-                    let option = document.createElement("option");
-                    option.value = state;
-                    sList.appendChild(option);
-                }});
-            }}
-        }}
-
-        function updateCities() {{
-            const countryVal = document.getElementById("c_select").value;
-            const stateVal = document.getElementById("s_select").value;
-            const cityInput = document.getElementById("city_select");
-            const cityList = document.getElementById("city_list");
-
-            cityInput.value = ""; cityInput.disabled = true; cityList.innerHTML = "";
-
-            if (countryVal && stateVal && geoDb[countryVal][stateVal]) {{
-                cityInput.disabled = false;
-                let cities = geoDb[countryVal][stateVal];
-                let cityNames = Array.isArray(cities) ? cities : Object.keys(cities);
-
-                cityNames.sort().forEach(city => {{
-                    let option = document.createElement("option");
-                    option.value = city;
-                    cityList.appendChild(option);
-                }});
-            }}
-        }}
+        function updateStates() {{ const c = document.getElementById("c_select").value; const s = document.getElementById("s_select"); s.innerHTML = '<option value="">-- State --</option>'; document.getElementById("city_select").innerHTML = '<option value="">-- City --</option>'; document.getElementById("lga_select").innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>'; if(c && geoDb[c]) {{ Object.keys(geoDb[c]).forEach(k => {{ s.options.add(new Option(k, k)); }}); }} }}
+        function updateCities() {{ const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select"); city.innerHTML = '<option value="">-- City --</option>'; document.getElementById("lga_select").innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>'; if(c && s && geoDb[c][s]) {{ Object.keys(geoDb[c][s]).forEach(k => {{ city.options.add(new Option(k, k)); }}); }} }}
+        function updateLGAs() {{ const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select"); lga.innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>'; if(c && s && city && geoDb[c][s][city]) {{ Object.keys(geoDb[c][s][city]).forEach(k => {{ lga.options.add(new Option(k, k)); }}); }} }}
+        function updateAreas() {{ const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select").value; const area = document.getElementById("area_select"); area.innerHTML = '<option value="">-- Area --</option>'; if(c && s && city && lga && geoDb[c][s][city][lga]) {{ geoDb[c][s][city][lga].forEach(v => {{ area.options.add(new Option(v, v)); }}); }} }}
     </script></body></html>"""
-
-
 @app.get("/register/test", response_class=HTMLResponse)
 def database_autofill_diagnostic_test():
     test_scenarios = ["Osogbo", "Ibadan", "Ogbomoso", "Ile-Ife"]
-    logs_html = "".join([
-                            f'<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:12px; margin-bottom:6px; border-radius:8px;">🔍 Testing Keyword: <strong>"{tok}"</strong> → Result Country: <strong>{CITY_AUTOFILL_MAP[tok.lower()]["country"]}</strong> | Resolved District: <strong>{CITY_AUTOFILL_MAP[tok.lower()]["lga"]}</strong> <span style="color:#10b981; float:right;">✔ PASS</span></div>'
-                            for tok in test_scenarios])
+    logs_html = "".join([f'<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:12px; margin-bottom:6px; border-radius:8px;">🔍 Testing Keyword: <strong>"{tok}"</strong> → Result Country: <strong>{CITY_AUTOFILL_MAP[tok.lower()]["country"]}</strong> | Resolved District: <strong>{CITY_AUTOFILL_MAP[tok.lower()]["lga"]}</strong> <span style="color:#10b981; float:right;">✔ PASS</span></div>' for tok in test_scenarios])
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="glass-panel" style="max-width:550px; padding:30px 20px;"><h3>💻 Mapped Autofill Diagnostic Test Matrix</h3><p style="color:#64748b; font-size:13px; margin-top:-10px;">Simulating instant query extraction parameters across open background threads:</p>{logs_html}<br><a href="/register" class="btn btn-blue" style="width:100%;">Return to Live Form</a></div></body></html>"""
-
-
 @app.post("/submit-registration")
-def handle_registration(
-        name: str = Form(...),
-        phone: str = Form(...),
-        city_manual: str = Form(...),
-        country: str = Form(None),
-        state: str = Form(None),
-        city: str = Form(None),
-        lga: str = Form(None),
-        area: str = Form(None)
-):
-    # Fallback to whatever text string the user typed or selected in the searchable form
-    c = country or "Nigeria"
-    s = state or "Unknown Region"
-    # Prioritize the city selected from the datalist, fallback to manual input field
-    ci = city or city_manual
-    lg = lga or f"{ci} Sector"
-    ar = area or "General Farm Hub"
-
-    # Check against your historic quick autofill map if it matches a pre-configured local node
-    lookup_token = ci.strip().lower()
+def handle_registration(name: str = Form(...), phone: str = Form(...), city_manual: str = Form(...), country: str = Form(None), state: str = Form(None), city: str = Form(None), lga: str = Form(None), area: str = Form(None)):
+    lookup_token = city_manual.strip().lower()
     if lookup_token in CITY_AUTOFILL_MAP:
         geo = CITY_AUTOFILL_MAP[lookup_token]
-        c, s, lg, ar = geo["country"], geo["state"], geo["lga"], geo["area"]
-
-    # Open up your database engine file ledger
+        c, s, ci, lg, ar = geo["country"], geo["state"], city_manual, geo["lga"], geo["area"]
+    else:
+        c, s, ci, lg, ar = country or "Nigeria", state or "Unknown Region", city_manual, lga or f"{city_manual} Sector", area or "General Farm Hub"
     db = db_engine.load_db()
     clean_phone = db_engine.clean_phone_number(phone)
-
-    # Structure the new farmer record cleanly with simple string parameters
-    db["farmers"][clean_phone] = {
-        "name": name,
-        "country": str(c),
-        "state": str(s),
-        "city": str(ci),
-        "lga": str(lg),
-        "area": str(ar),
-        "zone": str(lg),
-        "status": "Pending"
-    }
+    db["farmers"][clean_phone] = {"name": name, "country": c, "state": s, "city": ci, "lga": lg, "area": ar, "zone": lg, "status": "Pending"}
     db_engine.save_db(db)
-
-    # Fire off notification logs to administration channels
     if lookup_token not in CITY_AUTOFILL_MAP:
-        send_admin_webhook(
-            {"text": f"🚧 *NEW LOCATION REGISTERED*: *{name}* ({phone}) signed up under: {ci}, {s}, {c}."})
-
-    return HTMLResponse(
-        content=f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="glass-panel" style="padding:40px 25px; text-align:center; max-width:440px; width:100%;"><h2 style="color:#eab308; margin-top:0;">⏳ Profile Mapped</h2><p style="color:#94a3b8; font-size:14px;">Thank you, {name}. System mapped your node under <strong>{lg}</strong> based on your location values. Awaiting administrator gate clearance.</p><a href="/" class="btn btn-emerald" style="margin-top:20px; width:100%;">Back Home</a></div></body></html>"""
-    )
+        send_admin_webhook({"text": f"🚧 *UNMAPPED CITY ALERT*: *{name}* ({phone}) signed up using: *{city_manual}*."})
+    return HTMLResponse(content=f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="glass-panel" style="padding:40px 25px; text-align:center; max-width:440px; width:100%;"><h2 style="color:#eab308; margin-top:0;">⏳ Profile Mapped</h2><p style="color:#94a3b8; font-size:14px;">Thank you, {name}. System mapped you under <strong>{lg} Sector</strong> based on your city input. Awaiting administrator gate clearance.</p><a href="/" class="btn btn-emerald" style="margin-top:20px; width:100%;">Back Home</a></div></body></html>""")
