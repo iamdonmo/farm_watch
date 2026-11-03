@@ -80,30 +80,33 @@ def mask_phone_number(phone: str) -> str:
 def send_production_alert(to_number: str, message_text: str):
     """Fires a structural title-case template payload directly to Twilio's REST API."""
     url = f"https://twilio.com{TWILIO_ACCOUNT_SID}/Messages.json"
-    
+
+    # Ensure the target format is clean and exactly what Twilio expects
     clean_target = str(to_number).strip()
     if not clean_target.startswith("whatsapp:"):
         clean_target = f"whatsapp:{clean_target}"
-        
-# Strip the template restrictions to test free-form text delivery
-payload = {
-    "To": clean_target,
-    "From": TWILIO_PHONE_NUMBER,
-    "Body": message_text  # Uses plain text body instead of strict ContentSid keys
-}
 
-    
+    payload = {
+        "To": clean_target,
+        "From": TWILIO_PHONE_NUMBER,
+        "ContentSid": "HXb5b62575e6e4ff6129ad7c8efe1f983e",
+        "ContentVariables": '{"1":"12/1","2":"3pm"}'
+    }
+
     try:
         res = requests.post(
-            url, 
-            data=payload, 
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), 
+            url,
+            data=payload,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
             timeout=5.0
         )
-        # Twilio sends a 201 Created status back if your authentication and template properties pass
+        # Log the response in Render Console so you can see the error code
+        print(f"📡 Twilio Dispatch Status: {res.status_code} | Response: {res.text}")
         return res.status_code == 201
-    except Exception:
+    except Exception as e:
+        print(f"❌ Network Exception during Twilio dispatch: {e}")
         return False
+
 
 def get_realtime_weather(lga: str) -> dict:
     geo_coordinates = {
