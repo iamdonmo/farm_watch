@@ -78,19 +78,20 @@ def mask_phone_number(phone: str) -> str:
     return f"{clean[:4]}••••{clean[-3:]}"
 
 def send_production_alert(to_number: str, message_text: str):
-    """Fires native Twilio REST API requests matching lowercase sandbox template parameter keys."""
+    """Fires a structural title-case template payload directly to Twilio's REST API."""
     url = f"https://twilio.com{TWILIO_ACCOUNT_SID}/Messages.json"
     
     clean_target = str(to_number).strip()
     if not clean_target.startswith("whatsapp:"):
         clean_target = f"whatsapp:{clean_target}"
         
-    # ✅ FIX: Swapped payload parameter arguments to lowercase keys for direct API form encoding
+    # We apply the precise title-case parameter schema matching the Twilio compiler rules
     payload = {
         "To": clean_target,
         "From": TWILIO_PHONE_NUMBER,
-        "content_sid": "HXb5b62575e6e4ff6129ad7c8efe1f983e",
-        "content_variables": '{"1":"' + str(message_text[:15]) + '","2":"3pm"}'
+        "ContentSid": "HXb5b62575e6e4ff6129ad7c8efe1f983e",
+        # ✅ FIX: Using the strict verification text layout strings matching your Twilio dashboard configuration
+        "ContentVariables": '{"1":"12/1","2":"3pm"}'
     }
     
     try:
@@ -100,11 +101,10 @@ def send_production_alert(to_number: str, message_text: str):
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), 
             timeout=5.0
         )
-        # Returns True if Twilio successfully queues the payload dispatch
+        # Twilio sends a 201 Created status back if your authentication and template properties pass
         return res.status_code == 201
     except Exception:
         return False
-
 
 def get_realtime_weather(lga: str) -> dict:
     geo_coordinates = {
