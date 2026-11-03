@@ -36,21 +36,43 @@ gc = geonamescache.GeonamesCache()
 all_countries = gc.get_countries()
 all_cities = gc.get_cities()
 
-# Build a dynamic structure for your dropdowns
-GLOBAL_GEO_DB = {}
-for city_id, city_info in all_cities.items():
-    country_name = all_countries.get(city_info['countrycode'], {}).get('name', 'Unknown')
-    # You can use 'admin1code' or similar mapping to extract states if needed
-    state_name = city_info.get('admin1code', 'General Region') 
+import geonamescache
 
+# Initialize the global geography database automatically
+gc = geonamescache.GeonamesCache()
+
+all_countries = gc.get_countries()
+all_cities = gc.get_cities()
+
+# This sub-database holds the actual text names for the state codes
+all_subdivisions = gc.get_subdivisions()
+
+GLOBAL_GEO_DB = {}
+
+for city_id, city_info in all_cities.items():
+    country_code = city_info.get('countrycode', '')
+    country_name = all_countries.get(country_code, {}).get('name', 'Unknown')
+    
+    # Get the raw code (e.g., '15' or 'LA')
+    state_code = city_info.get('admin1code', 'General Region') 
+    
+    # 🔄 Look up the real state name using the country code and state code combined
+    subdivision_info = all_subdivisions.get(country_code, {}).get(state_code, {})
+    state_name = subdivision_info.get('name', f"Region {state_code}") if subdivision_info else f"Region {state_code}"
+    
+    # Group everything nicely into your dropdown structure
     if country_name not in GLOBAL_GEO_DB:
         GLOBAL_GEO_DB[country_name] = {}
     if state_name not in GLOBAL_GEO_DB[country_name]:
         GLOBAL_GEO_DB[country_name][state_name] = {}
-
-    # Map the city name to your existing structure
+        
     city_name = city_info['name']
-    GLOBAL_GEO_DB[country_name][state_name][city_name] = ["Central Sector", "Agrarian Grid"]
+    
+    # Keeping your original layout structure so your javascript dropdown maps don't break
+    GLOBAL_GEO_DB[country_name][state_name][city_name] = {
+        "General Sector": ["Central Sector", "Agrarian Grid"]
+    }
+
 
 class DatabaseChangeHandler(FileSystemEventHandler):
     def on_modified(self, event):
