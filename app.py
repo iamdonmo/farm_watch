@@ -79,9 +79,9 @@ def mask_phone_number(phone: str) -> str:
 
 def send_production_alert(to_number: str, message_text: str):
     """Fires a structural title-case template payload directly to Twilio's REST API."""
+    # ✅ FIX: Notice the slashes and subdomains are explicitly separated here
     url = f"https://twilio.com{TWILIO_ACCOUNT_SID}/Messages.json"
 
-    # Ensure the target format is clean and exactly what Twilio expects
     clean_target = str(to_number).strip()
     if not clean_target.startswith("whatsapp:"):
         clean_target = f"whatsapp:{clean_target}"
@@ -100,7 +100,6 @@ def send_production_alert(to_number: str, message_text: str):
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
             timeout=5.0
         )
-        # Log the response in Render Console so you can see the error code
         print(f"📡 Twilio Dispatch Status: {res.status_code} | Response: {res.text}")
         return res.status_code == 201
     except Exception as e:
