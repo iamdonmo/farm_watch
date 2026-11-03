@@ -85,14 +85,13 @@ def send_production_alert(to_number: str, message_text: str):
     if not clean_target.startswith("whatsapp:"):
         clean_target = f"whatsapp:{clean_target}"
         
-    # We apply the precise title-case parameter schema matching the Twilio compiler rules
-    payload = {
-        "To": clean_target,
-        "From": TWILIO_PHONE_NUMBER,
-        "ContentSid": "HXb5b62575e6e4ff6129ad7c8efe1f983e",
-        # ✅ FIX: Using the strict verification text layout strings matching your Twilio dashboard configuration
-        "ContentVariables": '{"1":"12/1","2":"3pm"}'
-    }
+# Strip the template restrictions to test free-form text delivery
+payload = {
+    "To": clean_target,
+    "From": TWILIO_PHONE_NUMBER,
+    "Body": message_text  # Uses plain text body instead of strict ContentSid keys
+}
+
     
     try:
         res = requests.post(
