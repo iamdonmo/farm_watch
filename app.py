@@ -78,19 +78,20 @@ def mask_phone_number(phone: str) -> str:
     return f"{clean[:4]}••••{clean[-3:]}"
 
 def send_production_alert(to_number: str, message_text: str):
-    """Fires native Twilio REST requests matching Content Template Schema boundaries."""
+    """Fires native Twilio REST API requests matching correct sandbox parameter keys."""
     url = f"https://twilio.com{TWILIO_ACCOUNT_SID}/Messages.json"
     
     clean_target = str(to_number).strip()
     if not clean_target.startswith("whatsapp:"):
         clean_target = f"whatsapp:{clean_target}"
         
-    # Mapping custom threat layouts cleanly inside your pre-approved Twilio variables matrix
+    # We clean up the message and map parameters to the exact raw API format Twilio expects
     payload = {
         "To": clean_target,
         "From": TWILIO_PHONE_NUMBER,
-        "ContentSid": TWILIO_CONTENT_SID,
-        "ContentVariables": '{"1":"' + message_text[:20] + '","2":"FarmGrid"}'
+        "Body": message_text,  # Fallback text parameter in case Content Templates are strict
+        "ContentSid": "HXb5b62575e6e4ff6129ad7c8efe1f983e",
+        "ContentVariables": '{"1":"FarmWatch","2":"Alert"}'
     }
     
     try:
@@ -100,9 +101,11 @@ def send_production_alert(to_number: str, message_text: str):
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), 
             timeout=5.0
         )
+        # Twilio sends a 201 Created status code on successful delivery hook handshakes
         return res.status_code == 201
     except Exception:
         return False
+
 
 def get_realtime_weather(lga: str) -> dict:
     geo_coordinates = {
