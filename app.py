@@ -545,22 +545,76 @@ async def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
         await conn.commit()
     return Response(content="<Response></Response>", media_type="application/xml")
 
+
 @app.get("/", response_class=HTMLResponse)
 def community_homepage():
-    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head><body>
-        <div class="glass-panel" style="max-width: 550px; margin: 60px auto; text-align: center;">
-            <div ondblclick="window.location.href='/dashboard'" style="cursor:default; user-select:none; margin-bottom:20px;">
-                <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 12px rgba(16,185,129,0.4));">
-                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-                    <path d="M12 8v4"/><path d="M12 16h.01"/>
-                </svg>
-                <h1 style="margin:15px 0 2px 0; font-size:28px; font-weight:900; letter-spacing:-0.03em; color:#fff; text-shadow:0 2px 10px rgba(0,0,0,0.5);">olode.com.ng</h1>
-                <span class="badge badge-blue" style="font-size:10px; font-weight:800; letter-spacing:0.08em; padding:4px 10px;">Farm Watch Matrix</span>
+    # Public domain SVG path representing a friendly, high-visibility security badge with a plant leaf core
+    clean_logo_svg = """
+    <svg width="90" height="90" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 16px rgba(16,185,129,0.35)); margin-bottom: 10px;">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        <path d="M12 8a3 3 0 0 0-3 3c0 3 3 7 3 7s3-4 3-7a3 3 0 0 0-3-3z"/>
+        <circle cx="12" cy="11" r="1" fill="#10b981"/>
+    </svg>
+    """
+
+    return f"""<html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            {UPGRADED_CSS}
+            .welcome-title {{
+                margin: 5px 0 8px 0; 
+                font-size: 32px; 
+                font-weight: 900; 
+                letter-spacing: -0.02em; 
+                color: #fff;
+            }}
+            .subtitle {{
+                color: var(--text-muted); 
+                line-height: 1.6; 
+                font-size: 15px; 
+                margin: 0 auto 35px auto; 
+                max-width: 420px;
+            }}
+            .action-link {{
+                padding: 18px; 
+                font-size: 16px; 
+                font-weight: 800; 
+                color: #ffffff; 
+                letter-spacing: 0.01em; 
+                border-radius: 14px;
+                text-transform: uppercase;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="glass-panel" style="max-width: 520px; margin: 50px auto; text-align: center;">
+
+            <!-- Branding Header Area -->
+            <div ondblclick="window.location.href='/dashboard'" style="cursor: default; user-select: none;">
+                {clean_logo_svg}
+                <h1 class="welcome-title">olode.com.ng</h1>
+                <span class="badge badge-emerald" style="font-size: 11px; font-weight: 800; letter-spacing: 0.05em; padding: 5px 12px;">🌾 Farm Watch Network</span>
             </div>
-            <p style="color: var(--text-muted); line-height: 1.6; font-size:14px; margin-bottom:30px;">Tactical localized protection infrastructure matrix.</p>
-            <div style="display:grid; gap:16px;">
-                <a href="/register" class="btn btn-emerald" style="padding:16px; font-size:16px; font-weight:800; color:#ffffff; text-shadow:0 1px 3px rgba(0,0,0,0.4); letter-spacing:0.02em; border-radius:14px;">➕ REGISTER OPERATIONAL NODE</a>
-                <a href="/portal/login" class="btn btn-blue" style="padding:16px; font-size:16px; font-weight:800; color:#ffffff; text-shadow:0 1px 3px rgba(0,0,0,0.4); letter-spacing:0.02em; border-radius:14px;">👩‍🌾 ACCESS MEMBER TERMINAL</a>
+
+            <hr style="border: 0; border-top: 1px solid var(--border-glass); margin: 25px 0;">
+
+            <!-- Simplified, Clear Language Descriptions -->
+            <p class="subtitle">
+                Connecting local farmers to watch over our community together, share live warnings, and protect our lands from danger.
+            </p>
+
+            <!-- Clean, Human-Friendly Buttons -->
+            <div style="display: grid; gap: 16px;">
+                <a href="/register" class="btn btn-emerald action-link">
+                    👋 Register Your Farm Node
+                </a>
+                <a href="/portal/login" class="btn btn-blue action-link" style="background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3); color: #93c5fd;">
+                    👨‍🌾 Enter Member Portal
+                </a>
             </div>
+
         </div>
-    </body></html>"""
+    </body>
+    </html>"""
