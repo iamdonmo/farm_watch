@@ -28,14 +28,26 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# SECURITY: All secrets MUST come from environment variables in production.
+# Never commit real credentials. Rotate any keys that were previously hardcoded.
+# ---------------------------------------------------------------------------
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "chief")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "securepassword123")
-ADMIN_SECRET_HASH = hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest()
-COOKIE_SIGNING_KEY = os.getenv("COOKIE_SECRET_KEY", "grid-security-core-token-991").encode()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")  # Required in production
+if not ADMIN_PASSWORD:
+    ADMIN_PASSWORD = "CHANGE_ME_IN_PRODUCTION"  # Safe fallback only for local dev
+    print("WARNING: Using default admin password. Set ADMIN_PASSWORD env var.")
 
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "AC436cb01fff8036da72eda4b89ef1366d")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "9beab2f0af9f6e78b079e27348073269")
+ADMIN_SECRET_HASH = hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest()
+COOKIE_SIGNING_KEY = os.getenv("COOKIE_SECRET_KEY", "dev-only-change-me-32-chars-min!!").encode()
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "whatsapp:+14155238886")
+SITE_URL = os.getenv("SITE_URL", "https://olode.com.ng")
+
+if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    print("WARNING: Twilio credentials not set. WhatsApp alerts will fail.")
 
 DB_FILE = "farm_watch.db"
 MEDIA_DIR = "static_media"
@@ -60,12 +72,14 @@ RESTRICTED_STATUSES = {STATUS_PENDING, STATUS_REPORTED}
 
 # Messaging safety limits
 MAX_MESSAGE_LENGTH = 350
+MAX_UPLOAD_SIZE = 5 * 1024 * 1024  # 5 MB
 MAX_MESSAGES_PER_HOUR_TO_PEER = 8
 MAX_MESSAGES_PER_DAY = 25
 REPORTS_TO_AUTO_FLAG = 2
 
 # Engagement / games
 CHECKIN_XP = 5
+AUTO_XP_PER_TICK = 1  # XP awarded every 20 seconds while on the page
 SHOUTOUT_XP = 3
 DART_WIN_XP = 15
 HUNT_WIN_XP = 10
@@ -119,7 +133,8 @@ async def lifespan(app: FastAPI):
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 sender_phone TEXT,
                 receiver_phone TEXT,
-                body TEXT
+                body TEXT,
+                seen INTEGER DEFAULT 0
             );
         """)
         await conn.execute("""
@@ -202,8 +217,22 @@ async def lifespan(app: FastAPI):
             pass
         try:
             await conn.execute("ALTER TABLE farm_products ADD COLUMN photo_path TEXT;")
+            try:
+                await conn.execute("ALTER TABLE direct_messages ADD COLUMN seen INTEGER DEFAULT 0;")
+            except Exception:
+                pass
         except Exception:
             pass
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS friendships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                requester_phone TEXT NOT NULL,
+                receiver_phone TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(requester_phone, receiver_phone)
+            );
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS spotify_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -211,6 +240,28 @@ async def lifespan(app: FastAPI):
                 title TEXT NOT NULL,
                 embed_path TEXT NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS product_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                reporter_phone TEXT NOT NULL,
+                reason TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(product_id, reporter_phone)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS product_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                reviewer_phone TEXT NOT NULL,
+                reviewer_name TEXT,
+                rating INTEGER CHECK(rating >= 1 AND rating <= 5),
+                comment TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(product_id, reviewer_phone)
             );
         """)
         await conn.commit()
@@ -500,7 +551,16 @@ async def farmer_authentication(phone: str = Form(...)):
             )
         res = RedirectResponse(url="/portal/feed", status_code=303)
         signed_token = sign_cookie_value(target)
-        res.set_cookie(key="farmer_session", value=signed_token, max_age=31536000, httponly=True, secure=False)
+        # secure=True in production (HTTPS). Set COOKIE_SECURE=1 env var.
+        cookie_secure = os.getenv("COOKIE_SECURE", "0") == "1"
+        res.set_cookie(
+            key="farmer_session",
+            value=signed_token,
+            max_age=31536000,
+            httponly=True,
+            secure=cookie_secure,
+            samesite="lax"
+        )
         return res
     return RedirectResponse(url="/portal/login?error=Phone number not recognized on network scale.", status_code=303)
 
@@ -720,6 +780,9 @@ async def admin_live_threat_feed_stream(username: str = Depends(authenticate_adm
 
 @app.post("/admin/simulate-grid")
 async def admin_simulate_grid_data(username: str = Depends(authenticate_admin)):
+    """WARNING: Injects mock data. Disable in production."""
+    if os.getenv("ALLOW_MOCK", "0") != "1":
+        raise HTTPException(status_code=403, detail="Mock data disabled. Set ALLOW_MOCK=1 to enable.")
     mock_farmers = [
         ("2348031112221", "Bello Kano", "Kano Municipal", "Kano City Center", 245),
         ("2348031112225", "Adewale Osogbo", "Osogbo", "Ataoja Sector", 410),
@@ -737,6 +800,9 @@ async def admin_simulate_grid_data(username: str = Depends(authenticate_admin)):
 
 @app.post("/admin/flush-grid")
 async def admin_flush_grid_data(username: str = Depends(authenticate_admin)):
+    """WARNING: Destructive endpoint. Disable or protect heavily in production."""
+    if os.getenv("ALLOW_FLUSH", "0") != "1":
+        raise HTTPException(status_code=403, detail="Flush disabled. Set ALLOW_FLUSH=1 to enable.")
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("DELETE FROM farmers;")
         await conn.execute("DELETE FROM alerts_log;")
@@ -750,6 +816,22 @@ async def admin_flush_grid_data(username: str = Depends(authenticate_admin)):
         await conn.execute("DELETE FROM game_scores;")
         await conn.execute("DELETE FROM farm_products;")
         await conn.execute("DELETE FROM spotify_links;")
+        await conn.commit()
+    return RedirectResponse(url="/dashboard", status_code=303)
+
+
+@app.post("/admin/approve-product")
+async def admin_approve_product(product_id: int = Form(...), username: str = Depends(authenticate_admin)):
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("UPDATE farm_products SET status = 'Active' WHERE id = ?", (product_id,))
+        await conn.commit()
+    return RedirectResponse(url="/dashboard", status_code=303)
+
+
+@app.post("/admin/reject-product")
+async def admin_reject_product(product_id: int = Form(...), username: str = Depends(authenticate_admin)):
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("UPDATE farm_products SET status = 'Rejected' WHERE id = ?", (product_id,))
         await conn.commit()
     return RedirectResponse(url="/dashboard", status_code=303)
 
@@ -769,6 +851,8 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
             ORDER BY mr.id DESC LIMIT 30
         """) as c3:
             recent_reports = await c3.fetchall()
+        async with conn.execute("SELECT * FROM farm_products WHERE status = 'Pending' ORDER BY id DESC") as c4:
+            pending_products = await c4.fetchall()
 
     total_nodes = len(all_farmers)
     pending_clearance = sum(1 for f in all_farmers if f["status"] in RESTRICTED_STATUSES)
@@ -807,13 +891,30 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
             active_nodes_html += f"""
             <tr>
                 <td style="font-weight: 600; color: #fff;">{f['name']}</td>
-                <td style="font-family: monospace; color: var(--text-muted);">{mask_phone_number(f['phone'])}</td>
+                <td style="font-family: monospace; color: var(--text-muted);">{f['phone']}</td>
                 <td>{f['state']} &rarr; {f['lga']}</td>
                 <td><span class="badge badge-emerald">Operational</span></td>
                 <td><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{f['phone']}"><button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 12px; border-radius: 8px;">Remove Node</button></form></td>
             </tr>"""
 
     pending_table = f'<div style="overflow-x: auto;"><table class="data-table"><thead><tr><th>Node Name</th><th>Phone</th><th>Sector / Status</th><th>Actions</th></tr></thead><tbody>{pending_html}</tbody></table></div>' if pending_clearance > 0 else '<p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">No new registrations or reported nodes awaiting clearance.</p>'
+
+    # Pending products for admin approval
+    products_rows = ""
+    for prod in pending_products:
+        products_rows += f"""
+        <tr>
+            <td style="font-weight:600; color:#fff;">{html.escape(prod['title'] or '')}</td>
+            <td>{html.escape(prod['farmer_name'] or '')}</td>
+            <td><span class="badge badge-blue">{html.escape(prod['lga'] or '')}</span></td>
+            <td style="font-size:13px; max-width:200px;">{html.escape((prod['description'] or '')[:60])}</td>
+            <td><div style="display:flex; gap:6px;">
+                <form action="/admin/approve-product" method="post" style="margin:0;"><input type="hidden" name="product_id" value="{prod['id']}"><button type="submit" class="btn btn-emerald" style="padding:6px 12px; font-size:12px;">Approve</button></form>
+                <form action="/admin/reject-product" method="post" style="margin:0;"><input type="hidden" name="product_id" value="{prod['id']}"><button type="submit" class="btn btn-danger" style="padding:6px 12px; font-size:12px;">Reject</button></form>
+            </div></td>
+        </tr>"""
+    pending_products_table = f'<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Title</th><th>Seller</th><th>LGA</th><th>Details</th><th>Actions</th></tr></thead><tbody>{products_rows or "<tr><td colspan=5 style=color:var(--text-muted);font-style:italic;>No products awaiting approval.</td></tr>"}</tbody></table></div>'
+
     active_table = f'<div style="overflow-x: auto;"><table class="data-table"><thead><tr><th>Node Name</th><th>Phone Address</th><th>Geographic Network Path</th><th>Status</th><th>Management</th></tr></thead><tbody>{active_nodes_html}</tbody></table></div>' if active_nodes_html else '<p style="color: var(--text-muted); font-style: italic; text-align: center;">No active nodes operating on current security grid.</p>'
 
     reports_rows = ""
@@ -821,8 +922,8 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
         reports_rows += f"""
         <tr>
             <td style="font-size:12px; color:var(--text-muted);">{r['timestamp']}</td>
-            <td style="font-family:monospace; font-size:12px;">{mask_phone_number(r['reporter_phone'])}</td>
-            <td style="font-family:monospace; font-size:12px;">{mask_phone_number(r['sender_phone'])}</td>
+            <td style="font-family:monospace; font-size:12px;">{r['reporter_phone']}</td>
+            <td style="font-family:monospace; font-size:12px;">{r['sender_phone']}</td>
             <td style="font-size:13px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{html.escape(r['body'][:80])}</td>
         </tr>"""
     reports_table = f"""
@@ -857,6 +958,7 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
             </div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🏆 Node Reliability Leaderboard</h3><table class="data-table"><thead><tr><th>Rank</th><th>Farmer Deployed Node Name</th><th>Grid Sector Focus</th><th>Network Rating</th></tr></thead><tbody>{leaderboard_html or "<tr><td colspan='4' style='color:var(--text-muted); font-style:italic;'>No XP metrics available.</td></tr>"}</tbody></table></div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3><span style="color: #ef4444;" class="pulse">&bull;</span> Real-Time Emergency Vector Feed</h3><div id="live_threat_feed_target"><p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">Connecting link matrix...</p></div></div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🛒 Products Awaiting Approval</h3>{pending_products_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⏳ Executive Node Approvals Pending</h3>{pending_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🚩 Recent Message Reports</h3>{reports_table}</div>
             <div class="glass-panel" style="padding: 30px;"><h3>🗂️ Active Grid Infrastructure Map</h3>{active_table}</div>
@@ -1030,7 +1132,7 @@ async def submit_soil_reading(
             (current_user["phone"], current_user["lga"], moisture, ph)
         )
         await conn.commit()
-    return RedirectResponse(url="/portal/feed?active_tab=incidents", status_code=303)
+    return RedirectResponse(url="/portal/feed?active_tab=incidents&soil_saved=1", status_code=303)
 
 
 @app.post("/portal/checkin")
@@ -1087,10 +1189,10 @@ async def post_farm_product(
     price: str = Form(""),
     category: str = Form("General"),
     contact_phone: str = Form(""),
-    photo: Optional[UploadFile] = File(None),
+    photos: List[UploadFile] = File(None),
     current_user=Depends(get_current_farmer)
 ):
-    """Post a farm product listing (optional photo)."""
+    """Post a farm product listing (up to 5 photos)."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     title_c = sanitize(title)[:MAX_PRODUCT_TITLE]
@@ -1101,33 +1203,40 @@ async def post_farm_product(
     cat = sanitize(category)[:30] if category else "General"
     contact = normalize_nigerian_mobile(contact_phone) or current_user["phone"]
 
-    photo_path = None
-    if photo and photo.filename:
-        head = await photo.read(12)
-        await photo.seek(0)
-        # Allow JPEG / PNG / WebP
-        is_image = (
-            head.startswith(b"\xff\xd8\xff")
-            or head.startswith(b"\x89PNG")
-            or head.startswith(b"RIFF")
-        )
-        if is_image and (photo.size is None or photo.size < 5_000_000):
-            ext = "jpg"
-            if head.startswith(b"\x89PNG"):
-                ext = "png"
-            elif head.startswith(b"RIFF"):
-                ext = "webp"
-            fname = f"prod_{hashlib.md5(os.urandom(16)).hexdigest()}.{ext}"
-            dest = os.path.join(MEDIA_DIR, fname)
-            with open(dest, "wb") as f:
-                f.write(await photo.read())
-            photo_path = fname
+    photo_paths = []
+    if photos:
+        for photo in photos[:5]:  # max 5 photos
+            if not photo or not photo.filename:
+                continue
+            head = await photo.read(12)
+            await photo.seek(0)
+            is_image = (
+                head.startswith(b"\xff\xd8\xff")
+                or head.startswith(b"\x89PNG")
+                or head.startswith(b"RIFF")
+            )
+            if is_image:
+                content = await photo.read()
+                if len(content) > MAX_UPLOAD_SIZE:
+                    continue
+                ext = "jpg"
+                if head.startswith(b"\x89PNG"):
+                    ext = "png"
+                elif head.startswith(b"RIFF"):
+                    ext = "webp"
+                fname = f"prod_{hashlib.md5(os.urandom(16)).hexdigest()}.{ext}"
+                dest = os.path.join(MEDIA_DIR, fname)
+                with open(dest, "wb") as f:
+                    f.write(content)
+                photo_paths.append(fname)
+
+    photo_path = ",".join(photo_paths) if photo_paths else None
 
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute(
             """INSERT INTO farm_products
-               (farmer_phone, farmer_name, lga, title, description, price, contact_phone, category, photo_path)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (farmer_phone, farmer_name, lga, title, description, price, contact_phone, category, photo_path, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending')""",
             (current_user["phone"], current_user["name"], current_user["lga"],
              title_c, desc_c, price_c, contact, cat, photo_path)
         )
@@ -1136,7 +1245,7 @@ async def post_farm_product(
             (PRODUCT_POST_XP, current_user["phone"])
         )
         await conn.commit()
-    return RedirectResponse(url="/portal/feed?active_tab=market", status_code=303)
+    return RedirectResponse(url="/portal/feed?active_tab=market&pending=1", status_code=303)
 
 
 @app.post("/portal/market/sold")
@@ -1366,7 +1475,7 @@ async def send_direct_message(
 
     clean_r = clean_phone(receiver_phone)
     msg_body = sanitize(body)
-    redirect_url = f"/portal/feed?active_tab=messages&search_phone={clean_r}"
+    redirect_url = f"/portal/chat?with={clean_r}"
 
     if not msg_body:
         return RedirectResponse(url=redirect_url, status_code=303)
@@ -1392,13 +1501,31 @@ async def send_direct_message(
                     peer = await cur.fetchone()
                 if peer:
                     clean_r = peer["phone"]
-                    redirect_url = f"/portal/feed?active_tab=messages&search_phone={clean_r}"
+                    redirect_url = f"/portal/chat?with={clean_r}"
 
         if not peer:
             return RedirectResponse(url=redirect_url + "&error=notfound", status_code=303)
 
-        # Same-LGA restriction
-        if peer["lga"] != current_user["lga"]:
+        # Allow messaging if same LGA OR they are accepted friends
+        same_lga = peer["lga"] == current_user["lga"]
+        is_friend = False
+        async with conn.execute("""
+            SELECT 1 FROM friendships
+            WHERE status = 'accepted'
+              AND ((requester_phone = ? AND receiver_phone = ?)
+                OR (requester_phone = ? AND receiver_phone = ?))
+        """, (current_user["phone"], clean_r, clean_r, current_user["phone"])) as fcur:
+            if await fcur.fetchone():
+                is_friend = True
+        # Allow messaging if same LGA, friends, OR the receiver has an active product (buyer-seller)
+        has_product = False
+        async with conn.execute(
+            "SELECT 1 FROM farm_products WHERE farmer_phone = ? AND status = 'Active' LIMIT 1",
+            (clean_r,)
+        ) as pcur:
+            if await pcur.fetchone():
+                has_product = True
+        if not same_lga and not is_friend and not has_product:
             return RedirectResponse(url=redirect_url + "&error=lga", status_code=303)
 
         # Block check (either direction)
@@ -1461,6 +1588,432 @@ async def delete_direct_message(
     return RedirectResponse(url=redirect, status_code=303)
 
 
+
+@app.post("/portal/market/report")
+async def report_product(
+    product_id: int = Form(...),
+    reason: str = Form(""),
+    current_user=Depends(get_current_farmer)
+):
+    """Report a product listing for scam or abuse."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    reason_c = sanitize(reason)[:200]
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute(
+            "INSERT OR IGNORE INTO product_reports (product_id, reporter_phone, reason) VALUES (?, ?, ?)",
+            (product_id, current_user["phone"], reason_c)
+        )
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=market&reported=1", status_code=303)
+
+
+@app.post("/portal/market/review")
+async def review_product(
+    product_id: int = Form(...),
+    rating: int = Form(...),
+    comment: str = Form(""),
+    current_user=Depends(get_current_farmer)
+):
+    """Leave a 1-5 star review on a product."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    rating = max(1, min(5, int(rating)))
+    comment_c = sanitize(comment)[:300]
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute(
+            """INSERT OR REPLACE INTO product_reviews
+               (product_id, reviewer_phone, reviewer_name, rating, comment)
+               VALUES (?, ?, ?, ?, ?)""",
+            (product_id, current_user["phone"], current_user["name"], rating, comment_c)
+        )
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=market", status_code=303)
+
+
+@app.post("/portal/xp/tick")
+async def xp_tick(current_user=Depends(get_current_farmer)):
+    """Award a small amount of XP for staying active on the page."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute(
+            "UPDATE farmers SET xp = xp + ? WHERE phone = ?",
+            (AUTO_XP_PER_TICK, current_user["phone"])
+        )
+        async with conn.execute("SELECT xp FROM farmers WHERE phone = ?", (current_user["phone"],)) as cur:
+            row = await cur.fetchone()
+            new_xp = row[0] if row else current_user["xp"]
+        await conn.commit()
+    return {"xp": new_xp}
+
+
+@app.post("/portal/friend/request")
+async def send_friend_request(
+    target_phone: str = Form(...),
+    current_user=Depends(get_current_farmer)
+):
+    """Send a friend request to another farmer."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    clean_t = clean_phone(target_phone)
+    if clean_t == current_user["phone"]:
+        return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        # Only block if already accepted friends. Pending requests do not block new ones.
+        async with conn.execute("""
+            SELECT status FROM friendships
+            WHERE status = 'accepted'
+              AND ((requester_phone = ? AND receiver_phone = ?)
+                OR (requester_phone = ? AND receiver_phone = ?))
+        """, (current_user["phone"], clean_t, clean_t, current_user["phone"])) as cur:
+            already_friends = await cur.fetchone()
+        if not already_friends:
+            # Allow multiple pending requests to different people.
+            # If a pending request to this person already exists, INSERT OR IGNORE keeps it.
+            await conn.execute(
+                "INSERT OR IGNORE INTO friendships (requester_phone, receiver_phone, status) VALUES (?, ?, 'pending')",
+                (current_user["phone"], clean_t)
+            )
+            await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=community&friend_sent=1", status_code=303)
+
+
+@app.post("/portal/friend/accept")
+async def accept_friend_request(
+    requester_phone: str = Form(...),
+    current_user=Depends(get_current_farmer)
+):
+    """Accept a friend request."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    clean_r = clean_phone(requester_phone)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute(
+            "UPDATE friendships SET status = 'accepted' WHERE requester_phone = ? AND receiver_phone = ? AND status = 'pending'",
+            (clean_r, current_user["phone"])
+        )
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+
+
+@app.post("/portal/friend/reject")
+async def reject_friend_request(
+    requester_phone: str = Form(...),
+    current_user=Depends(get_current_farmer)
+):
+    """Reject a friend request."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    clean_r = clean_phone(requester_phone)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute(
+            "DELETE FROM friendships WHERE requester_phone = ? AND receiver_phone = ? AND status = 'pending'",
+            (clean_r, current_user["phone"])
+        )
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+
+@app.get("/portal/profile/edit", response_class=HTMLResponse)
+async def edit_profile_form(current_user=Depends(get_current_farmer)):
+    if not current_user:
+        return RedirectResponse(url="/portal/login?error=Session required.", status_code=303)
+    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head>
+    <body><div class="glass-panel" style="max-width:480px; margin:40px auto;">
+        <h2 style="margin:0 0 8px 0;">Edit Profile</h2>
+        <p style="color:var(--text-muted); font-size:14px; margin-bottom:20px;">Update your name and town. Your phone number cannot be changed.</p>
+        <form action="/portal/profile/update" method="post">
+            <label>Full Name</label>
+            <input type="text" name="name" value="{html.escape(current_user.get('name') or '')}" required maxlength="80">
+            <label>Town / City</label>
+            <input type="text" name="city" value="{html.escape(current_user.get('city') or '')}" required maxlength="60">
+            <p style="font-size:13px; color:#94a3b8; margin:8px 0 16px 0;">Changing town may affect your LGA sector and who can see your posts.</p>
+            <button type="submit" class="btn btn-emerald" style="width:100%; padding:14px; margin-top:8px;">Save Changes</button>
+        </form>
+        <p style="text-align:center; margin-top:20px;">
+            <a href="/portal/feed" style="color:#6ee7b7; text-decoration:none;">← Back to Feed</a>
+        </p>
+        <hr style="border:none; border-top:1px solid rgba(255,255,255,0.1); margin:24px 0;">
+        <p style="font-size:13px; color:#f87171; margin-bottom:10px;">Danger zone</p>
+        <form action="/portal/account/delete" method="post" onsubmit="return confirm('Permanently delete your account and all data? This cannot be undone.');">
+            <button type="submit" class="btn btn-danger" style="width:100%; padding:12px;">Delete My Account</button>
+        </form>
+    </div></body></html>"""
+
+
+@app.post("/portal/profile/update")
+async def update_profile(
+    name: str = Form(...),
+    city: str = Form(...),
+    current_user=Depends(get_current_farmer)
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    clean_name = sanitize(name)[:80]
+    clean_city = sanitize(city)[:60]
+    if not clean_name or not clean_city:
+        return RedirectResponse(url="/portal/profile/edit?error=empty", status_code=303)
+    # Re-resolve LGA from city map if possible
+    lookup = clean_city.strip().lower()
+    geo = CITY_AUTOFILL_MAP.get(lookup, {
+        "country": current_user.get("country") or "Nigeria",
+        "state": current_user.get("state") or "Region",
+        "lga": clean_city,
+        "area": current_user.get("area") or "General Hub"
+    })
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute(
+            """UPDATE farmers SET name = ?, city = ?, lga = ?, state = ?, area = ?
+               WHERE phone = ?""",
+            (clean_name, clean_city, geo["lga"], geo["state"], geo["area"], current_user["phone"])
+        )
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=community&profile_updated=1", status_code=303)
+
+
+@app.post("/portal/invite")
+async def send_invite(
+    target_phone: str = Form(...),
+    current_user=Depends(get_current_farmer)
+):
+    """Send a WhatsApp invite with the site link to a non-registered number."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    clean_t = normalize_nigerian_mobile(target_phone)
+    if not clean_t:
+        return RedirectResponse(url="/portal/feed?active_tab=messages&error=invalid_phone", status_code=303)
+    # Check if already registered
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute("SELECT 1 FROM farmers WHERE phone = ?", (clean_t,)) as cur:
+            if await cur.fetchone():
+                return RedirectResponse(url=f"/portal/feed?active_tab=messages&search_phone={clean_t}&error=already_member", status_code=303)
+    # Send invite via WhatsApp
+    invite_text = (
+        f"👋 Hello! {current_user['name']} invited you to join Farm Watch (olode.com.ng).\n\n"
+        f"Register your farm and connect with neighbours to protect your community.\n"
+        f"Join here: {SITE_URL}/register\n\n"
+        f"After you register and get approved, you can message each other on the platform."
+    )
+    asyncio.create_task(async_dispatch_whatsapp(clean_t, invite_text))
+    return RedirectResponse(url=f"/portal/feed?active_tab=messages&search_phone={clean_t}&invite_sent=1", status_code=303)
+
+
+@app.get("/portal/messages", response_class=HTMLResponse)
+async def simple_messages_page(current_user=Depends(get_current_farmer)):
+    """Lightweight messages page — shows friends AND anyone who has messaged you."""
+    if not current_user:
+        return RedirectResponse(url="/portal/login?error=Session required.", status_code=303)
+    my_phone = current_user["phone"]
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        # Friends
+        async with conn.execute("""
+            SELECT 
+                CASE WHEN f.requester_phone = ? THEN f.receiver_phone ELSE f.requester_phone END as phone,
+                fa.name as name
+            FROM friendships f
+            JOIN farmers fa ON fa.phone = CASE WHEN f.requester_phone = ? THEN f.receiver_phone ELSE f.requester_phone END
+            WHERE f.status = 'accepted'
+              AND (f.requester_phone = ? OR f.receiver_phone = ?)
+        """, (my_phone, my_phone, my_phone, my_phone)) as cur:
+            friends = await cur.fetchall()
+        # Anyone who has sent or received a message with me
+        async with conn.execute("""
+            SELECT DISTINCT
+                CASE WHEN dm.sender_phone = ? THEN dm.receiver_phone ELSE dm.sender_phone END as phone,
+                fa.name as name
+            FROM direct_messages dm
+            JOIN farmers fa ON fa.phone = CASE WHEN dm.sender_phone = ? THEN dm.receiver_phone ELSE dm.sender_phone END
+            WHERE dm.sender_phone = ? OR dm.receiver_phone = ?
+        """, (my_phone, my_phone, my_phone, my_phone)) as cur:
+            chat_partners = await cur.fetchall()
+    # Merge: friends first, then other chat partners
+    seen = set()
+    contacts = []
+    for row in list(friends) + list(chat_partners):
+        ph = row["phone"]
+        if ph and ph not in seen:
+            seen.add(ph)
+            contacts.append({"phone": ph, "name": row["name"] or "Unknown"})
+    contacts_html = ""
+    for c in contacts:
+        contacts_html += (
+            '<div style="display:flex; justify-content:space-between; align-items:center; padding:14px; background:rgba(16,185,129,0.08); border-radius:10px; margin-bottom:8px;">'
+            f'<span style="font-weight:700; color:#f1f5f9;">{html.escape(c["name"])}</span>'
+            f'<a href="/portal/chat?with={c["phone"]}" style="background:#34d399; color:#042f2e; padding:8px 16px; border-radius:8px; text-decoration:none; font-weight:700; font-size:14px;">Open Chat</a>'
+            '</div>'
+        )
+    if not contacts_html:
+        contacts_html = '<p style="color:#94a3b8; text-align:center;">No conversations yet.</p>'
+    page = (
+        '<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        '<style>body{font-family:system-ui,sans-serif;background:#0a1f14;color:#f0fdf4;margin:0;padding:20px;}'
+        '.wrap{max-width:560px;margin:0 auto;}h1{font-size:24px;margin:0 0 8px 0;}'
+        '.back{color:#6ee7b7;text-decoration:none;font-weight:700;font-size:14px;}'
+        '.card{background:rgba(18,42,32,0.8);border:1px solid rgba(52,211,153,0.2);border-radius:16px;padding:20px;margin-top:16px;}'
+        '</style></head><body><div class="wrap">'
+        '<a href="/portal/feed?active_tab=community" class="back">← Back to Community</a>'
+        '<h1 style="margin-top:12px;">💬 Messages</h1>'
+        '<p style="color:#94a3b8; font-size:14px;">Friends and people who messaged you</p>'
+        f'<div class="card">{contacts_html}</div></div></body></html>'
+    )
+    return HTMLResponse(content=page)
+
+
+
+@app.get("/portal/chat", response_class=HTMLResponse)
+async def simple_chat_page(
+    with_phone: str = Query(..., alias="with"),
+    current_user=Depends(get_current_farmer)
+):
+    """Lightweight one-to-one chat."""
+    if not current_user:
+        return RedirectResponse(url="/portal/login?error=Session required.", status_code=303)
+    clean_with = normalize_nigerian_mobile(with_phone) or clean_phone(with_phone)
+    # Mark incoming messages from this person as seen (safe if column missing)
+    try:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            await conn.execute(
+                "UPDATE direct_messages SET seen = 1 WHERE receiver_phone = ? AND sender_phone = ?",
+                (current_user["phone"], clean_with)
+            )
+            alt = None
+            if clean_with.startswith("0") and len(clean_with) == 11:
+                alt = "234" + clean_with[1:]
+            elif clean_with.startswith("234") and len(clean_with) == 13:
+                alt = "0" + clean_with[3:]
+            if alt:
+                await conn.execute(
+                    "UPDATE direct_messages SET seen = 1 WHERE receiver_phone = ? AND sender_phone = ?",
+                    (current_user["phone"], alt)
+                )
+            await conn.commit()
+    except Exception:
+        pass
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        peer = None
+        async with conn.execute("SELECT name, phone FROM farmers WHERE phone = ?", (clean_with,)) as cur:
+            peer = await cur.fetchone()
+        if not peer and clean_with.startswith("0") and len(clean_with) == 11:
+            async with conn.execute("SELECT name, phone FROM farmers WHERE phone = ?", ("234" + clean_with[1:],)) as cur:
+                peer = await cur.fetchone()
+        elif not peer and clean_with.startswith("234") and len(clean_with) == 13:
+            async with conn.execute("SELECT name, phone FROM farmers WHERE phone = ?", ("0" + clean_with[3:],)) as cur:
+                peer = await cur.fetchone()
+        msgs = []
+        peer_phone = clean_with
+        peer_name = "Unknown"
+        if peer:
+            peer_name = peer["name"] or "Unknown"
+            peer_phone = peer["phone"]
+            alts = {peer_phone}
+            if peer_phone.startswith("0") and len(peer_phone) == 11:
+                alts.add("234" + peer_phone[1:])
+            elif peer_phone.startswith("234") and len(peer_phone) == 13:
+                alts.add("0" + peer_phone[3:])
+            ph = ",".join("?" * len(alts))
+            async with conn.execute(
+                f"SELECT * FROM direct_messages WHERE (sender_phone = ? AND receiver_phone IN ({ph})) OR (receiver_phone = ? AND sender_phone IN ({ph})) ORDER BY id ASC",
+                (current_user["phone"],) + tuple(alts) + (current_user["phone"],) + tuple(alts)
+            ) as mcur:
+                msgs = await mcur.fetchall()
+    messages_html = ""
+    for m in msgs:
+        is_mine = m["sender_phone"] == current_user["phone"]
+        align = "flex-end" if is_mine else "flex-start"
+        bg = "rgba(16,185,129,0.2)" if is_mine else "rgba(255,255,255,0.08)"
+        messages_html += (
+            f'<div style="display:flex;justify-content:{align};margin-bottom:10px;">'
+            f'<div style="max-width:75%;background:{bg};padding:10px 14px;border-radius:12px;">'
+            f'<div style="font-size:15px;color:#f1f5f9;">{html.escape(m["body"])}</div>'
+            f'<div style="font-size:11px;color:#94a3b8;margin-top:4px;">{m["timestamp"]}</div>'
+            '</div></div>'
+        )
+    if not messages_html:
+        messages_html = '<p style="text-align:center;color:#94a3b8;margin:40px 0;">No messages yet. Say hello!</p>'
+    page = (
+        '<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        '<style>body{font-family:system-ui,sans-serif;background:#0a1f14;color:#f0fdf4;margin:0;padding:20px;}'
+        '.wrap{max-width:600px;margin:0 auto;}.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;}'
+        '.name{font-size:20px;font-weight:800;}.back{color:#6ee7b7;text-decoration:none;font-weight:700;}'
+        '.chat{background:rgba(0,0,0,0.25);border-radius:12px;padding:16px;min-height:280px;max-height:50vh;overflow-y:auto;margin-bottom:16px;}'
+        'form{display:flex;gap:10px;}input{flex:1;padding:14px;font-size:16px;background:#1e293b;border:2px solid #475569;color:#f8fafc;border-radius:10px;}'
+        'button{padding:14px 24px;background:#34d399;color:#042f2e;border:none;border-radius:10px;font-weight:700;font-size:16px;cursor:pointer;}'
+        '</style></head><body><div class="wrap">'
+        '<div class="header"><a href="/portal/messages" class="back">← Back</a>'
+        f'<div class="name">{html.escape(peer_name)} ✅</div><span></span></div>'
+        f'<div style="font-size:13px;color:#94a3b8;margin-bottom:12px;font-family:monospace;">{mask_phone_number(peer_phone)}</div>'
+        f'<div class="chat">{messages_html}</div>'
+        '<form action="/portal/messages/send" method="post">'
+        f'<input type="hidden" name="receiver_phone" value="{peer_phone}">'
+        '<input type="text" name="body" placeholder="Type a message..." required maxlength="350" autocomplete="off">'
+        '<button type="submit">Send</button></form></div></body></html>'
+    )
+    return HTMLResponse(content=page)
+
+
+
+@app.get("/portal/soil/history", response_class=HTMLResponse)
+async def soil_history(current_user=Depends(get_current_farmer)):
+    """Show the farmer's past soil readings."""
+    if not current_user:
+        return RedirectResponse(url="/portal/login?error=Session required.", status_code=303)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT moisture, ph, timestamp, source FROM sensor_readings WHERE farmer_phone = ? ORDER BY id DESC LIMIT 50",
+            (current_user["phone"],)
+        ) as cur:
+            rows = await cur.fetchall()
+    rows_html = ""
+    for r in rows:
+        rows_html += (
+            "<tr>"
+            f"<td>{r['timestamp']}</td>"
+            f"<td style='font-weight:700; color:#6ee7b7;'>{r['moisture']}%</td>"
+            f"<td style='font-weight:700; color:#93c5fd;'>{r['ph']}</td>"
+            f"<td style='font-size:12px; color:#94a3b8;'>{r['source'] or 'manual'}</td>"
+            "</tr>"
+        )
+    if not rows_html:
+        rows_html = '<tr><td colspan="4" style="text-align:center; color:#94a3b8;">No readings yet.</td></tr>'
+    page = (
+        f"<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>{UPGRADED_CSS}</style></head>"
+        "<body><div class='glass-panel' style='max-width:640px; margin:40px auto;'>"
+        "<h2 style='margin:0 0 8px 0;'>🌱 Soil Reading History</h2>"
+        "<p style='color:var(--text-muted); font-size:14px; margin-bottom:16px;'>Your last 50 readings.</p>"
+        "<div style='overflow-x:auto;'>"
+        "<table class='data-table'><thead><tr><th>Date</th><th>Moisture</th><th>pH</th><th>Source</th></tr></thead>"
+        f"<tbody>{rows_html}</tbody></table></div>"
+        "<p style='text-align:center; margin-top:20px;'>"
+        "<a href='/portal/feed?active_tab=incidents' style='color:#6ee7b7; text-decoration:none;'>← Back to Feed</a>"
+        "</p></div></body></html>"
+    )
+    return HTMLResponse(content=page)
+
+
+@app.post("/portal/account/delete")
+async def delete_account(current_user=Depends(get_current_farmer)):
+    """Permanently delete the current user's account and data."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    phone = current_user["phone"]
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("DELETE FROM direct_messages WHERE sender_phone = ? OR receiver_phone = ?", (phone, phone))
+        await conn.execute("DELETE FROM friendships WHERE requester_phone = ? OR receiver_phone = ?", (phone, phone))
+        await conn.execute("DELETE FROM farm_products WHERE farmer_phone = ?", (phone,))
+        await conn.execute("DELETE FROM sensor_readings WHERE farmer_phone = ?", (phone,))
+        await conn.execute("DELETE FROM checkins WHERE farmer_phone = ?", (phone,))
+        await conn.execute("DELETE FROM shoutouts WHERE farmer_phone = ?", (phone,))
+        await conn.execute("DELETE FROM farmers WHERE phone = ?", (phone,))
+        await conn.commit()
+    resp = RedirectResponse(url="/register?deleted=1", status_code=303)
+    resp.delete_cookie(key=COOKIE_NAME)
+    return resp
+
+
+
 @app.get("/portal/feed", response_class=HTMLResponse)
 async def farmer_feed_portal(
     current_user=Depends(get_current_farmer),
@@ -1470,9 +2023,29 @@ async def farmer_feed_portal(
     market_status: Optional[str] = Query(None),
     market_q: Optional[str] = Query(None),
     market_sort: Optional[str] = Query(None),
-    market_mine: Optional[str] = Query(None)
+    market_mine: Optional[str] = Query(None),
+    friend_sent: Optional[str] = Query(None),
+    profile_updated: Optional[str] = Query(None),
+    invite_sent: Optional[str] = Query(None),
+    view_profile: Optional[str] = Query(None),
+    friend_name: Optional[str] = Query(None),
+    soil_saved: Optional[str] = Query(None)
 ):
     if not current_user: return RedirectResponse(url="/portal/login?error=Session required.", status_code=303)
+    # Always define tip_of_day early so it is never unbound
+    tip_of_day = FARMING_TIPS[int(__import__('datetime').datetime.now().strftime('%j')) % len(FARMING_TIPS)]
+    # Unread message count for badge (safe if column missing)
+    unread_count = 0
+    try:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            async with conn.execute(
+                "SELECT COUNT(*) FROM direct_messages WHERE receiver_phone = ? AND seen = 0",
+                (current_user["phone"],)
+            ) as cur:
+                unread_count = (await cur.fetchone())[0]
+    except Exception:
+        unread_count = 0
+    unread_badge = f'<span style="background:#ef4444; color:white; font-size:11px; font-weight:800; padding:2px 7px; border-radius:10px; margin-left:6px;">{unread_count}</span>' if unread_count else ""
     if current_user.get("status") in RESTRICTED_STATUSES:
         return HTMLResponse(content=f"""
         <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head>
@@ -1523,6 +2096,23 @@ async def farmer_feed_portal(
         """, (current_user['lga'],)) as c7:
             leaderboard_rows = await c7.fetchall()
         async with conn.execute("""
+            SELECT f.requester_phone, fa.name as requester_name
+            FROM friendships f
+            JOIN farmers fa ON fa.phone = f.requester_phone
+            WHERE f.receiver_phone = ? AND f.status = 'pending'
+        """, (current_user['phone'],)) as c_fr:
+            pending_requests = await c_fr.fetchall()
+        async with conn.execute("""
+            SELECT 
+                CASE WHEN f.requester_phone = ? THEN f.receiver_phone ELSE f.requester_phone END as friend_phone,
+                fa.name as friend_name
+            FROM friendships f
+            JOIN farmers fa ON fa.phone = CASE WHEN f.requester_phone = ? THEN f.receiver_phone ELSE f.requester_phone END
+            WHERE f.status = 'accepted'
+              AND (f.requester_phone = ? OR f.receiver_phone = ?)
+        """, (current_user['phone'], current_user['phone'], current_user['phone'], current_user['phone'])) as c_ff:
+            my_friends = await c_ff.fetchall()
+        async with conn.execute("""
             SELECT id, title, embed_path FROM spotify_links
             WHERE farmer_phone = ? ORDER BY id DESC LIMIT 20
         """, (current_user["phone"],)) as c_sp:
@@ -1560,22 +2150,73 @@ async def farmer_feed_portal(
             market_products = await c8.fetchall()
         market_result_count = len(market_products)
 
-    tip_of_day = FARMING_TIPS[int(__import__('datetime').datetime.now().strftime('%j')) % len(FARMING_TIPS)]
+    # Friends panel HTML
+    pending_html = ""
+    for r in pending_requests:
+        pending_html += f"""
+        <div style="background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:10px; padding:12px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span style="font-weight:600; color:#f1f5f9;">{html.escape(r['requester_name'])}</span>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                <a href="/portal/feed?active_tab=community&view_profile={r['requester_phone']}" style="background:rgba(59,130,246,0.2); border:1px solid rgba(59,130,246,0.4); color:#93c5fd; font-size:12px; font-weight:700; padding:6px 12px; border-radius:8px; text-decoration:none;">👤 View Profile</a>
+                <form action="/portal/friend/accept" method="post" style="margin:0;">
+                    <input type="hidden" name="requester_phone" value="{r['requester_phone']}">
+                    <button type="submit" class="btn btn-emerald" style="padding:6px 12px; font-size:12px;">Accept</button>
+                </form>
+                <form action="/portal/friend/reject" method="post" style="margin:0;">
+                    <input type="hidden" name="requester_phone" value="{r['requester_phone']}">
+                    <button type="submit" class="btn btn-danger" style="padding:6px 12px; font-size:12px;">Reject</button>
+                </form>
+            </div>
+        </div>"""
+    if not pending_html:
+        pending_html = '<p style="color:var(--text-muted); font-size:13px;">No pending requests.</p>'
 
-    my_spotify_options = "".join([
-        f'<option value="{html.escape(s["embed_path"])}">★ {html.escape(s["title"])}</option>'
-        for s in my_spotify_links
-    ])
-    my_spotify_list_html = "".join([
-        f'''<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);">
-            <button type="button" onclick="setSpotifyEmbed('{html.escape(s["embed_path"])}')" style="background:none;border:none;color:#1db954;font-size:14px;font-weight:700;cursor:pointer;text-align:left;padding:0;">{html.escape(s["title"])}</button>
-            <form action="/portal/spotify/delete" method="post" style="margin:0;">
-                <input type="hidden" name="link_id" value="{s["id"]}">
-                <button type="submit" style="background:none;border:none;color:#f87171;font-size:12px;cursor:pointer;">Remove</button>
-            </form>
-        </div>'''
-        for s in my_spotify_links
-    ]) or '<p style="color:var(--text-muted);font-size:13px;margin:0;">No saved links yet — paste yours below.</p>'
+    friends_html = ""
+    for fr in my_friends:
+        friends_html += f"""
+        <div style="padding:10px 12px; background:rgba(16,185,129,0.06); border-radius:8px; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-weight:600; color:#f1f5f9;">{html.escape(fr['friend_name'])} <span title="Verified" style="color:#34d399;">✅</span></span>
+            <a href="/portal/chat?with={fr['friend_phone']}" style="font-size:12px; color:#93c5fd; text-decoration:none; background:rgba(59,130,246,0.15); padding:6px 12px; border-radius:8px; border:1px solid rgba(59,130,246,0.3);">💬 Message</a>
+        </div>"""
+    if not friends_html:
+        friends_html = '<p style="color:var(--text-muted); font-size:13px;">No friends yet. Add some from your neighbors!</p>'
+
+    # Profile viewer for friend request sender (masked phone)
+    profile_card_html = ""
+    if view_profile:
+        clean_view = normalize_nigerian_mobile(view_profile) or clean_phone(view_profile)
+        async with aiosqlite.connect(DB_FILE) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute("SELECT * FROM farmers WHERE phone = ?", (clean_view,)) as cur:
+                prof = await cur.fetchone()
+            if not prof and clean_view.startswith("0") and len(clean_view) == 11:
+                async with conn.execute("SELECT * FROM farmers WHERE phone = ?", ("234" + clean_view[1:],)) as cur:
+                    prof = await cur.fetchone()
+            elif not prof and clean_view.startswith("234") and len(clean_view) == 13:
+                async with conn.execute("SELECT * FROM farmers WHERE phone = ?", ("0" + clean_view[3:],)) as cur:
+                    prof = await cur.fetchone()
+        if prof:
+            profile_card_html = f"""
+            <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.25); border-radius:14px; padding:18px; margin-bottom:16px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                    <div style="font-weight:800; font-size:18px; color:#fff;">{html.escape(prof['name'] or '')} {'✅' if prof['status']=='Approved' else ''}</div>
+                    <a href="/portal/feed?active_tab=community" style="color:#94a3b8; font-size:12px; text-decoration:none;">✕ Close</a>
+                </div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; font-size:14px;">
+                    <div><span style="color:#94a3b8;">Phone</span><br><b style="color:#e2e8f0; font-family:monospace;">{mask_phone_number(prof['phone'])}</b></div>
+                    <div><span style="color:#94a3b8;">Status</span><br><b style="color:#e2e8f0;">{html.escape(prof['status'] or '')}</b></div>
+                    <div><span style="color:#94a3b8;">LGA / Sector</span><br><b style="color:#e2e8f0;">{html.escape(prof['lga'] or '')}</b></div>
+                    <div><span style="color:#94a3b8;">Area</span><br><b style="color:#e2e8f0;">{html.escape(prof['area'] or '')}</b></div>
+                    <div><span style="color:#94a3b8;">State</span><br><b style="color:#e2e8f0;">{html.escape(prof['state'] or '')}</b></div>
+                    <div><span style="color:#94a3b8;">Grid XP</span><br><b style="color:#fbbf24;">⚡ {prof['xp'] or 0}</b></div>
+                </div>
+                <p style="font-size:12px; color:#94a3b8; margin:12px 0 0 0;">Full phone number is hidden until you accept the request.</p>
+            </div>"""
+        else:
+            profile_card_html = '<div style="color:#f87171; padding:12px;">Profile not found.</div>'
+
+    my_spotify_options = ""
+    my_spotify_list_html = ""
 
     leaderboard_html = ""
     for i, row in enumerate(leaderboard_rows):
@@ -1615,15 +2256,25 @@ async def farmer_feed_portal(
 
         photo_html = ""
         if p["photo_path"]:
-            photo_html = f'<img src="/media/{html.escape(p["photo_path"])}" alt="" style="width:100%; max-height:200px; object-fit:cover; border-radius:12px; margin-bottom:12px;">'
+            paths = [x.strip() for x in p["photo_path"].split(",") if x.strip()]
+            if len(paths) == 1:
+                photo_html = f'<img src="/media/{html.escape(paths[0])}" alt="" style="width:100%; max-height:220px; object-fit:cover; border-radius:12px; margin-bottom:12px;">'
+            elif paths:
+                imgs = "".join([
+                    f'<img src="/media/{html.escape(p)}" alt="" style="width:48%; max-height:140px; object-fit:cover; border-radius:8px; margin:1%;">'
+                    for p in paths[:4]
+                ])
+                photo_html = f'<div style="display:flex; flex-wrap:wrap; margin-bottom:12px;">{imgs}</div>'
 
         sold_badge = '<span style="background:rgba(245,158,11,0.2); color:#fbbf24; font-size:12px; font-weight:800; padding:4px 10px; border-radius:6px; margin-left:6px;">SOLD</span>' if is_sold else ""
         price_color = "#94a3b8" if is_sold else "#6ee7b7"
         card_opacity = "opacity:0.75;" if is_sold else ""
         contact_raw = p["contact_phone"] or p["farmer_phone"] or ""
         call_btn = ""
+        msg_btn = ""
         if contact_raw and not is_sold:
             call_btn = f'<a href="tel:{html.escape(str(contact_raw))}" style="display:inline-block;padding:10px 16px;background:rgba(59,130,246,0.2);border:1px solid rgba(59,130,246,0.4);color:#93c5fd;border-radius:10px;font-size:14px;font-weight:700;text-decoration:none;">📞 Call seller</a>'
+            msg_btn = f'<a href="/portal/chat?with={html.escape(str(p["farmer_phone"] or ""))}" style="display:inline-block;padding:10px 16px;background:rgba(16,185,129,0.2);border:1px solid rgba(16,185,129,0.4);color:#6ee7b7;border-radius:10px;font-size:14px;font-weight:700;text-decoration:none;">💬 Message seller</a>'
 
         products_html += f"""
         <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:16px; margin-bottom:14px; {card_opacity}">
@@ -1638,7 +2289,35 @@ async def farmer_feed_portal(
             <p style="font-size:15px; color:#cbd5e1; margin:12px 0; line-height:1.5;">{html.escape(p['description'] or '')}</p>
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; font-size:14px;">
                 <span style="color:#94a3b8;">Seller: <b style="color:#e2e8f0;">{html.escape(p['farmer_name'] or '')}</b></span>
-                <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">{call_btn}{actions}</span>
+                <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">{call_btn}{msg_btn}{actions}</span>
+            </div>
+            <div style="margin-top:14px; padding:12px; background:rgba(239,68,68,0.06); border:1px solid rgba(239,68,68,0.2); border-radius:10px;">
+                <div style="font-size:12px; color:#f87171; font-weight:700; margin-bottom:8px; text-transform:uppercase; letter-spacing:0.04em;">🔒 Privacy & Safety</div>
+                <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                    <form action="/portal/market/report" method="post" style="margin:0;">
+                        <input type="hidden" name="product_id" value="{p['id']}">
+                        <input type="hidden" name="reason" value="Scam / suspicious listing">
+                        <button type="submit" style="background:rgba(239,68,68,0.25); border:1px solid rgba(239,68,68,0.5); color:#fecaca; font-size:13px; font-weight:700; padding:10px 16px; border-radius:8px; cursor:pointer;">🚩 Report Listing</button>
+                    </form>
+                    <form action="/portal/block-node" method="post" style="margin:0;">
+                        <input type="hidden" name="target_phone" value="{html.escape(str(p['farmer_phone'] or ''))}">
+                        <button type="submit" style="background:rgba(239,68,68,0.25); border:1px solid rgba(239,68,68,0.5); color:#fecaca; font-size:13px; font-weight:700; padding:10px 16px; border-radius:8px; cursor:pointer;">🚫 Block Seller</button>
+                    </form>
+                    <details style="display:inline;">
+                        <summary style="background:rgba(59,130,246,0.2); border:1px solid rgba(59,130,246,0.4); color:#93c5fd; font-size:13px; font-weight:700; padding:10px 16px; border-radius:8px; cursor:pointer; list-style:none;">⭐ Review</summary>
+                    <form action="/portal/market/review" method="post" style="margin-top:8px; background:rgba(0,0,0,0.2); padding:10px; border-radius:8px;">
+                        <input type="hidden" name="product_id" value="{p['id']}">
+                        <select name="rating" required style="padding:6px; margin-right:8px; background:#1e293b; color:#fff; border-radius:6px;">
+                            <option value="5">★★★★★</option>
+                            <option value="4">★★★★</option>
+                            <option value="3">★★★</option>
+                            <option value="2">★★</option>
+                            <option value="1">★</option>
+                        </select>
+                        <input type="text" name="comment" placeholder="Short comment (optional)" maxlength="300" style="padding:6px; width:180px; background:#1e293b; color:#fff; border:1px solid #475569; border-radius:6px;">
+                        <button type="submit" class="btn btn-emerald" style="padding:6px 12px; font-size:12px; margin-left:6px;">Submit</button>
+                    </form>
+                </details>
             </div>
         </div>"""
     if not products_html:
@@ -1709,10 +2388,17 @@ async def farmer_feed_portal(
             <form action='/portal/approve-node' method='post' style='margin:0;'><input type='hidden' name='target_phone' value='{n['phone']}'><button type='submit' class='btn btn-emerald' style='padding:8px 16px; font-size:12px; border-radius:8px;'>🔒 Verify Identity</button></form>
         </div>""" for n in pending_neighbors])
     nb_approved = "".join([f"""
-        <div style='padding:12px 16px; background:rgba(16,185,129,0.03); border:1px solid rgba(16,185,129,0.15); border-radius:10px; margin-bottom:8px; display:flex; align-items:center; gap:10px;'>
-            🟢 <div style='flex:1;'><span style='font-weight:600; color:#f1f5f9;'>{f['name']}</span></div>
-            <form action='/portal/flag-node' method='post' style='margin:0;'><input type='hidden' name='target_phone' value='{f['phone']}'><button type='submit' class='btn btn-danger' style='padding:4px 10px; font-size:11px; border-radius:6px;'>Flag Node</button></form>
-            <span style='font-size:11px; color:var(--accent-emerald); background:rgba(16,185,129,0.1); padding:2px 8px; border-radius:4px;'>Online</span>
+        <div style='padding:12px 16px; background:rgba(16,185,129,0.03); border:1px solid rgba(16,185,129,0.15); border-radius:10px; margin-bottom:8px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;'>
+            🟢 <div style='flex:1; min-width:120px;'>
+                <span style='font-weight:600; color:#f1f5f9;'>{html.escape(f['name'])}</span>
+                <span title="Verified & Approved" style="color:#34d399; font-size:14px; margin-left:6px;">✅</span>
+            </div>
+            <form action='/portal/friend/request' method='post' style='margin:0;' onsubmit="return confirm('⚠️ Verify this person first!\n\nMake sure you know them or have verified their identity before sending a friend request.\n\nContinue?');">
+                <input type='hidden' name='target_phone' value='{f['phone']}'>
+                <button type='submit' class='btn' style='padding:6px 12px; font-size:12px; background:rgba(59,130,246,0.2); color:#93c5fd; border:1px solid rgba(59,130,246,0.4);'>👋 Add Friend</button>
+            </form>
+            <form action='/portal/flag-node' method='post' style='margin:0;'><input type='hidden' name='target_phone' value='{f['phone']}'><button type='submit' class='btn btn-danger' style='padding:4px 10px; font-size:11px; border-radius:6px;'>Flag</button></form>
+            <span style='font-size:11px; color:var(--accent-emerald); background:rgba(16,185,129,0.1); padding:2px 8px; border-radius:4px;'>Verified</span>
         </div>""" for f in approved_neighbors])
 
     # --- Direct Messages / Peer Lookup logic ---
@@ -1731,6 +2417,54 @@ async def farmer_feed_portal(
                 Invalid phone number. Please enter a valid Nigerian mobile<br>
                 (070 / 080 / 081 / 090 / 091 — 11 digits, or with 234 country code).
             </div>"""
+
+    # Guaranteed friend chat: if we came from the friends list, always show a working interface
+    if friend_name and search_phone:
+        clean_target = normalize_nigerian_mobile(search_phone) or clean_phone(search_phone)
+        peer_card_html = f"""
+        <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.25); border-radius:14px; padding:18px; margin-bottom:16px;">
+            <div style="font-weight:800; font-size:20px; color:#fff; margin-bottom:6px;">{html.escape(friend_name)} ✅</div>
+            <div style="font-size:13px; color:var(--text-muted); font-family:monospace;">{mask_phone_number(clean_target)}</div>
+        </div>"""
+        # Load any existing messages
+        async with aiosqlite.connect(DB_FILE) as conn:
+            conn.row_factory = aiosqlite.Row
+            my_phone = current_user["phone"]
+            # Try both phone formats
+            alts = {clean_target}
+            if clean_target.startswith("0") and len(clean_target) == 11:
+                alts.add("234" + clean_target[1:])
+            elif clean_target.startswith("234") and len(clean_target) == 13:
+                alts.add("0" + clean_target[3:])
+            placeholders = ",".join("?" * len(alts))
+            async with conn.execute(f"""
+                SELECT * FROM direct_messages
+                WHERE (sender_phone = ? AND receiver_phone IN ({placeholders}))
+                   OR (receiver_phone = ? AND sender_phone IN ({placeholders}))
+                ORDER BY id ASC
+            """, (my_phone,) + tuple(alts) + (my_phone,) + tuple(alts)) as mcur:
+                msgs = await mcur.fetchall()
+            for m in msgs:
+                is_mine = m["sender_phone"] == my_phone
+                align = "flex-end" if is_mine else "flex-start"
+                bg = "rgba(16,185,129,0.18)" if is_mine else "rgba(255,255,255,0.06)"
+                messages_log_html += f"""
+                <div style="display:flex; justify-content:{align}; margin-bottom:10px;">
+                    <div style="max-width:78%; background:{bg}; padding:10px 14px; border-radius:12px;">
+                        <div style="font-size:13px; color:#f1f5f9;">{html.escape(m['body'])}</div>
+                        <div style="font-size:10px; color:var(--text-muted); margin-top:4px;">{m['timestamp']}</div>
+                    </div>
+                </div>"""
+        send_form_html = f"""
+        <form action="/portal/messages/send" method="post" style="display:flex; gap:10px; margin-top:12px; align-items:center; background:rgba(0,0,0,0.2); padding:12px; border-radius:12px;">
+            <input type="hidden" name="receiver_phone" value="{clean_target}">
+            <input type="text" name="body" placeholder="Type a message to {html.escape(friend_name)}..." required autocomplete="off" maxlength="{MAX_MESSAGE_LENGTH}"
+                   style="flex:1; padding:14px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px;">
+            <button type="submit" class="btn btn-emerald" style="padding:14px 24px; font-size:16px; cursor:pointer;">Send</button>
+        </form>
+        <p style="font-size:12px; color:#94a3b8; margin:8px 0 0 0;">Press Send to deliver your message.</p>"""
+        # Skip the complex lookup below
+        clean_search = ""
 
     if clean_search:
         async with aiosqlite.connect(DB_FILE) as conn:
@@ -1755,6 +2489,35 @@ async def farmer_feed_portal(
                 my_phone = current_user["phone"]
                 peer_phone = peer["phone"]
                 same_lga = peer["lga"] == current_user["lga"]
+                # Check friendship
+                is_friend = False
+                # Normalize both phone formats for friendship check
+                def phone_alts(ph):
+                    alts = {ph}
+                    if ph.startswith("0") and len(ph) == 11:
+                        alts.add("234" + ph[1:])
+                    elif ph.startswith("234") and len(ph) == 13:
+                        alts.add("0" + ph[3:])
+                    return alts
+                my_alts = phone_alts(my_phone)
+                peer_alts = phone_alts(peer_phone)
+                async with conn.execute("""
+                    SELECT 1 FROM friendships
+                    WHERE status = 'accepted'
+                      AND ((requester_phone IN ({}) AND receiver_phone IN ({}))
+                        OR (requester_phone IN ({}) AND receiver_phone IN ({})))
+                """.format(
+                    ",".join("?" * len(my_alts)),
+                    ",".join("?" * len(peer_alts)),
+                    ",".join("?" * len(peer_alts)),
+                    ",".join("?" * len(my_alts))
+                ), tuple(my_alts) + tuple(peer_alts) + tuple(peer_alts) + tuple(my_alts)) as fcur:
+                    if await fcur.fetchone():
+                        is_friend = True
+                # If user came from the friends list, they are already friends
+                if friend_name:
+                    is_friend = True
+                can_message = is_friend  # Messaging only after friend request is accepted
                 status_badge_class = "badge-emerald" if peer["status"] == STATUS_APPROVED else "badge-amber"
 
                 # Check block status (either direction)
@@ -1787,11 +2550,30 @@ async def farmer_feed_portal(
                         <button type="submit" class="btn btn-danger" style="padding:6px 12px; font-size:12px;">Block</button>
                     </form>"""
 
+                # Prominent privacy controls
+                report_btn = f"""
+                <form action="/portal/flag-node" method="post" style="margin:0;">
+                    <input type="hidden" name="target_phone" value="{peer_phone}">
+                    <button type="submit" style="background:rgba(239,68,68,0.2); border:1px solid rgba(239,68,68,0.5); color:#fecaca; font-size:13px; font-weight:700; padding:10px 16px; border-radius:8px; cursor:pointer;">🚩 Report</button>
+                </form>"""
+
+                # Friend request button (built outside f-string to avoid escaping issues)
+                if is_friend:
+                    friend_request_btn = '<span style="color:#34d399; font-weight:700; font-size:13px;">✅ Already friends</span>'
+                else:
+                    friend_request_btn = (
+                        f'<form action="/portal/friend/request" method="post" style="margin:0;" '
+                        f'onsubmit="return confirm(\'⚠️ Verify this person first! Make sure you know them before sending a friend request. Continue?\');">'
+                        f'<input type="hidden" name="target_phone" value="{peer_phone}">'
+                        f'<button type="submit" class="btn btn-emerald" style="padding:8px 16px; font-size:13px;">👋 Send Friend Request</button>'
+                        f'</form>'
+                    )
+
                 peer_card_html = f"""
                 <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.25); border-radius:14px; padding:18px; margin-bottom:16px;">
                     <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
                         <div>
-                            <div style="font-weight:700; font-size:16px; color:#fff; margin-bottom:6px;">{html.escape(peer['name'])}</div>
+                            <div style="font-weight:800; font-size:20px; color:#fff; margin-bottom:6px;">{html.escape(peer['name'])} {'✅' if peer['status']=='Approved' else ''}</div>
                             <div style="font-size:13px; color:var(--text-muted);">LGA Sector: <b>{html.escape(peer['lga'])}</b></div>
                             <div style="font-size:13px; color:var(--text-muted); margin-top:4px;">
                                 Status: <span class="badge {status_badge_class}">{html.escape(peer['status'])}</span>
@@ -1800,14 +2582,23 @@ async def farmer_feed_portal(
                                 {mask_phone_number(peer_phone)}
                             </div>
                         </div>
-                        <div style="display:flex; gap:8px; align-items:center;">{block_btn}</div>
+                    </div>
+                    <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+{friend_request_btn}
+                    </div>
+                    <div style="margin-top:14px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.08);">
+                        <div style="font-size:12px; color:#f87171; font-weight:700; margin-bottom:8px; text-transform:uppercase; letter-spacing:0.04em;">🔒 Privacy Controls</div>
+                        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                            {report_btn}
+                            {block_btn}
+                        </div>
                     </div>
                 </div>"""
 
-                if not same_lga:
+                if not can_message:
                     peer_card_html += """
                     <div style="background:rgba(245,158,11,0.1); border:1px solid rgba(245,158,11,0.25); border-radius:10px; padding:12px 16px; margin-bottom:14px; font-size:13px; color:#fbbf24;">
-                        Messaging is limited to farmers in the same LGA for community safety.
+                        Send a friend request first. You can message each other after they accept. Phone number stays masked until then.
                     </div>"""
                 elif they_blocked_me:
                     peer_card_html += """
@@ -1821,12 +2612,20 @@ async def farmer_feed_portal(
                     </div>"""
                 else:
                     # Load conversation
+                    # Load messages using both phone formats
+                    my_alts_list = list(phone_alts(my_phone))
+                    peer_alts_list = list(phone_alts(peer_phone))
                     async with conn.execute("""
                         SELECT * FROM direct_messages
-                        WHERE (sender_phone = ? AND receiver_phone = ?)
-                           OR (sender_phone = ? AND receiver_phone = ?)
+                        WHERE (sender_phone IN ({}) AND receiver_phone IN ({}))
+                           OR (sender_phone IN ({}) AND receiver_phone IN ({}))
                         ORDER BY id ASC
-                    """, (my_phone, peer_phone, peer_phone, my_phone)) as mcur:
+                    """.format(
+                        ",".join("?" * len(my_alts_list)),
+                        ",".join("?" * len(peer_alts_list)),
+                        ",".join("?" * len(peer_alts_list)),
+                        ",".join("?" * len(my_alts_list))
+                    ), tuple(my_alts_list) + tuple(peer_alts_list) + tuple(peer_alts_list) + tuple(my_alts_list)) as mcur:
                         msgs = await mcur.fetchall()
 
                     for m in msgs:
@@ -1869,7 +2668,18 @@ async def farmer_feed_portal(
                         <button type="submit" class="btn btn-emerald" style="padding:12px 20px; white-space:nowrap;">Send</button>
                     </form>"""
             else:
-                peer_card_html = '<p style="color:var(--text-muted); font-size:14px; text-align:center; margin:20px 0;">No registered node found for that number. Please check and try again.</p>'
+                peer_card_html = f"""
+                <div style="background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:14px; padding:18px; margin-bottom:16px; text-align:center;">
+                    <div style="font-size:28px; margin-bottom:8px;">📱</div>
+                    <div style="font-weight:700; color:#f1f5f9; margin-bottom:6px;">Not on Farm Watch yet</div>
+                    <div style="font-size:13px; color:var(--text-muted); margin-bottom:14px; font-family:monospace;">{mask_phone_number(clean_search)}</div>
+                    <p style="font-size:14px; color:#cbd5e1; margin:0 0 16px 0;">This number is not registered. Send them an invite with the site link.</p>
+                    <form action="/portal/invite" method="post" style="margin:0;">
+                        <input type="hidden" name="target_phone" value="{clean_search}">
+                        <button type="submit" class="btn btn-emerald" style="padding:12px 24px; font-size:15px;">📨 Send Invite</button>
+                    </form>
+                    <p style="font-size:12px; color:#94a3b8; margin-top:12px;">They will receive a WhatsApp message with the registration link.</p>
+                </div>"""
 
     # Safety notice always shown in the messages tab
     safety_notice = f"""
@@ -1948,16 +2758,18 @@ async def farmer_feed_portal(
             <div style="background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:24px; padding:24px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px; margin-bottom:24px;">
                 <div style="display:flex; align-items:center; gap:16px;">
                     <div style="font-size:40px;">👨‍🌾</div>
-                    <div><h1 style="margin:0; font-size:22px; font-weight:800; color:#fff;">Terminal: {current_user['name']}</h1><span class="badge badge-emerald" style="margin-top:6px;">📍 {current_user['lga']} Sector Grid</span></div>
+                    <div><h1 style="margin:0; font-size:22px; font-weight:800; color:#fff;">Terminal: {html.escape(current_user['name'])} {'✅' if current_user.get('status') == 'Approved' else ''}</h1><span class="badge badge-emerald" style="margin-top:6px;">📍 {html.escape(current_user['lga'])} Sector Grid</span></div>
                 </div>
-                <div style="display:flex; gap:12px; align-items:center;"><span id="grid_score_display" class="badge badge-amber" style="font-weight:800; padding:8px 16px; font-size:13px;">⚡ {current_user['xp']} Grid XP</span><a href="/portal/logout" class="btn btn-danger" style="padding:10px 20px; font-size:13px; border-radius:10px;">🔌 Disconnect</a></div>
+                <div style="display:flex; gap:12px; align-items:center;"><span id="grid_score_display" class="badge badge-amber" style="font-weight:800; padding:8px 16px; font-size:13px;">⚡ {current_user['xp']} Grid XP</span>
+                    <a href="/portal/profile/edit" class="btn" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); padding:10px 16px; font-size:13px; border-radius:10px;">✏️ Edit Profile</a>
+                    <a href="/portal/logout" class="btn btn-danger" style="padding:10px 20px; font-size:13px; border-radius:10px;">🔌 Disconnect</a></div>
             </div>
 
             <div class="tab-bar">
                 <a href="/portal/feed?active_tab=incidents" class="tab-btn" style="{tab_incidents_active}">🛡️ Alerts</a>
                 <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community</a>
                 <a href="/portal/feed?active_tab=market" class="tab-btn" style="{tab_market_active}">🛒 Market</a>
-                <a href="/portal/feed?active_tab=messages" class="tab-btn" style="{tab_messages_active}">💬 Messages</a>
+                <a href="/portal/messages" class="tab-btn" style="background:transparent; color:var(--text-muted);">💬 Messages{unread_badge}</a>
             </div>
 
             <div id="tab_incidents" style="{show_incidents}">
@@ -2007,6 +2819,8 @@ async def farmer_feed_portal(
                         </div>
                         <div style="font-size:13px; color:#cbd5e1; line-height:1.45; margin-bottom:14px;">{soil['advice']}</div>
                         {f'<div style="font-size:11px; color:var(--text-muted); margin-bottom:12px;">Last reading: {soil["timestamp"]}</div>' if soil.get('timestamp') else ''}
+                        {('<div style="background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); border-radius:10px; padding:10px 14px; margin-bottom:12px; color:#6ee7b7; font-weight:700; font-size:14px;">✅ Soil reading saved!</div>') if soil_saved else ''}
+                        <div style="margin-bottom:12px;"><a href="/portal/soil/history" style="color:#6ee7b7; font-size:13px; font-weight:700; text-decoration:none;">📊 View reading history →</a></div>
                         <form action="/portal/sensors/submit" method="post" style="border-top:1px solid rgba(255,255,255,0.06); padding-top:14px;">
                             <div style="font-size:13px; font-weight:700; color:#e2e8f0; margin-bottom:10px;">Enter new reading</div>
                             <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
@@ -2104,98 +2918,6 @@ async def farmer_feed_portal(
                     <audio id="radio_audio" crossorigin="anonymous" preload="none" style="display:none;"></audio>
                 </div>
 
-                <!-- Spotify -->
-                <div class="portal-card" style="margin-top:24px; border-color: rgba(29,185,84,0.3);">
-                    <div class="card-header" style="border-color: rgba(29,185,84,0.2);">
-                        🎧 <h3 class="card-title" style="color:#1db954;">Spotify — Your links</h3>
-                    </div>
-                    <p style="font-size:14px; color:#cbd5e1; margin:0 0 14px 0; line-height:1.45;">
-                        Save your favourite playlists here. Paste a Spotify link, give it a name, and play anytime.
-                    </p>
-
-                    <div style="background:rgba(29,185,84,0.06); border:1px solid rgba(29,185,84,0.2); border-radius:12px; padding:14px; margin-bottom:16px;">
-                        <div style="font-size:13px; font-weight:700; color:#1db954; margin-bottom:8px;">My saved playlists</div>
-                        {my_spotify_list_html}
-                    </div>
-
-                    <form action="/portal/spotify/save" method="post" style="background:rgba(0,0,0,0.2); padding:14px; border-radius:12px; margin-bottom:14px;">
-                        <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Name</label>
-                        <input type="text" name="title" required maxlength="60" placeholder="e.g. My farm work mix"
-                               style="width:100%; padding:12px; font-size:16px; background:rgba(10,31,20,0.9); border:2px solid rgba(29,185,84,0.35); color:#f0fdf4; border-radius:10px; box-sizing:border-box; margin-bottom:10px;">
-                        <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Spotify link</label>
-                        <input type="text" name="url" required placeholder="Paste playlist / album / song link from Spotify"
-                               style="width:100%; padding:12px; font-size:15px; background:rgba(10,31,20,0.9); border:2px solid rgba(29,185,84,0.35); color:#f0fdf4; border-radius:10px; box-sizing:border-box; margin-bottom:12px;">
-                        <button type="submit" class="btn btn-emerald" style="width:100%; padding:14px; font-size:16px; background:linear-gradient(135deg,#1db954,#1ed760); color:#042f1a;">Save my link</button>
-                    </form>
-
-                    <div style="display:flex; flex-wrap:wrap; gap:10px; margin-bottom:12px; align-items:center;">
-                        <label style="font-size:14px; font-weight:700; color:#e2e8f0; margin:0;">Quick play</label>
-                        <select id="spotify_preset" onchange="loadSpotifyPreset()" style="flex:1; min-width:180px; padding:12px; font-size:16px; background:rgba(10,31,20,0.9); border:2px solid rgba(29,185,84,0.35); color:#f0fdf4; border-radius:10px;">
-                            <option value="">— Choose —</option>
-                            <optgroup label="My links">{my_spotify_options or '<option disabled>None saved yet</option>'}</optgroup>
-                            <optgroup label="Suggested">
-                                <option value="playlist/37i9dQZF1DWYkaDi7aYkT9">Afrobeats Hits</option>
-                                <option value="playlist/37i9dQZF1DX4sWSpwq3LiO">Peaceful Piano</option>
-                                <option value="playlist/37i9dQZF1DX3Ogo9pFvBkY">Ambient Relaxation</option>
-                                <option value="playlist/37i9dQZF1DX0XUsuxWHRQd">RapCaviar</option>
-                            </optgroup>
-                        </select>
-                    </div>
-                    <div style="display:flex; flex-wrap:wrap; gap:10px; margin-bottom:14px; align-items:center;">
-                        <input type="text" id="spotify_url" placeholder="Or paste link just to play (without saving)"
-                               style="flex:1; min-width:200px; padding:12px; font-size:15px; background:rgba(10,31,20,0.9); border:2px solid rgba(29,185,84,0.35); color:#f0fdf4; border-radius:10px;">
-                        <button type="button" onclick="loadSpotifyUrl()" class="btn btn-emerald" style="padding:12px 18px; font-size:15px; background:linear-gradient(135deg,#1db954,#1ed760); color:#042f1a;">Play</button>
-                    </div>
-                    <div id="spotify_wrap" style="border-radius:12px; overflow:hidden; background:rgba(0,0,0,0.25); min-height:80px;">
-                        <div id="spotify_placeholder" style="padding:28px; text-align:center; color:#94a3b8; font-size:14px;">
-                            Save your links above, then tap one to play
-                        </div>
-                        <iframe id="spotify_iframe" style="display:none; width:100%; height:152px; border:0;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" loading="lazy"></iframe>
-                    </div>
-                    <p style="font-size:12px; color:#64748b; margin:10px 0 0 0;">
-                        How to copy a link: open Spotify → share → Copy link. Free accounts play with ads.
-                    </p>
-                </div>
-
-                <!-- Farm TV — Nigerian channels -->
-                <div class="portal-card" style="margin-top:24px; border-color: rgba(239,68,68,0.25);">
-                    <div class="card-header" style="border-color: rgba(239,68,68,0.2);">
-                        📺 <h3 class="card-title" style="color:#fca5a5;">Farm TV — Nigerian Channels</h3>
-                    </div>
-                    <p style="font-size:14px; color:#cbd5e1; margin:0 0 14px 0; line-height:1.45;">
-                        News, football &amp; entertainment. Choose a channel. Needs internet.
-                    </p>
-                    <div style="display:flex; flex-wrap:wrap; gap:10px; margin-bottom:14px; align-items:center;">
-                        <label style="font-size:14px; font-weight:700; color:#e2e8f0; margin:0;">Channel</label>
-                        <select id="tv_channel" onchange="loadTvChannel()" style="flex:1; min-width:200px; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px;">
-                            <option value="">— Select a TV channel —</option>
-                            <optgroup label="📰 News">
-                                <option value="ch:UCEXGDNclvmg6RW0vipJYsTQ">Channels Television</option>
-                                <option value="ch:UCgp4A6I8LCWrhUzn-5SbKvA">TVC News Nigeria</option>
-                                <option value="ch:UCQzc5L69qj73yq_OIBM7wNg">News Central TV</option>
-                                <option value="yt:@AriseNewsChannel">Arise News</option>
-                                <option value="yt:@NTALive">NTA Live</option>
-                            </optgroup>
-                            <optgroup label="⚽ Football &amp; Sports">
-                                <option value="yt:@BrilaMedia">Brila Media TV (Football &amp; Sports)</option>
-                                <option value="yt:@SuperSport">SuperSport (highlights / live when available)</option>
-                            </optgroup>
-                            <optgroup label="🎵 Entertainment &amp; Music">
-                                <option value="yt:@SoundcityTVAfrica">Soundcity TV</option>
-                                <option value="yt:@africamagicofficial">Africa Magic</option>
-                                <option value="yt:@SpiceTVAfrica">Spice TV</option>
-                            </optgroup>
-                        </select>
-                    </div>
-                    <div id="tv_player_wrap" style="position:relative; width:100%; padding-bottom:56.25%; background:#0f172a; border-radius:12px; overflow:hidden; border:1px solid rgba(255,255,255,0.08);">
-                        <div id="tv_placeholder" style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:15px; text-align:center; padding:20px;">
-                            Select a channel to start watching
-                        </div>
-                        <iframe id="tv_iframe" style="display:none; position:absolute; top:0; left:0; width:100%; height:100%; border:0;" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>
-                    </div>
-                    <p style="font-size:12px; color:#64748b; margin:10px 0 0 0;">Powered by official YouTube live streams. If a channel is offline, try another.</p>
-                </div>
-
                 <div class="portal-grid" style="grid-template-columns: 1fr; margin-top:24px;">
                     <div class="portal-card" style="border-color: rgba(239,68,68,0.2);"><div class="card-header" style="border-color: rgba(239,68,68,0.15);">🛡️ <h3 class="card-title" style="color:#ef4444;">Active Sector Threat Vectors</h3></div>{echo_feed_html or '<div style="text-align:center; padding:20px; color:var(--text-muted); font-style:italic; font-size:14px;">🟢 Secure baseline. Local sector is quiet.</div>'}</div>
                     <div class="portal-card" style="border-color: rgba(245,158,11,0.2);">
@@ -2214,6 +2936,49 @@ async def farmer_feed_portal(
 
             <div id="tab_community" style="{show_community}">
                 <div class="portal-grid">
+                    {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Friend request sent! It will appear under their Requests.</div></div>') if friend_sent else ''}
+                    {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Profile updated successfully.</div></div>') if profile_updated else ''}
+                    <div class="portal-card" style="grid-column:1 / -1; background:linear-gradient(145deg, rgba(22,52,38,0.9), rgba(18,40,48,0.85)); border:1px solid rgba(52,211,153,0.2);">
+                        <div class="card-header" style="border-bottom:1px solid rgba(52,211,153,0.15);">
+                            <span style="font-size:22px;">🔍</span>
+                            <h3 class="card-title">Find a Farmer</h3>
+                        </div>
+                        <p style="font-size:14px; color:#a7c4b5; margin:0 0 18px 0; line-height:1.5;">
+                            Search by Nigerian mobile number to connect with someone on the network or invite them to join.
+                        </p>
+                        <form action="/portal/feed" method="get" style="display:flex; gap:12px; flex-wrap:wrap; align-items:stretch;">
+                            <input type="hidden" name="active_tab" value="community">
+                            <div style="flex:1; min-width:200px; position:relative;">
+                                <span style="position:absolute; left:14px; top:50%; transform:translateY(-50%); color:#6ee7b7; font-size:16px; pointer-events:none;">📱</span>
+                                <input type="text" name="search_phone" placeholder="0803 123 4567" required inputmode="numeric" autocomplete="tel"
+                                       style="width:100%; padding:14px 14px 14px 42px; font-size:16px; background:rgba(10,31,20,0.85); border:1.5px solid rgba(52,211,153,0.3); color:#f0fdf4; border-radius:12px; box-sizing:border-box; outline:none;"
+                                       onfocus="this.style.borderColor='#34d399'; this.style.boxShadow='0 0 0 3px rgba(52,211,153,0.15)';"
+                                       onblur="this.style.borderColor='rgba(52,211,153,0.3)'; this.style.boxShadow='none';">
+                            </div>
+                            <button type="submit" class="btn btn-emerald" style="padding:14px 28px; font-size:15px; border-radius:12px; white-space:nowrap;">
+                                Search
+                            </button>
+                        </form>
+                        <div style="display:flex; gap:16px; margin-top:14px; flex-wrap:wrap; font-size:12px; color:#7d9b8c;">
+                            <span>✓ Registered users → send friend request</span>
+                            <span>✓ Not registered → send invite link</span>
+                        </div>
+                        {peer_card_html if search_phone else ""}
+                    </div>
+                    <div class="portal-card" style="grid-column:1 / -1;">
+                        <div class="card-header">🤝 <h3 class="card-title">Friends & Requests</h3></div>
+                        <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+                            <div>
+                                <div style="font-size:13px; font-weight:700; color:#fbbf24; margin-bottom:8px;">Pending Requests</div>
+                                {profile_card_html}
+                                {pending_html}
+                            </div>
+                            <div>
+                                <div style="font-size:13px; font-weight:700; color:#6ee7b7; margin-bottom:8px;">My Friends</div>
+                                {friends_html}
+                            </div>
+                        </div>
+                    </div>
                     <div class="portal-card">
                         <div class="card-header">✅ <h3 class="card-title">Daily Check-in</h3></div>
                         <p style="font-size:14px; color:#cbd5e1; margin:0 0 14px 0;">Let neighbours know you are safe today.</p>
@@ -2281,6 +3046,9 @@ async def farmer_feed_portal(
             <div id="tab_market" style="{show_market}">
                 <div class="portal-card" style="max-width:720px; margin:0 auto 20px;">
                     <div class="card-header">🛒 <h3 class="card-title">Farm Market</h3></div>
+                    <div style="background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.35); border-radius:12px; padding:14px 16px; margin-bottom:16px; font-size:14px; color:#fecaca; line-height:1.5;">
+                        <strong>⚠️ Scam Warning:</strong> Never send money before seeing the goods. Meet in a public place. Use the <b>Report</b> button if a listing looks suspicious. Farm Watch does not handle payments.
+                    </div>
                     <p style="font-size:14px; color:#cbd5e1; margin:0 0 16px 0; line-height:1.45;">
                         Promote your crops, livestock, tools or produce. Neighbours can contact you directly.
                         Posting earns <b style="color:#6ee7b7;">+{PRODUCT_POST_XP} XP</b>.
@@ -2299,9 +3067,10 @@ async def farmer_feed_portal(
                         <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Details</label>
                         <input type="text" name="description" maxlength="{MAX_PRODUCT_DESC}" placeholder="Quality, quantity, location notes…"
                                style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; box-sizing:border-box; margin-bottom:12px;">
-                        <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Photo (optional)</label>
-                        <input type="file" name="photo" accept="image/jpeg,image/png,image/webp"
+                        <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Photos (optional, up to 5)</label>
+                        <input type="file" name="photos" accept="image/jpeg,image/png,image/webp" multiple
                                style="width:100%; padding:12px; font-size:14px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; box-sizing:border-box; margin-bottom:12px;">
+                        <p style="font-size:12px; color:#94a3b8; margin:0 0 12px 0;">You can select multiple images at once.</p>
                         <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Contact phone (optional)</label>
                         <input type="text" name="contact_phone" placeholder="Leave blank to use your registered number" inputmode="numeric"
                                style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; box-sizing:border-box; margin-bottom:14px;">
@@ -2339,20 +3108,20 @@ async def farmer_feed_portal(
             </div>
 
             <div id="tab_messages" style="{show_messages}">
-                <div class="portal-card" style="max-width:720px; margin:0 auto;">
-                    <div class="card-header">💬 <h3 class="card-title">Node P2P Comms</h3></div>
-                    {safety_notice}
-                    <form action="/portal/feed" method="get" style="margin-bottom:18px; display:flex; gap:10px;">
-                        <input type="hidden" name="active_tab" value="messages">
-                        <input type="text" name="search_phone" placeholder="Enter registered mobile number (same LGA)..." value="{clean_search}" required
-                               style="flex:1; padding:12px; background:#090d16; border:1px solid var(--border-glass); color:white; border-radius:10px;">
-                        <button type="submit" class="btn btn-emerald" style="padding:12px 20px;">Lookup Peer</button>
-                    </form>
-                    {peer_card_html}
-                    <div style="max-height:340px; overflow-y:auto; margin-bottom:12px; padding:12px; background:rgba(0,0,0,0.25); border-radius:12px; min-height:120px;">
-                        {messages_log_html or '<p style="color:var(--text-muted); font-size:13px; text-align:center; margin:30px 0;">No messages yet. Lookup a peer in your LGA to start a conversation.</p>'}
+                <div class="portal-card" style="max-width:720px; margin:0 auto; min-height:400px;">
+                    <div class="card-header">💬 <h3 class="card-title">Messages</h3></div>
+                    {('<div style="background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); border-radius:10px; padding:12px 16px; margin-bottom:14px; color:#6ee7b7; font-weight:700;">✅ Invite sent!</div>') if invite_sent else ''}
+                    {peer_card_html or '<div style="padding:20px; text-align:center; color:#94a3b8;">Select a friend from Community or search below.</div>'}
+                    <div style="max-height:300px; overflow-y:auto; margin:12px 0; padding:12px; background:rgba(0,0,0,0.25); border-radius:12px; min-height:100px;">
+                        {messages_log_html or '<p style="color:var(--text-muted); font-size:14px; text-align:center; margin:20px 0;">No messages yet. Say hello!</p>'}
                     </div>
-                    {send_form_html}
+                    {send_form_html or ''}
+                    <form action="/portal/feed" method="get" style="margin-top:20px; display:flex; gap:10px;">
+                        <input type="hidden" name="active_tab" value="messages">
+                        <input type="text" name="search_phone" placeholder="Or search a number..." value=""
+                               style="flex:1; padding:12px; background:#1e293b; border:1px solid #475569; color:white; border-radius:10px;">
+                        <button type="submit" class="btn btn-emerald" style="padding:12px 20px;">Search</button>
+                    </form>
                 </div>
             </div>
         </div>
@@ -2464,7 +3233,8 @@ async def farmer_feed_portal(
                 }}
             }}
 
-            document.getElementById('radio_station').addEventListener('change', function() {{
+            const radioStationEl = document.getElementById('radio_station');
+            if (radioStationEl) radioStationEl.addEventListener('change', function() {{
                 const audio = document.getElementById('radio_audio');
                 if (radioPlaying) {{
                     audio.pause();
@@ -2579,77 +3349,23 @@ async def farmer_feed_portal(
                 document.getElementById('hunt_msg').style.color = '#94a3b8';
             }}
 
-            // ----- Spotify embeds -----
-            function setSpotifyEmbed(path) {{
-                const iframe = document.getElementById('spotify_iframe');
-                const placeholder = document.getElementById('spotify_placeholder');
-                if (!path) {{
-                    iframe.style.display = 'none';
-                    iframe.src = '';
-                    placeholder.style.display = 'block';
-                    return;
+            // ----- Auto XP every 20 seconds while on the page -----
+            setInterval(async () => {{
+                try {{
+                    if (document.hidden) return;
+                    const res = await fetch('/portal/xp/tick', {{ method: 'POST' }});
+                    if (res.ok) {{
+                        const data = await res.json();
+                        const el = document.getElementById('grid_score_display');
+                        if (el && data.xp !== undefined) {{
+                            el.innerText = '⚡ ' + data.xp + ' Grid XP';
+                        }}
+                    }}
+                }} catch (e) {{
+                    // Silent fail - network or auth issue
                 }}
-                iframe.src = 'https://open.spotify.com/embed/' + path + '?utm_source=generator&theme=0';
-                placeholder.style.display = 'none';
-                iframe.style.display = 'block';
-            }}
-            function loadSpotifyPreset() {{
-                const val = document.getElementById('spotify_preset').value;
-                if (val) {{
-                    document.getElementById('spotify_url').value = '';
-                    setSpotifyEmbed(val);
-                }}
-            }}
-            function loadSpotifyUrl() {{
-                const raw = (document.getElementById('spotify_url').value || '').trim();
-                if (!raw) return;
-                // Accept open.spotify.com links for playlist, album, track, episode
-                let m = raw.match(/open[.]spotify[.]com[/](playlist|album|track|episode|show)[/]([a-zA-Z0-9]+)/);
-                if (!m) {{
-                    // Also accept spotify:playlist:ID URI form
-                    m = raw.match(/spotify:(playlist|album|track|episode|show):([a-zA-Z0-9]+)/);
-                }}
-                if (m) {{
-                    document.getElementById('spotify_preset').value = '';
-                    setSpotifyEmbed(m[1] + '/' + m[2]);
-                }} else {{
-                    document.getElementById('spotify_placeholder').style.display = 'block';
-                    document.getElementById('spotify_placeholder').innerText = 'Link not recognized. Paste a Spotify playlist, album, or song link.';
-                    document.getElementById('spotify_iframe').style.display = 'none';
-                }}
-            }}
+            }}, 20000);
 
-            // ----- Farm TV (YouTube live embeds) -----
-            function loadTvChannel() {{
-                const sel = document.getElementById('tv_channel');
-                const val = sel.value;
-                const iframe = document.getElementById('tv_iframe');
-                const placeholder = document.getElementById('tv_placeholder');
-                if (!val) {{
-                    iframe.style.display = 'none';
-                    iframe.src = '';
-                    placeholder.style.display = 'flex';
-                    placeholder.innerText = 'Select a channel to start watching';
-                    return;
-                }}
-                if (val.startsWith('ch:')) {{
-                    // Direct channel ID — embed live stream in page
-                    const channelId = val.slice(3);
-                    iframe.src = 'https://www.youtube.com/embed/live_stream?channel=' + encodeURIComponent(channelId) + '&autoplay=1&rel=0';
-                    placeholder.style.display = 'none';
-                    iframe.style.display = 'block';
-                }} else if (val.startsWith('yt:')) {{
-                    // Open official YouTube channel live page (works when they are on air)
-                    const handle = val.slice(3);
-                    iframe.style.display = 'none';
-                    iframe.src = '';
-                    placeholder.style.display = 'flex';
-                    placeholder.innerHTML = 'Opening <b>' + sel.selectedOptions[0].text + '</b>…<br><br>' +
-                        '<a href="https://www.youtube.com/' + handle + '/live" target="_blank" rel="noopener" ' +
-                        'style="display:inline-block;padding:12px 20px;background:#ef4444;color:#fff;border-radius:10px;font-weight:700;text-decoration:none;font-size:16px;">Watch live on YouTube</a>';
-                    window.open('https://www.youtube.com/' + handle + '/live', '_blank', 'noopener');
-                }}
-            }}
         </script>
     </body></html>"""
 
@@ -2680,6 +3396,11 @@ async def farmer_raise_alert(alert_type: str = Form(...), message: str = Form(..
 
         if not any(sig in file_head for sig in valid_signatures):
             raise HTTPException(status_code=400, detail="Invalid video format header uploaded.")
+        # Enforce size limit
+        content_bytes = await video_evidence.read()
+        if len(content_bytes) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=400, detail="Video file too large (max 5MB).")
+        await video_evidence.seek(0)
 
         v_name = f"{hashlib.md5(os.urandom(16)).hexdigest()}_{sanitize(video_evidence.filename)}"
         with open(os.path.join(MEDIA_DIR, v_name), "wb") as f:
@@ -2718,7 +3439,8 @@ async def farmer_relay_alert(alert_id: int = Form(...), current_user=Depends(get
             await conn.execute("UPDATE farmers SET xp = xp + 15 WHERE phone = ?", (current_user['phone'],))
             async with conn.execute("SELECT xp FROM farmers WHERE phone = ?", (current_user['phone'],)) as res_cursor:
                 res_row = await res_cursor.fetchone()
-                if res_row: new_xp = res_row
+                if res_row:
+                    new_xp = res_row[0] if isinstance(res_row, (tuple, list)) else res_row["xp"]
             await conn.commit()
         async with aiosqlite.connect(DB_FILE) as conn:
             conn.row_factory = aiosqlite.Row
