@@ -1,57 +1,33 @@
-import secrets
-import requests
 import os
-import threading
-from fastapi import FastAPI, Form, Response, Depends, HTTPException, status, Cookie
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
+import hmac
+import hashlib
+import html
+import httpx
+import asyncio
+import aiosqlite
+from typing import Optional, Dict, List
+from fastapi import FastAPI, Form, Response, Depends, HTTPException, status, Cookie, File, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-import database as db_engine
 
-app = FastAPI(title="Farm Watch Enterprise Node", version="4.6.0")
+app = FastAPI(title="Farm Watch Enterprise Node", version="5.2.1")
 security = HTTPBasic()
-db_engine.initialize_db()
 
-ADMIN_USERNAME = "chief"
-ADMIN_PASSWORD = "securepassword123"
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "chief")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "securepassword123")
+ADMIN_SECRET_HASH = hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest()
+COOKIE_SIGNING_KEY = os.getenv("COOKIE_SECRET_KEY", "grid-security-core-token-991").encode()
 
-# 📞 ---------------------------------------------------------
-# ACTIVE PRODUCTION TWILIO PROFILE INDEX
-# ---------------------------------------------------------
-TWILIO_ACCOUNT_SID = "AC436cb01fff8036da72eda4b89ef1366d"
-TWILIO_AUTH_TOKEN = "9beab2f0af9f6e78b079e27348073269"
-TWILIO_PHONE_NUMBER = "whatsapp:+14155238886"
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "AC436cb01fff8036da72eda4b89ef1366d")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "9beab2f0af9f6e78b079e27348073269")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "whatsapp:+14155238886")
+DB_FILE = "farm_watch.db"
+MEDIA_DIR = "static_media"
 
-# Pre-approved meta sandbox notification schema container
-TWILIO_CONTENT_SID = "HXb5b62575e6e4ff6129ad7c8efe1f983e"
+os.makedirs(MEDIA_DIR, exist_ok=True)
+app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 
-ADMIN_ALERT_WEBHOOK_URL = "https://slack.com"
-
-GLOBAL_GEO_DB = {
-    "Nigeria": {
-        "Kano": {
-            "Kano Municipal": ["Gandun Albasa", "Kano City Center", "Tudun Wada"],
-            "Fagge": ["Fagge D2", "Waje", "Sabon Gari"]
-        },
-        "Lagos": {
-            "Ikeja": ["Alausa", "Oregun", "Computer Village"],
-            "Lekki": ["Phase 1", "Ikate", "Chevron Node"]
-        },
-        "Osun": {
-            "Osogbo": ["Olorunda Central", "Capital Hub Ring", "Ataoja Sector"],
-            "Ile-Ife": ["Ife Central Town", "Modakeke Border", "University Outpost"],
-            "Ilesa": ["Ilesa East Sector", "Ilesa West Farm Ring", "Ijebu-Jesa Road"],
-            "Ede": ["Ede South Agrarian", "Timi Market Node", "Federal Poly Outskirt"]
-        },
-        "Oyo": {
-            "Ibadan": ["Ido Farming Grid", "Oluyole Frontier", "Lagelu Outpost Area"],
-            "Ogbomoso": ["Ogbomoso North LAUTECH", "Ogbomoso South Central"],
-            "Iseyin": ["Iseyin-Okeogun Central", "Ado-Awaye Route", "Agrarian North"],
-            "Saki": ["Saki West Grid", "Saki East Valley", "Oke-Ogun Boundary Ring"]
-        }
-    }
-}
 CITY_AUTOFILL_MAP = {
     "osogbo": {"country": "Nigeria", "state": "Osun", "lga": "Osogbo", "area": "Ataoja Sector"},
     "ile-ife": {"country": "Nigeria", "state": "Osun", "lga": "Ile-Ife", "area": "Ife Central Town"},
@@ -59,346 +35,532 @@ CITY_AUTOFILL_MAP = {
     "ogbomoso": {"country": "Nigeria", "state": "Oyo", "lga": "Ogbomoso", "area": "Ogbomoso South Central"}
 }
 
-class DatabaseChangeHandler(FileSystemEventHandler):
-    def on_modified(self, event):
-        if os.path.basename(event.src_path) == os.path.basename(db_engine.DB_FILE):
+#  MODERN LIFESPAN APPROACH
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. This runs BEFORE the application starts receiving requests (Startup)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("PRAGMA journal_mode=WAL;")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS farmers (
+                phone TEXT PRIMARY KEY, name TEXT, country TEXT, state TEXT, 
+                city TEXT, lga TEXT, area TEXT, token TEXT, status TEXT, xp INTEGER DEFAULT 100
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS alerts_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                type TEXT, sender TEXT, lga TEXT, message TEXT, status TEXT, video_path TEXT
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS alert_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER, 
+                author TEXT, text TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        try:
+            await conn.execute("ALTER TABLE alerts_log ADD COLUMN video_path TEXT;")
+        except Exception:
             pass
+        await conn.commit()
 
-def start_db_watchdog():
-    db_dir = os.path.dirname(os.path.abspath(db_engine.DB_FILE)) or "."
-    observer = Observer()
-    observer.schedule(DatabaseChangeHandler(), path=db_dir, recursive=False)
-    observer.start()
+    yield  # 2. The app stays active and handles requests here
 
-threading.Thread(target=start_db_watchdog, daemon=True).start()
+    # 3. Any cleanup code here runs when the app is shutting down (Shutdown)
+
+
+# Pass the lifespan context manager into your FastAPI initialization
+app = FastAPI(title="Farm Watch Enterprise Node", version="5.2.1", lifespan=lifespan)
+
+
+def clean_phone(phone: str) -> str:
+    return "".join(c for c in phone if c.isdigit())
+
+def sanitize(text: str) -> str:
+    return html.escape(text.strip())
+
+def sign_cookie_value(value: str) -> str:
+    signature = hmac.new(COOKIE_SIGNING_KEY, value.encode(), hashlib.sha256).hexdigest()
+    return f"{value}.{signature}"
+
+def verify_cookie_value(signed_value: Optional[str]) -> Optional[str]:
+    if not signed_value or "." not in signed_value:
+        return None
+    value, signature = signed_value.rsplit(".", 1)
+    expected = hmac.new(COOKIE_SIGNING_KEY, value.encode(), hashlib.sha256).hexdigest()
+    return value if hmac.compare_digest(signature, expected) else None
 
 def mask_phone_number(phone: str) -> str:
-    clean = str(phone).strip()
+    clean = clean_phone(phone)
     if len(clean) <= 6: return "••••" + clean[-2:] if len(clean) > 2 else "••••"
     return f"{clean[:4]}••••{clean[-3:]}"
 
-def send_production_alert(to_number: str, message_text: str):
-    """Fires a structural title-case template payload directly to Twilio's REST API."""
+async def async_dispatch_whatsapp(to_number: str, message_text: str):
     url = f"https://twilio.com{TWILIO_ACCOUNT_SID}/Messages.json"
+    clean_target = f"whatsapp:+{clean_phone(to_number)}" if not to_number.startswith("+") else f"whatsapp:{to_number}"
+    payload = {"To": clean_target, "From": TWILIO_PHONE_NUMBER, "Body": message_text}
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            res = await client.post(url, data=payload, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+            print(f"📡 Background Dispatch Status: {res.status_code}")
+        except Exception as e:
+            print(f"❌ Non-blocking network alert exception: {e}")
 
-    # Ensure the target format is clean and exactly what Twilio expects
-    clean_target = str(to_number).strip()
-    if not clean_target.startswith("whatsapp:"):
-        clean_target = f"whatsapp:{clean_target}"
-
-    payload = {
-        "To": clean_target,
-        "From": TWILIO_PHONE_NUMBER,
-        "ContentSid": "HXb5b62575e6e4ff6129ad7c8efe1f983e",
-        "ContentVariables": '{"1":"12/1","2":"3pm"}'
-    }
-
-    try:
-        res = requests.post(
-            url,
-            data=payload,
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-            timeout=5.0
-        )
-        # Log the response in Render Console so you can see the error code
-        print(f"📡 Twilio Dispatch Status: {res.status_code} | Response: {res.text}")
-        return res.status_code == 201
-    except Exception as e:
-        print(f"❌ Network Exception during Twilio dispatch: {e}")
-        return False
-
-
-def get_realtime_weather(lga: str) -> dict:
+async def get_realtime_weather(lga: str) -> dict:
     geo_coordinates = {
         "osogbo": {"lat": 7.7827, "lon": 4.5418}, "ile-ife": {"lat": 7.4667, "lon": 4.5667},
-        "ibadan": {"lat": 7.3775, "lon": 3.9470}, "ogbomoso": {"lat": 8.1333, "lon": 4.2667},
-        "kano municipal": {"lat": 11.9964, "lon": 8.5167}, "ikeja": {"lat": 6.5244, "lon": 3.3792}
+        "ibadan": {"lat": 7.3775, "lon": 3.9470}, "ogbomoso": {"lat": 8.1333, "lon": 4.2667}
     }
-    coords = geo_coordinates.get(lga.strip().lower(), {"lat": 7.3775, "lon": 3.9470})
-    try:
-        url = f"https://open-meteo.com{coords['lat']}&longitude={coords['lon']}&current_weather=true"
-        res = requests.get(url, timeout=3)
-        if res.status_code == 200:
-            w_data = res.json().get("current_weather", {})
-            temp = w_data.get("temperature", 28.5)
-            desc = "Optimal Growth" if 22 <= temp <= 32 else "Monitor Soil Hydration"
-            return {"temp": f"{temp}°C", "desc": desc}
-    except Exception: pass
+    coords = geo_coordinates.get(lga.lower().strip(), {"lat": 7.3775, "lon": 3.9470})
+    url = f"https://open-meteo.com{coords['lat']}&longitude={coords['lon']}&current_weather=true"
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        try:
+            res = await client.get(url)
+            if res.status_code == 200:
+                temp = res.json().get("current_weather", {}).get("temperature", 28.5)
+                return {"temp": f"{temp}°C", "desc": "Optimal Growth" if 22 <= temp <= 32 else "Monitor Hydration"}
+        except Exception: pass
     return {"temp": "28.5°C", "desc": "Optimal Conditions"}
 
-def send_admin_webhook(payload: dict):
-    if "://slack.com" in ADMIN_ALERT_WEBHOOK_URL or "://discord.com" in ADMIN_ALERT_WEBHOOK_URL:
-        try: requests.post(ADMIN_ALERT_WEBHOOK_URL, json=payload, timeout=3)
-        except Exception: pass
 def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    is_user = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
-    is_pass = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
-    if not (is_user and is_pass):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bad credentials.", headers={"WWW-Authenticate": "Basic"})
+    input_hash = hashlib.sha256(credentials.password.encode()).hexdigest()
+    if not (hmac.compare_digest(credentials.username, ADMIN_USERNAME) and hmac.compare_digest(input_hash, ADMIN_SECRET_HASH)):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Node Credentials", headers={"WWW-Authenticate": "Basic"})
     return credentials.username
+async def get_current_farmer(farmer_session: Optional[str] = Cookie(None)):
+    verified_phone = verify_cookie_value(farmer_session)
+    if not verified_phone: return None
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM farmers WHERE phone = ?", (verified_phone,)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
-def get_current_farmer(farmer_session: str = Cookie(None)):
-    if not farmer_session: return None
-    db = db_engine.load_db()
-    clean_phone = db_engine.clean_phone_number(farmer_session)
-    return {"phone": clean_phone, "data": db["farmers"][clean_phone]} if clean_phone in db["farmers"] else None
-CORE_CSS = """
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: radial-gradient(circle at 10% 20%, #0f172a 0%, #020617 90%); color: #f8fafc; margin: 0; padding: 20px; min-height: 100vh; display: flex; justify-content: center; align-items: center; box-sizing: border-box; }
-    .glass-panel { background: rgba(15, 23, 42, 0.65); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 24px; box-shadow: 0 20px 50px rgba(0,0,0,0.4); width: 100%; box-sizing: border-box; }
-    .btn { display: inline-flex; align-items: center; justify-content: center; padding: 14px 24px; border-radius: 12px; font-weight: 700; text-decoration: none; cursor: pointer; border: none; transition: all 0.2s ease-in-out; font-size: 14px; text-align: center; }
-    .btn-emerald { background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; box-shadow: 0 4px 14px rgba(16,185,129,0.2); }
-    .btn-blue { background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); color: white; box-shadow: 0 4px 14px rgba(59,130,246,0.2); }
-    input, select { width:100%; padding:12px; background:#020617; border: 1px solid rgba(255,255,255,0.1); color:white; border-radius:8px; box-sizing:border-box; margin-bottom:15px; font-size: 14px; }
-    .responsive-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; width: 100%; }
-"""
-@app.get("/", response_class=HTMLResponse)
-def community_homepage():
-    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="hero glass-panel" style="max-width: 550px; text-align: center; padding: 40px 30px;"><h1>📡 Farm Watch Ecosystem</h1><p style="color: #94a3b8; margin-bottom: 30px; line-height: 1.6; font-size: 15px;">Next-generation protection grid protecting local livelihoods.</p><div style="display:flex; flex-direction:column; gap:14px;"><a href="/register" class="btn btn-emerald">➕ Register Operational Node</a><a href="/portal/login" class="btn btn-blue">👩‍🌾 Member Authentication Portal</a><a href="/dashboard" class="btn" style="background:rgba(255,255,255,0.03); color:#cbd5e1; border:1px solid rgba(255,255,255,0.1);">🖥️ Access Admin Control Center</a></div></div></body></html>"""
-
-@app.get("/portal/login", response_class=HTMLResponse)
-def farmer_login_page(error: str = None):
-    err_box = f'<div style="color:#f87171; background:rgba(239,68,68,0.1); padding:12px; border-radius:8px; font-size:13px; margin-bottom:20px; font-weight:600; border: 1px solid rgba(239,68,68,0.15);">⚠️ {error}</div>' if error else ""
-    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="login-card glass-panel" style="padding:40px 25px; width:100%; max-width:380px;"><h2>Member Login</h2>{err_box}<form action="/portal/auth" method="post"><label style="font-size:11px; color:#64748b; font-weight:700; display:block; margin-bottom:6px;">PHONE NUMBER</label><input type="text" name="phone" placeholder="e.g. 23480..." required><button type="submit" class="btn btn-blue" style="width: 100%;">Secure Sign In</button></form></div></body></html>"""
 @app.post("/portal/auth")
-def farmer_authentication(phone: str = Form(...)):
-    db = db_engine.load_db()
-    clean_phone = db_engine.clean_phone_number(phone)
-    if clean_phone in db["farmers"]:
-        farmer_record = db["farmers"][clean_phone]
-        if not isinstance(farmer_record, dict):
-            farmer_record = {"name": "Registered Node"}
-        farmer_record["name"] = farmer_record.get("name", "Registered Node")
-        farmer_record["status"] = farmer_record.get("status", "Approved")
-        farmer_record["country"] = farmer_record.get("country", "Nigeria")
-        farmer_record["state"] = farmer_record.get("state", "Osun")
-        farmer_record["city"] = farmer_record.get("city", "Osogbo")
-        farmer_record["lga"] = farmer_record.get("lga", "Osogbo")
-        farmer_record["area"] = farmer_record.get("area", "General Farm Hub")
-        db["farmers"][clean_phone] = farmer_record
-        db_engine.save_db(db)
-        if farmer_record.get("status") == "Pending":
-            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting clearance.", status_code=303)
+async def farmer_authentication(phone: str = Form(...)):
+    target = clean_phone(phone)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM farmers WHERE phone = ?", (target,)) as cursor:
+            farmer = await cursor.fetchone()
+    if farmer:
+        if farmer["status"] == "Pending":
+            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting verification clearance.", status_code=303)
         res = RedirectResponse(url="/portal/feed", status_code=303)
-        res.set_cookie(key="farmer_session", value=clean_phone, max_age=2592000, httponly=True)
+        signed_token = sign_cookie_value(target)
+        res.set_cookie(key="farmer_session", value=signed_token, max_age=31536000, httponly=True, secure=False)
         return res
     return RedirectResponse(url="/portal/login?error=Phone number not recognized on network scale.", status_code=303)
-@app.get("/portal/feed", response_class=HTMLResponse)
-def farmer_feed_portal(current_user=Depends(get_current_farmer)):
-    if not current_user:
-        return RedirectResponse(url="/portal/login?error=Session expired or profile mismatched.", status_code=303)
-    f_phone, f_name, d = current_user["phone"], current_user["data"]["name"], current_user["data"]
-    country, state, city, lga, area = d.get("country", "Nigeria"), d.get("state", "Osun"), d.get("city", "Osogbo"), d.get("lga", "Osogbo"), d.get("area", "General Farm Hub")
-    db = db_engine.load_db()
-    total_neighbors = sum(1 for p, info in db["farmers"].items() if isinstance(info, dict) and info.get("lga") == lga and info.get("status") == "Approved")
-    weather = get_realtime_weather(lga)
-    nb_html = "".join([f'<div style="background:rgba(59,130,246,0.03); padding:14px; margin-bottom:8px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; gap:10px;"><div><strong style="color:white; display:block; font-size:14px;">{info.get("name", "Node")}</strong><span style="font-size:12px; color:#64748b;">{mask_phone_number(p)} • Sector: {info.get("area","General")}</span></div><form action="/portal/approve-node" method="post" style="margin:0;"><input type="hidden" name="target_phone" value="{p}"><button type="submit" class="btn btn-blue" style="padding:8px 14px; font-size:12px; border-radius:6px;">Verify</button></form></div>' for p, info in db["farmers"].items() if isinstance(info, dict) and info.get("lga") == lga and info.get("status", "Pending") == "Pending" and p != f_phone])
-    return render_farmer_complete_html(f_name, country, state, city, lga, area, total_neighbors, weather, nb_html)
-def render_farmer_complete_html(f_name, country, state, city, lga, area, total_neighbors, weather, nb_html):
-    return f"""
-    <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS} body {{ display:block; padding:15px; }} .container {{ max-width:950px; margin:0 auto; width:100%; }} @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }} .spinner {{ display: none; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: white; animation: spin 0.8s linear infinite; margin-right: 10px; }} .fun-widget {{ display:flex; gap:15px; margin-bottom:20px; flex-wrap:wrap; }} .widget-card {{ flex:1; min-width:140px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); padding:15px; border-radius:14px; text-align:center; }} .trivia-box {{ display:none; background:rgba(15,23,42,0.9); border:1px solid rgba(255,255,255,0.1); padding:20px; border-radius:16px; margin-bottom:25px; }} .social-link {{ display:inline-flex; align-items:center; gap:6px; color:#38bdf8; text-decoration:none; background:rgba(255,255,255,0.02); padding:8px 16px; border-radius:8px; border:1px solid rgba(255,255,255,0.05); font-size:13px; font-weight:700; transition:0.2s; }} .social-link:hover {{ background:rgba(255,255,255,0.08); transform:translateY(-1px); }}</style></head>
-    <body>
-    <div id="main_terminal_container" class="container glass-panel" style="padding:25px 20px;">
-        <div style="display:flex; justify-content:space-between; align-items:flex-start; border-bottom:1px solid rgba(255,255,255,0.05); padding-bottom:20px; margin-bottom:25px; flex-wrap:wrap; gap:15px;">
-            <div><h2 style="margin:0; font-size:20px;">👨‍🌾 Node Terminal: {f_name}</h2><span style="background:rgba(16,185,129,0.1); color:#10b981; padding:4px 8px; border-radius:6px; font-size:12px; font-weight:700; display:inline-block; margin-top:5px;">📍 Index: {country} / {state} / {lga} / {area}</span></div>
-            <button onclick="handleManualLogout()" class="btn" style="background:rgba(239,68,68,0.1); color:#f87171; padding:8px 16px; font-size:13px;">Disconnect</button>
-        </div>
-<div style="background:rgba(59,130,246,0.05); border:1px solid rgba(59,130,246,0.2); padding:15px; border-radius:12px; margin-bottom:20px; font-size:13px; line-height:1.5;">📱 <strong>WhatsApp Sandbox Activation Required:</strong> Text <code>join choice-something</code> to <strong>+1 415 523 8886</strong> from your mobile device.</div>
-<div class="fun-widget">
-    <div class="widget-card">🌤️<br><strong style="font-size:13px;color:#38bdf8;">Live Weather API</strong><br><span style="font-size:14px;font-weight:bold;color:#10b981;">{weather['temp']} - {weather['desc']}</span></div>
-    <div class="widget-card">🛡️<br><strong style="font-size:13px;color:#10b981;">Grid Sync</strong><br><span style="font-size:14px;font-weight:bold;">{total_neighbors} Peers Active</span></div>
-    <div class="widget-card">🎮<br><strong style="font-size:13px;color:#a855f7;">Breakout Terminal</strong><br><span style="font-size:12px;cursor:pointer;text-decoration:underline;color:#a855f7;font-weight:bold;" onclick="toggleTriviaGame()">Launch Training Quiz</span></div>
-</div>
-<div id="trivia_module" class="trivia-box">
-    <div style="display:flex; justify-content:space-between; align-items:center;"><h4 style="margin:0; color:#38bdf8;">🌾 Operational Security Training Quiz</h4><span id="quiz_progress" style="font-size:12px; color:#64748b; font-weight:bold;">Question 1/3</span></div>
-    <p id="trivia_question" style="margin:15px 0; font-weight:600; min-height:40px;"></p>
-    <div id="trivia_options" style="display:grid; gap:8px; margin-bottom:15px;"></div>
-    <p id="trivia_feedback" style="font-weight:bold; font-size:14px; min-height:20px; margin:10px 0;"></p>
-    <div style="display:flex; justify-content:space-between; margin-top:10px;">
-        <button id="quiz_back_btn" class="btn" style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); padding:6px 14px; font-size:12px;" onclick="navigateQuiz(-1)">⬅️ Back</button>
-        <button id="quiz_next_btn" class="btn btn-blue" style="padding:6px 14px; font-size:12px;" onclick="navigateQuiz(1)">Next ➡️</button>
-    </div>
-</div>
-    <div class="responsive-grid">
-        <div style="background:rgba(239,68,68,0.02); border:1px solid rgba(239,68,68,0.1); padding:20px; border-radius:16px; height:fit-content;">
-            <h3>🚨 Broadcast Emergency</h3>
-            <form id="broadcast_form" method="post" onsubmit="handleBroadcastSubmit(event)" style="display:flex; flex-direction:column; gap:12px; margin:0;">
-                <select id="alert_type" name="alert_type"><option value="Intruder Spotted">Intruder Spotted</option><option value="Critical Disaster">Critical Disaster</option><option value="Armed Attack">Armed Attack</option></select>
-                <input type="text" id="message" name="message" placeholder="Situation details..." required><button type="submit" id="dispatch_btn" class="btn btn-emerald" style="width:100%;"><div id="btn_spinner" class="spinner"></div><span id="btn_text">📡 Dispatch Alert Matrix</span></button>
-            </form>
-        </div>
-        <div>
-            <h3>🤝 Peer Authentication Desk</h3>
-            {nb_html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>Clear ring.</p>"}
-            <h3>📡 Live Feed (● Live Auto-Sync)</h3>
-            <div id="live_stream_container"></div>
-        </div>
-    </div>
-    <div style="margin-top:30px; padding-top:20px; border-top:1px solid rgba(255,255,255,0.05);">
-        <h4 style="margin:0 0 12px; color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:1px;">🛡️ Community Safety Connect Hub</h4>
-        <div style="display:flex; gap:10px; flex-wrap:wrap;">
-            <a href="https://wa.me" target="_blank" class="social-link">💬 WhatsApp Group</a>
-            <a href="https://telegram.org" target="_blank" class="social-link">✈️ Telegram Alert Channel</a>
-            <a href="https://facebook.com" target="_blank" class="social-link">👥 Facebook Union</a>
-        </div>
-    </div>
-</div>
-<script>
-    const quizData = [
-        {{ q: "What should a farmer do first if an unknown intruder is spotted near boundaries?", options: ["📡 Instantly broadcast an alarm inside the Farm Watch portal", "🏃 Investigate the location alone without signaling neighbors"], correct: 0 }},
-        {{ q: "Which type of alert triggers a Master Override broadcast to all sectors across the country database?", options: ["🌾 Asset Damage (Cattle/Crops)", "🔥 Critical Disaster (Fire/Flood) or Armed Attack"], correct: 1 }},
-        {{ q: "What is the primary criteria required for a new registered node to activate their portal feed?", options: ["⏳ Complete approval clearance from an approved admin or neighbor node", "🔑 Entering the master chief panel credentials"], correct: 0 }}
-    ];
-    let currentQuizIndex = 0;
-    function toggleTriviaGame() {{ const box = document.getElementById("trivia_module"); box.style.display = box.style.display === "block" ? "none" : "block"; if(box.style.display === "block") renderQuizQuestion(); }}
-    function renderQuizQuestion() {{
-        const item = quizData[currentQuizIndex]; document.getElementById("quiz_progress").innerText = "Question " + (currentQuizIndex + 1) + "/" + quizData.length; document.getElementById("trivia_question").innerText = item.q; document.getElementById("trivia_feedback").innerText = "";
-        const optsContainer = document.getElementById("trivia_options"); optsContainer.innerHTML = "";
-        item.options.forEach((opt, idx) => {{ optsContainer.innerHTML += `<button class="btn" style="background:#1f2937; text-align:left; justify-content:flex-start; width:100%; font-size:13px;" onclick="evaluateQuizAnswer(${{idx}})">${{opt}}</button>`; }});
-        document.getElementById("quiz_back_btn").style.visibility = currentQuizIndex === 0 ? "hidden" : "visible";
-        document.getElementById("quiz_next_btn").innerText = currentQuizIndex === quizData.length - 1 ? "Finish 🎉" : "Next ➡️";
-    }}
-    function evaluateQuizAnswer(selectedIdx) {{
-        const item = quizData[currentQuizIndex]; const fb = document.getElementById("trivia_feedback");
-        if(selectedIdx === item.correct) {{ fb.style.color = "#10b981"; fb.innerText = "🟢 Correct answer! Excellent security protocol tracking."; }} 
-        else {{ fb.style.color = "#ef4444"; fb.innerText = "❌ Incorrect option. Review network protocols for maximum grid protection."; }}
-    }}
-    function navigateQuiz(dir) {{ currentQuizIndex += dir; if(currentQuizIndex >= quizData.length) {{ currentQuizIndex = 0; toggleTriviaGame(); return; }} if(currentQuizIndex < 0) currentQuizIndex = 0; renderQuizQuestion(); }}
-    function handleManualLogout() {{ window.location.href = "/portal/logout"; }}
-    function handleBroadcastSubmit(e) {{
-        e.preventDefault(); const b=document.getElementById("dispatch_btn"); const s=document.getElementById("btn_spinner"); const t=document.getElementById("btn_text");
-        b.style.opacity="0.7"; b.style.pointerEvents="none"; s.style.display="inline-block"; t.innerText="Transmitting Alert Grid...";
-        const f=new FormData(); f.append("alert_type", document.getElementById("alert_type").value); f.append("message", document.getElementById("message").value);
-        fetch("/portal/alert/raise", {{ method: "POST", body: f }});
-        setTimeout(() => {{ document.getElementById("main_terminal_container").innerHTML = `<div style="padding:40px 25px; text-align:center; max-width:450px; margin:40px auto; width:100%;" class="glass-panel"><div style="font-size:48px; margin-bottom:15px;">✅</div><h2 style="color:#10b981; margin:0 0 10px;">Broadcast Dispatched</h2><p style="color:#94a3b8; font-size:14px;">Your incident report has been securely transmitted across the Grid.</p><a href="/portal/feed" class="btn btn-blue" style="margin-top:20px; width:100%;">Return to Guard Station</a></div>`; }}, 3000);
-    }}
-    async function fetchLiveFeedStream() {{ try {{ const res = await fetch("/portal/feed/stream"); if (res.status === 200) {{ document.getElementById("live_stream_container").innerHTML = await res.text(); }} }} catch(e) {{}} }}
-    setInterval(fetchLiveFeedStream, 2000); fetchLiveFeedStream();
-</script></body></html>
+
+@app.post("/submit-registration")
+async def handle_registration(name: str = Form(...), phone: str = Form(...), city_manual: str = Form(...)):
+    clean_p = clean_phone(phone)
+    lookup = city_manual.strip().lower()
+    geo = CITY_AUTOFILL_MAP.get(lookup, {"country": "Nigeria", "state": "Region", "lga": city_manual, "area": "General Hub"})
+    unique_token = hashlib.sha256(os.urandom(24)).hexdigest()[:16]
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("""
+            INSERT OR REPLACE INTO farmers (phone, name, country, state, city, lga, area, token, status, xp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 100)
+        """, (clean_p, sanitize(name), geo["country"], geo["state"], sanitize(city_manual), geo["lga"], geo["area"], unique_token))
+        await conn.commit()
+    return HTMLResponse(content=f"""
+    <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head>
+    <body><div class="glass-panel" style="max-width: 550px; margin: 60px auto; text-align: center;">
+        <div style="font-size: 56px; margin-bottom: 20px;">⏳</div><span class="badge badge-amber pulse" style="margin-bottom: 16px;">Node Profile Cryptographed</span>
+        <h2 style="margin: 0 0 12px 0; font-size: 28px; font-weight: 800;">Awaiting Infrastructure Clearance</h2>
+        <p style="color: var(--text-muted); line-height: 1.6; font-size: 15px; margin-bottom: 30px;">
+            Thank you, <b>{sanitize(name)}</b>. Your tactical node has been securely mapped under the <span style="color: #fff; font-weight: 600;">{geo['lga']} Grid Sector</span>.
+        </p>
+        <a href="/" class="btn" style="background: rgba(255,255,255,0.05); color: #cbd5e1; border: 1px solid var(--border-glass); width: 100%; box-sizing: border-box;">Return to Main Terminal Gateway</a>
+    </div></body></html>""")
+
+UPGRADED_CSS = """
+    :root {
+        --bg-slate: #020617; --panel-glass: rgba(15, 23, 42, 0.75); --border-glass: rgba(255, 255, 255, 0.08);
+        --accent-emerald: #10b981; --accent-blue: #3b82f6; --accent-amber: #f59e0b;
+        --text-main: #f8fafc; --text-muted: #94a3b8;
+    }
+    body { font-family: sans-serif; background: radial-gradient(circle at 50% 0%, #1e1b4b 0%, #020617 70%); color: var(--text-main); margin: 0; padding: 40px 20px; min-height: 100vh; box-sizing: border-box; }
+    .container { max-width: 1100px; margin: 0 auto; width: 100%; }
+    .glass-panel { background: var(--panel-glass); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid var(--border-glass); border-radius: 24px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5); padding: 40px; box-sizing: border-box; }
+    .badge { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 9999px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+    .badge-amber { background: rgba(245, 158, 11, 0.1); color: var(--accent-amber); border: 1px solid rgba(245, 158, 11, 0.2); }
+    .badge-emerald { background: rgba(16, 185, 129, 0.1); color: var(--accent-emerald); border: 1px solid rgba(16, 185, 129, 0.2); }
+    .badge-blue { background: rgba(59, 130, 246, 0.1); color: var(--accent-blue); border: 1px solid rgba(59, 130, 246, 0.2); }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 12px 24px; border-radius: 12px; font-weight: 700; text-decoration: none; cursor: pointer; border: none; transition: all 0.2s ease; font-size: 14px; }
+    .btn-emerald { background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; box-shadow: 0 4px 14px rgba(16,185,129,0.3); }
+    .btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; margin: 30px 0; }
+    .stat-card { background: rgba(255,255,255,0.02); border: 1px solid var(--border-glass); border-radius: 16px; padding: 24px; }
+    .data-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+    .data-table th { padding: 14px; color: var(--text-muted); font-size: 12px; text-transform: uppercase; border-bottom: 1px solid var(--border-glass); text-align: left; }
+    .data-table td { padding: 16px 14px; font-size: 14px; border-bottom: 1px solid rgba(255,255,255,0.02); text-align: left; }
+    input[type="text"], select { width: 100%; padding: 14px; background: #090d16; border: 1px solid var(--border-glass); color: white; border-radius: 12px; box-sizing: border-box; }
 """
-@app.get("/portal/feed/stream")
-def portal_async_feed_stream(current_user=Depends(get_current_farmer)):
-    if not current_user: return Response(status_code=401)
-    lga = current_user["data"].get("lga", "Unknown")
-    db = db_engine.load_db()
-    html = "".join([f'<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:16px; margin-bottom:12px; border-radius:12px;"><div style="display:flex; justify-content:space-between; font-size:11px; color:#64748b; margin-bottom:4px;"><span>⏱️ {i["timestamp"]}</span><span style="color:#ef4444; font-weight:800;">{i["status"]}</span></div><strong style="color:#f97316; font-size:13px;">[{i.get("type")}]</strong><span style="display:block; margin:6px 0; color:#e2e8f0; line-height:1.4;">"{i["message"]}"</span><span style="font-size:11px; color:#475569;">Origin: {i["sender"]}</span></div>' for i in reversed(db["alerts_log"]) if i.get("lga") == lga])
-    return HTMLResponse(content=html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>Sectors quiet across local scope.</p>")
-
-@app.post("/portal/alert/raise")
-def farmer_raise_alert(alert_type: str = Form(...), message: str = Form(...), current_user=Depends(get_current_farmer)):
-    if not current_user: return Response(status_code=401)
-    f_phone, f_name, d = current_user["phone"], current_user["data"]["name"], current_user["data"]
-    db = db_engine.load_db()
-    db_engine.archive_incident(f_name, d.get("lga"), message, alert_type)
-    idx = len(db["alerts_log"]) - 1
-    if idx >= 0:
-        db = db_engine.load_db()
-        for field in ["country", "state", "city", "lga", "area"]: db["alerts_log"][idx][field] = d.get(field, "Unknown")
-        db_engine.save_db(db)
-    override = alert_type in ["Critical Disaster", "Armed Attack"]
-    targets = [p for p, data in db["farmers"].items() if isinstance(data, dict) and p != f_phone and data.get("status") == "Approved" and (override or data.get("lga") == d.get("lga"))]
-    threading.Thread(target=lambda: [send_production_alert(n, f"ALERT [{alert_type.upper()}] from {f_name}: {message}") for n in targets], daemon=True).start()
-    return Response(status_code=200)
-
-@app.get("/admin/export-ledger")
-def admin_export_ledger(username: str = Depends(authenticate_admin)):
-    db = db_engine.load_db()
-    csv_data = "Timestamp,Type,Sender,LGA District,Message,Status\n"
-    for i in db.get("alerts_log", []):
-        msg = i.get("message", "").replace('"', '""')
-        csv_data += f'"{i.get("timestamp")}","{i.get("type")}","{i.get("sender")}","{i.get("lga")}","{msg}","{i.get("status")}"\n'
-    return StreamingResponse(iter([csv_data]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=farm_watch_security_ledger.csv"})
-@app.post("/portal/approve-node")
-def handle_node_approval(target_phone: str = Form(...), current_user=Depends(get_current_farmer)):
-    if not current_user: return HTMLResponse(content="<html><script>window.location.href='/portal/login';</script></html>")
-    db_engine.approve_farmer_node(target_phone)
-    return HTMLResponse(content="<html><script>window.location.href='/portal/feed';</script></html>")
-
-@app.get("/portal/logout")
-def handle_member_logout():
-    response = HTMLResponse(content="<html><script>document.cookie='farmer_session=; max-age=0; path=/;'; window.location.href='/';</script></html>")
-    return response
-@app.get("/dashboard", response_class=HTMLResponse)
-def admin_dashboard(username: str = Depends(authenticate_admin)):
-    db = db_engine.load_db()
-    total, active, resolved = len(db["farmers"]), sum(1 for i in db["alerts_log"] if i.get("status") == "Active"), sum(1 for i in db["alerts_log"] if i.get("status") == "Resolved")
-    pending_html = ""
-    for phone, m in db["farmers"].items():
-        if isinstance(m, dict) and m.get("status", "Pending") == "Pending":
-            pending_html += f'<div style="display:flex; justify-content:space-between; align-items:center; padding:12px; background:rgba(234,179,8,0.03); border:1px solid rgba(234,179,8,0.15); margin-bottom:8px; border-radius:8px; flex-wrap:wrap; gap:10px;"><span>⏳ <strong>{m["name"]}</strong> ({phone})<br><small style="color:#64748b;">MAPPED: {m.get("country")} -> {m.get("lga")}</small></span><div style="display:flex; gap:6px;"><form action="/admin/approve-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:#10b981; border:none; color:white; padding:6px 12px; border-radius:6px; font-size:11px; cursor:pointer; font-weight:700;">Approve</button></form><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:rgba(239,68,68,0.1); border:none; color:#f87171; padding:6px 12px; border-radius:6px; font-size:11px; cursor:pointer;">Deny</button></form></div></div>'
-    grouped_html, by_geo = "", {}
-    for p, f in db["farmers"].items():
-        if isinstance(f, dict) and f.get("status") == "Approved":
-            g_key = f"{f.get('country','Unknown')} → {f.get('state','Unknown')} → {f.get('city','Unknown')} → {f.get('lga','Unknown')}"
-            if g_key not in by_geo: by_geo[g_key] = []
-            by_geo[g_key].append((p, f))
-    for path, members in by_geo.items():
-        m_list = "".join([f'<li style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:rgba(255,255,255,0.02); margin-bottom:6px; border-radius:8px; gap:10px;"><span style="font-size:14px;">🟢 <strong>{m["name"]}</strong> ({m.get("area")}) <small style="color:#64748b; display:block; margin-top:2px;">{phone}</small></span><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{phone}"><button type="submit" style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:13px;">❌ Remove</button></form></li>' for phone, m in members])
-        grouped_html += f'<div style="margin-bottom:20px; border-left:3px solid #3b82f6; padding-left:12px;"><h4 style="margin:0 0 10px; color:#38bdf8; font-size:13px; text-transform:uppercase; letter-spacing:0.5px;">🗺️ {path}</h4><ul style="padding:0; margin:0; list-style:none;">{m_list}</ul></div>'
-    al_html = "".join([f'<div style="background:rgba(239,68,68,0.03); border:1px solid rgba(239,68,68,0.1); padding:16px; margin-bottom:10px; border-radius:12px; display:flex; justify-content:space-between; align-items:center; gap:15px; flex-wrap:wrap;"><div style="font-size:14px; line-height:1.4;"><strong>🚨 {i["type"]} ({i.get("lga")}):</strong> "{i["message"]}"</div><form action="/resolve-alert" method="post" style="margin:0;"><input type="hidden" name="alert_id" value="{idx}"><button type="submit" class="btn" style="background:#10b981; color:white; padding:6px 14px; font-size:12px; border-radius:6px;">Clear</button></form></div>' for idx, i in enumerate(db["alerts_log"]) if i.get("status") == "Active"])
-    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS} body {{ display:block; padding:15px; }} .box {{ max-width:1000px; margin:0 auto; width:100%; }} .stats-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:16px; margin:25px 0; }} .card {{ padding:20px; text-align:center; }} .card h2 {{ margin:0 0 4px; font-size:32px; font-weight:800; }}</style></head><body><div class="box glass-panel" style="padding:30px 20px;"><div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px;"><h2>📡 Global Command Dashboard</h2><a href="/admin/export-ledger" class="btn btn-emerald" style="padding:8px 16px; font-size:13px;">📊 Export Ledger Spreadsheet</a></div><div class="stats-grid"><div class="card glass-panel" style="border-top:3px solid #10b981;"><h2>{total}</h2><small style="color:#64748b; font-weight:700; letter-spacing:0.5px;">REGISTRATIONS</small></div><div class="card glass-panel" style="border-top:3px solid #ef4444;"><h2>{active}</h2><small style="color:#64748b; font-weight:700; letter-spacing:0.5px;">ACTIVE THREATS</small></div><div class="card glass-panel" style="border-top:3px solid #3b82f6;"><h2>{resolved}</h2><small style="color:#64748b; font-weight:700; letter-spacing:0.5px;">CONTAINED</small></div></div><h3 style="color:#eab308; border-bottom:1px solid rgba(234,179,8,0.1); padding-bottom:8px; margin-top:30px;">⏳ Awaiting Executive Security Authorization</h3>{pending_html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>No new registrations pending clearance.</p>"}<h3>🚨 Active Alarms Ledger</h3>{al_html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>No open alarms.</p>"}<h3>🗂️ Authorized Active Infrastructure Ring Map</h3>{grouped_html or "<p style='color:#64748b; font-size:13px; font-style:italic;'>Map unmapped.</p>"}</div></body></html>"""
-@app.post("/incoming-alert")
-def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
-    db = db_engine.load_db()
-    sender_number = db_engine.clean_phone_number(From.replace("whatsapp:", ""))
-    if sender_number not in db["farmers"] or db["farmers"][sender_number].get("status", "Pending") == "Pending":
-        return Response(content="<Response></Response>", media_type="application/xml")
-    f_data = db["farmers"][sender_number]
-    lga = f_data.get("lga", "Unknown")
-    alert_type, override = "General Anomaly", False
-    msg_lower = Body.lower()
-    if "fire" in msg_lower or "flood" in msg_lower: alert_type, override = "Critical Disaster", True
-    elif "thief" in msg_lower or "intruder" in msg_lower: alert_type = "Intruder Spotted"
-    elif "attack" in msg_lower or "armed" in msg_lower: alert_type, override = "Armed Attack", True
-    db_engine.archive_incident(f_data["name"], lga, Body, alert_type)
-    idx = len(db["alerts_log"]) - 1
-    if idx >= 0:
-        db = db_engine.load_db()
-        for field in ["country", "state", "city", "lga", "area"]: db["alerts_log"][idx][field] = f_data.get(field, "Unknown")
-        db_engine.save_db(db)
-    targets = [p for p, d in db["farmers"].items() if isinstance(d, dict) and p != sender_number and d.get("status") == "Approved" and (override or d.get("lga") == lga)]
-    threading.Thread(target=lambda: [send_production_alert(num, f"ALERT [{alert_type.upper()}] from {f_data['name']}: {Body}") for num in targets], daemon=True).start()
-    return Response(content="<Response></Response>", media_type="application/xml")
 @app.post("/admin/approve-farmer")
-def admin_direct_approve_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
-    db_engine.approve_farmer_node(phone)
+async def admin_direct_approve_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
+    clean_p = clean_phone(phone)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("UPDATE farmers SET status = 'Approved' WHERE phone = ?", (clean_p,))
+        await conn.commit()
     return RedirectResponse(url="/dashboard", status_code=303)
 
 @app.post("/delete-farmer")
-def handle_delete_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
-    db_engine.remove_farmer(phone)
+async def handle_delete_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
+    clean_p = clean_phone(phone)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("DELETE FROM farmers WHERE phone = ?", (clean_p,))
+        await conn.commit()
     return RedirectResponse(url="/dashboard", status_code=303)
 
 @app.post("/resolve-alert")
-def resolve_alert(alert_id: int = Form(...)):
-    db_engine.update_incident_status(alert_id)
+async def resolve_alert(alert_id: int = Form(...), username: str = Depends(authenticate_admin)):
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("UPDATE alerts_log SET status = 'Resolved' WHERE id = ?", (alert_id,))
+        await conn.commit()
     return RedirectResponse(url="/dashboard", status_code=303)
+
+@app.get("/admin/threats/stream", response_class=HTMLResponse)
+async def admin_live_threat_feed_stream(username: str = Depends(authenticate_admin)):
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM alerts_log WHERE status = 'Active' ORDER BY id DESC") as cursor:
+            active_alerts = await cursor.fetchall()
+    threat_feed_html = ""
+    for a in active_alerts:
+        v_tag = f'<div style="margin-top:8px;"><a href="/media/{a["video_path"]}" target="_blank" style="color:var(--accent-blue); font-size:12px; font-weight:700;">📂 View Attached Clip Evidence</a></div>' if a['video_path'] else ''
+        threat_feed_html += f"""
+        <div style="background: rgba(239, 68, 68, 0.04); border: 1px solid rgba(239, 68, 68, 0.2); padding: 18px; border-radius: 14px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; gap: 15px;">
+            <div>
+                <span class="badge" style="background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.25); margin-bottom: 6px;">{a['type']}</span>
+                <div style="font-size: 15px; color: #f1f5f9; font-weight: 500; margin: 4px 0;">"{a['message']}"</div>
+                {v_tag}
+                <small style="color: var(--text-muted); font-size: 12px;">Sector Target Focus: <b>{a['lga']} Sector</b> &bull; Transmitted by {a['sender']}</small>
+            </div>
+            <form action="/resolve-alert" method="post" style="margin:0;"><input type="hidden" name="alert_id" value="{a['id']}"><button type="submit" class="btn btn-emerald" style="padding: 8px 16px; font-size: 12px; border-radius: 8px;">Clear Alarm</button></form>
+        </div>"""
+    return threat_feed_html or '<p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">All sector grids reporting quiet baseline operations.</p>'
+
+@app.post("/admin/simulate-grid")
+async def admin_simulate_grid_data(username: str = Depends(authenticate_admin)):
+    mock_farmers = [
+        ("2348031112221", "Bello Kano", "Kano Municipal", "Kano City Center", 245),
+        ("2348031112225", "Adewale Osogbo", "Osogbo", "Ataoja Sector", 410),
+        ("2348031112226", "Arowolo Ife", "Ile-Ife", "Ife Central Town", 295)
+    ]
+    async with aiosqlite.connect(DB_FILE) as conn:
+        for phone, name, lga, area, xp in mock_farmers:
+            await conn.execute("""
+                INSERT OR REPLACE INTO farmers (phone, name, country, state, city, lga, area, token, status, xp)
+                VALUES (?, ?, 'Nigeria', 'Region', 'City', ?, ?, 'mock_token', 'Approved', ?)
+            """, (phone, name, lga, area, xp))
+        await conn.commit()
+    return RedirectResponse(url="/dashboard", status_code=303)
+
+@app.post("/admin/flush-grid")
+async def admin_flush_grid_data(username: str = Depends(authenticate_admin)):
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("DELETE FROM farmers;")
+        await conn.execute("DELETE FROM alerts_log;")
+        await conn.execute("DELETE FROM alert_comments;")
+        await conn.commit()
+    return RedirectResponse(url="/dashboard", status_code=303)
+@app.get("/dashboard", response_class=HTMLResponse)
+async def admin_dashboard(username: str = Depends(authenticate_admin)):
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM farmers ORDER BY xp DESC") as c1:
+            all_farmers = await c1.fetchall()
+        async with conn.execute("SELECT * FROM alerts_log WHERE status = 'Active'") as c2:
+            active_alerts = await c2.fetchall()
+    total_nodes = len(all_farmers)
+    pending_clearance = sum(1 for f in all_farmers if f['status'] == 'Pending')
+    active_threats = len(active_alerts)
+    pulse_class = "pulse" if pending_clearance > 0 else ""
+    map_nodes_js = ",".join([f"{{name:'{f['name']}', lga:'{f['lga']}', status:'{f['status']}'}}" for f in all_farmers if f['status'] == 'Approved'])
+    map_threats_js = ",".join([f"{{type:'{a['type']}', lga:'{a['lga']}'}}" for a in active_alerts])
+    pending_html = ""
+    for f in all_farmers:
+        if f['status'] == 'Pending':
+            pending_html += f"""
+            <tr>
+                <td style="font-weight: 600; color: #fff;">{f['name']}</td>
+                <td style="font-family: monospace; color: var(--text-muted);">{f['phone']}</td>
+                <td><span class="badge badge-blue">{f['lga']}</span></td>
+                <td><div style="display: flex; gap: 8px;">
+                    <form action="/admin/approve-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{f['phone']}"><button type="submit" class="btn btn-emerald" style="padding: 6px 14px; font-size: 12px; border-radius: 8px;">Grant Clearance</button></form>
+                    <form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{f['phone']}"><button type="submit" class="btn btn-danger" style="padding: 6px 14px; font-size: 12px; border-radius: 8px;">Deny</button></form>
+                </div></td>
+            </tr>"""
+    active_nodes_html = ""
+    leaderboard_html = ""
+    rank = 1
+    for f in all_farmers:
+        if f['status'] == 'Approved':
+            if rank <= 5:
+                leaderboard_html += f"<tr><td>🏅 <b>#{rank}</b></td><td>{f['name']}</td><td><span class='badge badge-blue'>{f['lga']}</span></td><td style='color:var(--accent-amber); font-weight:bold;'>{f['xp']} XP</td></tr>"
+                rank += 1
+            active_nodes_html += f"""
+            <tr>
+                <td style="font-weight: 600; color: #fff;">{f['name']}</td>
+                <td style="font-family: monospace; color: var(--text-muted);">{mask_phone_number(f['phone'])}</td>
+                <td>{f['state']} &rarr; {f['lga']}</td>
+                <td><span class="badge badge-emerald">Operational</span></td>
+                <td><form action="/delete-farmer" method="post" style="margin:0;"><input type="hidden" name="phone" value="{f['phone']}"><button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 12px; border-radius: 8px;">Remove Node</button></form></td>
+            </tr>"""
+    pending_table = f'<div style="overflow-x: auto;"><table class="data-table"><thead><tr><th>Node Name</th><th>Phone</th><th>Sector</th><th>Actions</th></tr></thead><tbody>{pending_html}</tbody></table></div>' if pending_clearance > 0 else '<p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">No new registrations awaiting clearance.</p>'
+    active_table = f'<div style="overflow-x: auto;"><table class="data-table"><thead><tr><th>Node Name</th><th>Phone Address</th><th>Geographic Network Path</th><th>Status</th><th>Management</th></tr></thead><tbody>{active_nodes_html}</tbody></table></div>' if active_nodes_html else '<p style="color: var(--text-muted); font-style: italic; text-align: center;">No active nodes operating on current security grid.</p>'
+    return f"""
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS} .map-container {{ background: #040814; border: 1px solid var(--border-glass); border-radius: 20px; padding: 20px; margin-bottom: 30px; position: relative; overflow: hidden; }} .grid-bg {{ stroke: rgba(59, 130, 246, 0.05); stroke-width: 1; fill: none; }} .map-dot {{ transition: all 0.5s ease; cursor: pointer; }} .map-pulse {{ animation: map-pulse-ring 1.5s infinite ease-out; transform-origin: center; }} @keyframes map-pulse-ring {{ 0% {{ r: 6; opacity: 1; }} 100% {{ r: 25; opacity: 0; }} }}</style></head>
+    <body>
+        <div class="container">
+            <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-glass); padding-bottom: 24px; flex-wrap: wrap; gap: 15px;">
+                <div><h1>📡 Global Command Control</h1><p style="margin: 4px 0 0 0; color: var(--text-muted); font-size: 14px;">Farm Watch Security Operations Matrix</p></div>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                    <form action="/admin/simulate-grid" method="post" style="margin:0;"><button type="submit" class="btn btn-emerald">⚙️ Inject Mock Data</button></form>
+                    <form action="/admin/flush-grid" method="post" style="margin:0;"><button type="submit" class="btn btn-danger">🗑️ Flush Grid Records</button></form>
+                </div>
+            </div>
+            <div class="stats-grid">
+                <div class="stat-card" style="border-left: 4px solid var(--accent-blue);"><div>DEPLOYED STRUCTURE NODES</div><h3 id="stat_total">{total_nodes}</h3></div>
+                <div class="stat-card" style="border-left: 4px solid var(--accent-amber);"><div>GATE AUTHORIZATIONS PENDING</div><h3 id="stat_pending" class="{pulse_class}">{pending_clearance}</h3></div>
+                <div class="stat-card" style="border-left: 4px solid #ef4444;"><div>ACTIVE EMERGENCY THREATS</div><h3 id="stat_threats">{active_threats}</h3></div>
+            </div>
+            <div class="map-container">
+                <h3>🗺️ Tactical Sector Infrastructure Map</h3>
+                <svg id="vector_map" width="100%" height="320" style="background:#030712; border-radius:12px; border:1px solid rgba(255,255,255,0.02)"><defs><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M 40 0 L 0 0 0 40" class="grid-bg"/></pattern></defs><rect width="100%" height="100%" fill="url(#grid)" /><g id="map_hardware_layer"></g></svg>
+            </div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🏆 Node Reliability Leaderboard</h3><table class="data-table"><thead><tr><th>Rank</th><th>Farmer Deployed Node Name</th><th>Grid Sector Focus</th><th>Network Rating</th></tr></thead><tbody>{leaderboard_html or "<tr><td colspan='4' style='color:var(--text-muted); font-style:italic;'>No XP metrics available.</td></tr>"}</tbody></table></div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3><span style="color: #ef4444;" class="pulse">&bull;</span> Real-Time Emergency Vector Feed</h3><div id="live_threat_feed_target"><p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">Connecting link matrix...</p></div></div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⏳ Executive Node Approvals Pending</h3>{pending_table}</div>
+            <div class="glass-panel" style="padding: 30px;"><h3>🗂️ Active Grid Infrastructure Map</h3>{active_table}</div>
+        </div>
+        <script>
+            const container = document.getElementById('live_threat_feed_target');
+            const geographicSectorCoordinates = {{"OSOGBO": {{x: 150, y: 220}}, "ILE-IFE": {{x: 280, y: 240}}, "IBADAN": {{x: 110, y: 140}}, "OGBOMOSO": {{x: 180, y: 80}}, "KANO MUNICIPAL": {{x: 620, y: 70}}, "FAGGE": {{x: 740, y: 90}}, "IKEJA": {{x: 450, y: 260}}, "LEKKI": {{x: 520, y: 280}}}};
+            function renderTacticalVectorMap() {{ const layer = document.getElementById('map_hardware_layer'); if(!layer) return; layer.innerHTML = ""; const deploymentNodes = [{map_nodes_js}], operationalThreats = [{map_threats_js}]; operationalThreats.forEach(t => {{ const p = geographicSectorCoordinates[t.lga.toUpperCase()] || {{x: 350, y: 160}}; layer.innerHTML += `<circle cx="${{p.x}}" cy="${{p.y}}" r="8" fill="rgba(239, 68, 68, 0.4)" class="map-pulse"/><circle cx="${{p.x}}" cy="${{p.y}}" r="5" fill="#ef4444" class="map-dot"/>`; }}); deploymentNodes.forEach(n => {{ const k = n.lga.toUpperCase(), p = geographicSectorCoordinates[k] || {{x: 350, y: 160}}; if (!operationalThreats.some(t => t.lga.toUpperCase() === k)) {{ layer.innerHTML += `<circle cx="${{p.x}}" cy="${{p.y}}" r="6" fill="#10b981" class="map-dot"/><text x="${{p.x + 10}}" y="${{p.y + 4}}" fill="#94a3b8" font-size="10" font-family="monospace">${{n.lga}}</text>`; }} }}); }}
+            async function pullLiveThreatStream() {{ try {{ const e = await fetch('/admin/threats/stream'); if (200 === e.status && container) {{ const t = await e.text(); if (container.innerHTML !== t) {{ container.innerHTML = t; renderTacticalVectorMap(); }} }} }} catch (err) {{ console.error(err); }} }}
+            setInterval(pullLiveThreatStream, 2000); window.onload = () => {{ pullLiveThreatStream(); renderTacticalVectorMap(); }};
+        </script>
+    </body></html>"""
 @app.get("/register", response_class=HTMLResponse)
 def registration_form():
-    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS} body{{display:flex; justify-content:center; align-items:center; min-height:100vh; padding:15px;}} .reg {{ max-width:440px; width:100%; }} label{{display:block; margin:12px 0 4px; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.5px;}}</style></head><body><div class="glass-panel reg" style="padding:35px 25px;"><h2>Register Security Node</h2><p style="color:#64748b; font-size:13px; margin-top:-10px; margin-bottom:25px; line-height:1.4;">Provide drop data OR skip fields and just type your city below.</p><form action="/submit-registration" method="post" style="margin:0;"><label>Farmer Name</label><input type="text" name="name" placeholder="Kwame" required><label>Phone Number</label><input type="text" name="phone" placeholder="e.g. +234..." required><label>City / Town (Autofill Input)</label><input type="text" name="city_manual" required><div style="border:1px solid rgba(255,255,255,0.05); padding:15px 12px; border-radius:12px; margin-bottom:20px; background: rgba(0,0,0,0.1);"><label style="margin:0 0 8px; color:#94a3b8;">Optional Dropdowns</label><select id="c_select" name="country" onchange="updateStates()"><option value="">-- Country --</option><option value="Nigeria">Nigeria</option></select><select id="s_select" name="state" onchange="updateCities()"><option value="">-- State --</option></select><select id="city_select" name="city" onchange="updateLGAs()"><option value="">-- City --</option></select><select id="lga_select" name="lga" onchange="updateAreas()"><option value="">-- LGA --</option></select><select id="area_select" name="area"><option value="">-- Area --</option></select></div><button type="submit" class="btn btn-emerald" style="width:100%;">Complete Request</button></form><br><center><a href="/register/test" style="color:#38bdf8; font-size:12px; text-decoration:underline;">💻 Launch Autofill Diagnostic Simulator</a></center></div>
-    <script>
-        const geoDb = {str(GLOBAL_GEO_DB)};
-        function updateStates() {{ const c = document.getElementById("c_select").value; const s = document.getElementById("s_select"); s.innerHTML = '<option value="">-- State --</option>'; document.getElementById("city_select").innerHTML = '<option value="">-- City --</option>'; document.getElementById("lga_select").innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>'; if(c && geoDb[c]) {{ Object.keys(geoDb[c]).forEach(k => {{ s.options.add(new Option(k, k)); }}); }} }}
-        function updateCities() {{ const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select"); city.innerHTML = '<option value="">-- City --</option>'; document.getElementById("lga_select").innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>'; if(c && s && geoDb[c][s]) {{ Object.keys(geoDb[c][s]).forEach(k => {{ city.options.add(new Option(k, k)); }}); }} }}
-        function updateLGAs() {{ const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select"); lga.innerHTML = '<option value="">-- LGA --</option>'; document.getElementById("area_select").innerHTML = '<option value="">-- Area --</option>'; if(c && s && city && geoDb[c][s][city]) {{ Object.keys(geoDb[c][s][city]).forEach(k => {{ lga.options.add(new Option(k, k)); }}); }} }}
-        function updateAreas() {{ const c = document.getElementById("c_select").value; const s = document.getElementById("s_select").value; const city = document.getElementById("city_select").value; const lga = document.getElementById("lga_select").value; const area = document.getElementById("area_select"); area.innerHTML = '<option value="">-- Area --</option>'; if(c && s && city && lga && geoDb[c][s][city][lga]) {{ geoDb[c][s][city][lga].forEach(v => {{ area.options.add(new Option(v, v)); }}); }} }}
-    </script></body></html>"""
-@app.get("/register/test", response_class=HTMLResponse)
-def database_autofill_diagnostic_test():
-    test_scenarios = ["Osogbo", "Ibadan", "Ogbomoso", "Ile-Ife"]
-    logs_html = "".join([f'<div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:12px; margin-bottom:6px; border-radius:8px;">🔍 Testing Keyword: <strong>"{tok}"</strong> → Result Country: <strong>{CITY_AUTOFILL_MAP[tok.lower()]["country"]}</strong> | Resolved District: <strong>{CITY_AUTOFILL_MAP[tok.lower()]["lga"]}</strong> <span style="color:#10b981; float:right;">✔ PASS</span></div>' for tok in test_scenarios])
-    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="glass-panel" style="max-width:550px; padding:30px 20px;"><h3>💻 Mapped Autofill Diagnostic Test Matrix</h3><p style="color:#64748b; font-size:13px; margin-top:-10px;">Simulating instant query extraction parameters across open background threads:</p>{logs_html}<br><a href="/register" class="btn btn-blue" style="width:100%;">Return to Live Form</a></div></body></html>"""
-@app.post("/submit-registration")
-def handle_registration(name: str = Form(...), phone: str = Form(...), city_manual: str = Form(...), country: str = Form(None), state: str = Form(None), city: str = Form(None), lga: str = Form(None), area: str = Form(None)):
-    lookup_token = city_manual.strip().lower()
-    if lookup_token in CITY_AUTOFILL_MAP:
-        geo = CITY_AUTOFILL_MAP[lookup_token]
-        c, s, ci, lg, ar = geo["country"], geo["state"], city_manual, geo["lga"], geo["area"]
-    else:
-        c, s, ci, lg, ar = country or "Nigeria", state or "Unknown Region", city_manual, lga or f"{city_manual} Sector", area or "General Farm Hub"
-    db = db_engine.load_db()
-    clean_phone = db_engine.clean_phone_number(phone)
-    db["farmers"][clean_phone] = {"name": name, "country": c, "state": s, "city": ci, "lga": lg, "area": ar, "zone": lg, "status": "Pending"}
-    db_engine.save_db(db)
-    if lookup_token not in CITY_AUTOFILL_MAP:
-        send_admin_webhook({"text": f"🚧 *UNMAPPED CITY ALERT*: *{name}* ({phone}) signed up using: *{city_manual}*."})
-    return HTMLResponse(content=f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{CORE_CSS}</style></head><body><div class="glass-panel" style="padding:40px 25px; text-align:center; max-width:440px; width:100%;"><h2 style="color:#eab308; margin-top:0;">⏳ Profile Mapped</h2><p style="color:#94a3b8; font-size:14px;">Thank you, {name}. System mapped you under <strong>{lg} Sector</strong> based on your city input. Awaiting administrator gate clearance.</p><a href="/" class="btn btn-emerald" style="margin-top:20px; width:100%;">Back Home</a></div></body></html>""")
+    return f"<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>{UPGRADED_CSS}</style></head><body><div class='glass-panel' style='max-width: 480px; margin: 40px auto;'><h2>Register Security Node</h2><form action='/submit-registration' method='post'><label>Farmer Full Name</label><input type='text' name='name' required><label>Mobile Phone Number</label><input type='text' name='phone' placeholder='e.g. 23480...' required><label>Target Town / City</label><input type='text' name='city_manual' placeholder='e.g. Osogbo' required><br><br><button type='submit' class='btn btn-emerald' style='width:100%;'>Complete Grid Entry</button></form></div></body></html>"
+
+@app.get("/admin/export-ledger")
+async def admin_export_ledger(username: str = Depends(authenticate_admin)):
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM alerts_log") as cursor:
+            logs = await cursor.fetchall()
+    csv_data = "Timestamp,Type,Sender,District,Message,Status\n"
+    for log in logs: csv_data += f"\"{log['timestamp']}\",\"{log['type']}\",\"{log['sender']}\",\"{log['lga']}\",\"{log['message']}\",\"{log['status']}\"\n"
+    return StreamingResponse(iter([csv_data]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=ledger.csv"})
+
+@app.get("/portal/login", response_class=HTMLResponse)
+def farmer_login_page(error: str = None):
+    err_msg = f"<p style='color:#ef4444;'>{error}</p>" if error else ""
+    return f"<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>{UPGRADED_CSS}</style></head><body><div class='glass-panel' style='max-width:400px; margin:80px auto;'><h2>Member Authentication</h2>{err_msg}<form action='/portal/auth' method='post'><label>Registered Phone Number</label><input type='text' name='phone' required><br><br><button type='submit' class='btn btn-blue' style='width:100%;'>Frictionless Sign In</button></form></div></body></html>"
+
+@app.get("/portal/logout")
+def handle_member_logout():
+    response = RedirectResponse(url="/", status_code=303)
+    response.delete_cookie(key="farmer_session")
+    return response
+
+@app.post("/portal/approve-node")
+async def handle_node_approval(target_phone: str = Form(...), current_user=Depends(get_current_farmer)):
+    if not current_user: raise HTTPException(status_code=401, detail="Unauthorized session Access")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("UPDATE farmers SET status = 'Approved' WHERE phone = ? AND lga = ?", (clean_phone(target_phone), current_user['lga']))
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed", status_code=303)
+
+
+@app.get("/portal/feed", response_class=HTMLResponse)
+async def farmer_feed_portal(current_user=Depends(get_current_farmer)):
+    if not current_user: return RedirectResponse(url="/portal/login?error=Session required.", status_code=303)
+    weather = await get_realtime_weather(current_user['lga'])
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM farmers WHERE lga = ? AND status = 'Pending'",
+                                (current_user['lga'],)) as c1:
+            pending_neighbors = await c1.fetchall()
+        async with conn.execute("SELECT * FROM farmers WHERE lga = ? AND status = 'Approved' AND phone != ?",
+                                (current_user['lga'], current_user['phone'])) as c2:
+            approved_neighbors = await c2.fetchall()
+        async with conn.execute("SELECT * FROM alerts_log WHERE lga = ? AND status = 'Active' ORDER BY id DESC",
+                                (current_user['lga'],)) as c3:
+            active_threats = await c3.fetchall()
+
+    nb_pending = "".join([f"""
+        <div style='background:#1e293b; padding:16px; margin:10px 0; border-radius:12px; display:flex; justify-content:space-between; align-items:center;'>
+            <div><div style='font-weight:600; color:#fff;'>{n['name']}</div><div style='font-size:12px; color:var(--text-muted);'>{mask_phone_number(n['phone'])}</div></div>
+            <form action='/portal/approve-node' method='post' style='margin:0;'><input type='hidden' name='target_phone' value='{n['phone']}'><button type='submit' class='btn btn-emerald' style='padding:8px 16px; font-size:12px; border-radius:8px;'>🔒 Verify Identity</button></form>
+        </div>""" for n in pending_neighbors])
+    nb_approved = "".join([f"""
+        <div style='padding:12px 16px; background:rgba(16,185,129,0.03); border:1px solid rgba(16,185,129,0.15); border-radius:10px; margin-bottom:8px; display:flex; align-items:center; gap:10px;'>
+            🟢 <div style='flex:1;'><span style='font-weight:600; color:#f1f5f9;'>{f['name']}</span></div><span style='font-size:11px; color:var(--accent-emerald); background:rgba(16,185,129,0.1); padding:2px 8px; border-radius:4px;'>Online</span>
+        </div>""" for f in approved_neighbors])
+
+    echo_feed_html = ""
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        for a in active_threats:
+            async with conn.execute("SELECT * FROM alert_comments WHERE alert_id = ? ORDER BY id ASC",
+                                    (a['id'],)) as cc:
+                comments = await cc.fetchall()
+            cm_html = "".join([
+                                  f"<div style='background:rgba(255,255,255,0.03); padding:8px 12px; border-radius:8px; margin-top:6px; font-size:13px;'><b style='color:var(--accent-blue);'>{c['author']}:</b> {c['text']}</div>"
+                                  for c in comments])
+            v_element = f'<div style="margin:12px 0;"><video src="/media/{a["video_path"]}" controls style="max-width:100%; border-radius:8px; border:1px solid rgba(255,255,255,0.1);"></video></div>' if \
+            a['video_path'] else ''
+            echo_feed_html += f"""
+            <div style="background:rgba(255,255,255,0.01); border:1px solid var(--border-glass); padding:20px; border-radius:16px; margin-bottom:16px;">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap;">
+                    <div><span class="badge badge-blue">📡 {a["type"]}</span><div style="font-size:15px; color:#f1f5f9; font-weight:600; margin:8px 0;">"{a["message"]}"</div><small style="color:var(--text-muted); font-size:11px;">Origin: Transmitted by <b>{a["sender"]}</b></small></div>
+                    <form action="/portal/alert/relay" method="post" onsubmit="triggerEchoAnimation(event, {a["id"]})" style="margin:0;"><input type="hidden" name="alert_id" value="{a["id"]}"><button type="submit" id="echo_btn_{a["id"]}" class="btn btn-blue" style="padding:8px 14px; font-size:12px;">🔁 Relay</button></form>
+                </div>
+                {v_element}
+                <div style="margin-top:15px; border-top:1px solid rgba(255,255,255,0.05); padding-top:12px;">
+                    <h5 style="margin:0 0 8px 0; font-size:12px; color:var(--text-muted); text-transform:uppercase;">💬 Intel Discussion Updates</h5>
+                    {cm_html or '<p style="color:var(--text-muted); font-size:12px; font-style:italic; margin:0;">No updates posted by neighbors yet.</p>'}
+                    <form action="/portal/alert/comment" method="post" style="margin-top:10px; display:flex; gap:8px;"><input type="hidden" name="alert_id" value="{a['id']}"><input type="text" name="comment_text" placeholder="Add verification update details..." required style="padding:10px; font-size:13px;"><button type="submit" class="btn btn-emerald" style="padding:0 16px; border-radius:12px; font-size:13px; white-space:nowrap;">Send</button></form>
+                </div>
+            </div>"""
+    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        {UPGRADED_CSS}
+        .portal-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; margin-top: 24px; }}
+        .portal-card {{ background: var(--panel-glass); border: 1px solid var(--border-glass); border-radius: 20px; padding: 24px; box-shadow: 0 10px 30px -10px rgba(0,0,0,0.3); display: flex; flex-direction: column; }}
+        .card-header {{ display: flex; align-items: center; gap: 10px; margin-bottom: 18px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 12px; }}
+        .card-title {{ font-size: 16px; font-weight: 700; color: #fff; margin: 0; }}
+        .weather-value {{ font-size: 32px; font-weight: 800; color: #fff; margin: 10px 0 5px 0; font-family: monospace; }}
+    </style></head>
+    <body>
+        <div class="container" style="max-width:1200px; padding:20px 0;">
+            <div style="background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:24px; padding:24px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px; margin-bottom:24px;">
+                <div style="display:flex; align-items:center; gap:16px;">
+                    <div style="font-size:40px;">👨‍🌾</div>
+                    <div><h1 style="margin:0; font-size:22px; font-weight:800; color:#fff;">Terminal: {current_user['name']}</h1><span class="badge badge-emerald" style="margin-top:6px;">📍 {current_user['lga']} Sector Grid</span></div>
+                </div>
+                <div style="display:flex; gap:12px; align-items:center;"><span id="grid_score_display" class="badge badge-amber" style="font-weight:800; padding:8px 16px; font-size:13px;">⚡ {current_user['xp']} Grid XP</span><a href="/portal/logout" class="btn btn-danger" style="padding:10px 20px; font-size:13px; border-radius:10px;">🔌 Disconnect</a></div>
+            </div>
+            <div class="portal-grid">
+                <div class="portal-card"><div class="card-header">🌤️ <h3 class="card-title">Local Environment Matrix</h3></div><div class="weather-value">{weather['temp']}</div><div style="color:var(--accent-blue); font-weight:600; font-size:14px;">📈 Status: {weather['desc']}</div></div>
+                <div class="portal-card"><div class="card-header">👥 <h3 class="card-title">Active Neighbors ({len(approved_neighbors)})</h3></div><div style="flex:1; max-height:220px; overflow-y:auto;">{nb_approved or '<p style="color:var(--text-muted); font-size:13px; margin:0;">No active nodes nearby.</p>'}</div></div>
+                <div class="portal-card"><div class="card-header">🤝 <h3 class="card-title">P2P Trust Gate</h3></div><div style="flex:1; max-height:220px; overflow-y:auto;">{nb_pending or '<p style="color:var(--text-muted); font-size:13px; margin:0;">Grid clear.</p>'}</div></div>
+            </div>
+            <div class="portal-grid" style="grid-template-columns: 1fr;">
+                <div class="portal-card" style="border-color: rgba(239,68,68,0.2);"><div class="card-header" style="border-color: rgba(239,68,68,0.15);">🛡️ <h3 class="card-title" style="color:#ef4444;">Active Sector Threat Vectors</h3></div>{echo_feed_html or '<div style="text-align:center; padding:20px; color:var(--text-muted); font-style:italic; font-size:14px;">🟢 Secure baseline. Local sector is quiet.</div>'}</div>
+                <div class="portal-card" style="border-color: rgba(245,158,11,0.2);">
+                    <div class="card-header" style="border-color: rgba(245,158,11,0.15);">🚨 <h3 class="card-title" style="color:var(--accent-amber);">Broadcast Emergency Panic Vector</h3></div>
+                    <form id="emergency_form" action="/portal/alert/raise" method="post" enctype="multipart/form-data" onsubmit="executeTransmissionSequence(event)">
+                        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:15px; margin-bottom:15px;">
+                            <div><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">Classification</label><select id="alert_type" name="alert_type"><option value="Intruder Spotted">⚠️ Intruder Spotted</option><option value="Critical Disaster">🔥 Critical Disaster</option><option value="Armed Attack">⚔️ Armed Attack</option></select></div>
+                            <div><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">Tactical Coordinates</label><input type="text" id="alert_message" name="message" placeholder="State coordinates..." required></div>
+                        </div>
+                        <div style="margin-bottom:20px;"><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">📷 Attach Video Clip Evidence (Optional)</label><input type="file" name="video_evidence" accept="video/*" style="background:#090d16; color:white; padding:10px; border-radius:12px; border:1px solid var(--border-glass); width:100%;"></div>
+                        <button type="submit" id="panic_btn" class="btn" style="width:100%; padding:16px; background:#ef4444; color:white; font-size:15px; font-weight:bold; box-shadow: 0 4px 20px rgba(239,68,68,0.25);">📡 Execute Strategic Grid Alarm</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+        <div id="radar_screen" class="glass-panel" style="max-width: 550px; margin: 60px auto; text-align: center; display: none;"><div class="radar-spinner"></div><span class="badge badge-amber pulse" style="margin-bottom: 16px;">Transmission Channel Engaged</span><h2>Transmitting...</h2></div>
+        <script>
+            async function triggerEchoAnimation(e, aId) {{ e.preventDefault(); const btn = document.getElementById('echo_btn_' + aId); btn.disabled = true; btn.innerText = "📡 Relaying..."; try {{ const res = await fetch('/portal/alert/relay', {{ method: 'POST', body: new FormData(e.target) }}); if (res.status === 200) {{ const newXp = await res.text(); document.getElementById('grid_score_display').innerText = "⚡ " + newXp + " Grid XP"; btn.className = "btn"; btn.style.background = "#10b981"; btn.innerText = "✅ Dispatched"; }} }} catch(err) {{ console.error(err); }} }}
+            function executeTransmissionSequence(e) {{ e.preventDefault(); const termCard = document.getElementById('container'), radarScreen = document.getElementById('radar_screen'); if(termCard) termCard.style.display = 'none'; radarScreen.style.display = 'block'; const form = document.getElementById('emergency_form'), formData = new FormData(form); fetch(form.action, {{ method: form.method, body: formData }}).then(() => {{ window.location.href = '/portal/feed'; }}).catch(() => {{ window.location.href = '/portal/feed'; }}); }}
+        </script>
+    </body></html>"""
+
+@app.post("/portal/alert/comment")
+async def farmer_post_comment(alert_id: int = Form(...), comment_text: str = Form(...), current_user=Depends(get_current_farmer)):
+    if not current_user: raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("INSERT INTO alert_comments (alert_id, author, text) VALUES (?, ?, ?)", (alert_id, current_user['name'], sanitize(comment_text)))
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed", status_code=303)
+
+@app.post("/portal/alert/raise")
+async def farmer_raise_alert(alert_type: str = Form(...), message: str = Form(...), video_evidence: Optional[UploadFile] = File(None), current_user=Depends(get_current_farmer)):
+    if not current_user: raise HTTPException(status_code=401, detail="Unauthorized")
+    v_name = None
+    if video_evidence and video_evidence.filename:
+        v_name = f"{hashlib.md5(os.urandom(16)).hexdigest()}_{video_evidence.filename}"
+        with open(os.path.join(MEDIA_DIR, v_name), "wb") as f: f.write(await video_evidence.read())
+    a_type, msg = sanitize(alert_type), sanitize(message)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("INSERT INTO alerts_log (type, sender, lga, message, status, video_path) VALUES (?, ?, ?, ?, 'Active', ?)", (a_type, current_user['name'], current_user['lga'], msg, v_name))
+        await conn.commit()
+    override = a_type in ["Critical Disaster", "Armed Attack"]
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        q = "SELECT phone FROM farmers WHERE status = 'Approved' AND phone != ?" if override else "SELECT phone FROM farmers WHERE status = 'Approved' AND lga = ? AND phone != ?"
+        p = (current_user['phone'],) if override else (current_user['lga'], current_user['phone'])
+        async with conn.execute(q, p) as cursor: targets = [r["phone"] for r in await cursor.fetchall()]
+    alert_text = f"🚨 ALERT [{a_type.upper()}] from Sector [{current_user['lga']}]: {msg}"
+    for phone in targets: asyncio.create_task(async_dispatch_whatsapp(phone, alert_text))
+    return Response(status_code=200)
+
+@app.post("/portal/alert/relay")
+async def farmer_relay_alert(alert_id: int = Form(...), current_user=Depends(get_current_farmer)):
+    if not current_user: raise HTTPException(status_code=401, detail="Session validation failed")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT type, sender, message, lga FROM alerts_log WHERE id = ?", (alert_id,)) as cursor: alert = await cursor.fetchone()
+    new_xp = current_user['xp']
+    if alert:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            await conn.execute("UPDATE farmers SET xp = xp + 15 WHERE phone = ?", (current_user['phone'],))
+            async with conn.execute("SELECT xp FROM farmers WHERE phone = ?", (current_user['phone'],)) as res_cursor:
+                res_row = await res_cursor.fetchone()
+                if res_row: new_xp = res_row[0]  # <--- Extract the actual value from the row tuple
+            await conn.commit()
+        async with aiosqlite.connect(DB_FILE) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute("SELECT phone FROM farmers WHERE status = 'Approved' AND lga = ? AND phone != ?", (alert['lga'], current_user['phone'])) as cursor: targets = [r["phone"] for r in await cursor.fetchall()]
+        relay_text = f"📡 [GRID RELAY] Forwarded by {current_user['name']} | ORIGINAL ALERT [{alert['type'].upper()}] from {alert['sender']}: {alert['message']}"
+        for phone in targets: asyncio.create_task(async_dispatch_whatsapp(phone, relay_text))
+    return Response(content=str(new_xp), status_code=200)
+
+@app.post("/incoming-alert")
+async def handle_incoming_alert(From: str = Form(...), Body: str = Form(...)):
+    sender_number = clean_phone(From.replace("whatsapp:", ""))
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM farmers WHERE phone = ? AND status = 'Approved'", (sender_number,)) as cursor: farmer = await cursor.fetchone()
+    if not farmer: return Response(content="<Response></Response>", media_type="application/xml")
+    alert_type, msg_lower = "General Anomaly", Body.lower()
+    if "fire" in msg_lower or "flood" in msg_lower: alert_type = "Critical Disaster"
+    elif "thief" in msg_lower or "intruder" in msg_lower: alert_type = "Intruder Spotted"
+    elif "attack" in msg_lower or "armed" in msg_lower: alert_type = "Armed Attack"
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("INSERT INTO alerts_log (type, sender, lga, message, status, video_path) VALUES (?, ?, ?, ?, 'Active', NULL)", (alert_type, farmer['name'], farmer['lga'], sanitize(Body)))
+        await conn.commit()
+    return Response(content="<Response></Response>", media_type="application/xml")
+
+@app.get("/", response_class=HTMLResponse)
+def community_homepage():
+    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head><body>
+        <div class="glass-panel" style="max-width: 550px; margin: 60px auto; text-align: center;">
+            <div ondblclick="window.location.href='/dashboard'" style="cursor:default; user-select:none; margin-bottom:20px;">
+                <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 12px rgba(16,185,129,0.4));">
+                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    <path d="M12 8v4"/><path d="M12 16h.01"/>
+                </svg>
+                <h1 style="margin:15px 0 2px 0; font-size:28px; font-weight:900; letter-spacing:-0.03em; color:#fff; text-shadow:0 2px 10px rgba(0,0,0,0.5);">olode.com.ng</h1>
+                <span class="badge badge-blue" style="font-size:10px; font-weight:800; letter-spacing:0.08em; padding:4px 10px;">Farm Watch Matrix</span>
+            </div>
+            <p style="color: var(--text-muted); line-height: 1.6; font-size:14px; margin-bottom:30px;">Tactical localized protection infrastructure matrix.</p>
+            <div style="display:grid; gap:16px;">
+                <a href="/register" class="btn btn-emerald" style="padding:16px; font-size:16px; font-weight:800; color:#ffffff; text-shadow:0 1px 3px rgba(0,0,0,0.4); letter-spacing:0.02em; border-radius:14px;">➕ REGISTER OPERATIONAL NODE</a>
+                <a href="/portal/login" class="btn btn-blue" style="padding:16px; font-size:16px; font-weight:800; color:#ffffff; text-shadow:0 1px 3px rgba(0,0,0,0.4); letter-spacing:0.02em; border-radius:14px;">👩‍🌾 ACCESS MEMBER TERMINAL</a>
+            </div>
+        </div>
+    </body></html>"""
