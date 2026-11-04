@@ -18,7 +18,3 @@ services:
         sync: false
       - key: TWILIO_PHONE_NUMBER
         sync: false
-    disk:
-      name: farm-watch-storage
-      mountPath: /data
-      sizeGB: 1
