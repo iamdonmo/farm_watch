@@ -1353,46 +1353,41 @@ async def post_farm_product(
     price: str = Form(""),
     category: str = Form("General"),
     contact_phone: str = Form(""),
-    photos: List[UploadFile] = File(None),
+    photos: Optional[List[UploadFile]] = File(None),
     current_user=Depends(get_current_farmer)
 ):
-    """Post a farm product listing (up to 5 photos)."""
+    """Post a farm product listing (up to 5 photos). Accepts iPhone HEIC and converts to JPEG."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     title_c = sanitize(title)[:MAX_PRODUCT_TITLE]
     if not title_c:
-        return RedirectResponse(url="/portal/feed?active_tab=market", status_code=303)
+        return RedirectResponse(url="/portal/feed?active_tab=market&post_err=title", status_code=303)
     desc_c = sanitize(description)[:MAX_PRODUCT_DESC]
     price_c = sanitize(price)[:40]
     cat = sanitize(category)[:30] if category else "General"
     contact = normalize_nigerian_mobile(contact_phone) or current_user["phone"]
 
     photo_paths = []
-    if photos:
-        for photo in photos[:5]:  # max 5 photos
-            if not photo or not photo.filename:
+    file_list = photos if isinstance(photos, list) else ([photos] if photos else [])
+    for photo in file_list[:5]:
+        if not photo or not getattr(photo, "filename", None):
+            continue
+        try:
+            raw = await photo.read()
+            if not raw or len(raw) > MAX_UPLOAD_SIZE:
                 continue
-            head = await photo.read(12)
-            await photo.seek(0)
-            is_image = (
-                head.startswith(b"\xff\xd8\xff")
-                or head.startswith(b"\x89PNG")
-                or head.startswith(b"RIFF")
-            )
-            if is_image:
-                content = await photo.read()
-                if len(content) > MAX_UPLOAD_SIZE:
-                    continue
-                ext = "jpg"
-                if head.startswith(b"\x89PNG"):
-                    ext = "png"
-                elif head.startswith(b"RIFF"):
-                    ext = "webp"
-                fname = f"prod_{hashlib.md5(os.urandom(16)).hexdigest()}.{ext}"
-                dest = os.path.join(MEDIA_DIR, fname)
-                with open(dest, "wb") as f:
-                    f.write(content)
-                photo_paths.append(fname)
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(raw))
+            img = img.convert("RGB")
+            img.thumbnail((1200, 1200))
+            fname = f"prod_{hashlib.md5(os.urandom(16)).hexdigest()}.jpg"
+            dest = os.path.join(MEDIA_DIR, fname)
+            img.save(dest, "JPEG", quality=82, optimize=True)
+            photo_paths.append(fname)
+        except Exception as e:
+            print(f"Photo convert skip: {e}")
+            continue
 
     photo_path = ",".join(photo_paths) if photo_paths else None
 
@@ -1400,7 +1395,7 @@ async def post_farm_product(
         await conn.execute(
             """INSERT INTO farm_products
                (farmer_phone, farmer_name, lga, title, description, price, contact_phone, category, photo_path, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending')""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')""",
             (current_user["phone"], current_user["name"], current_user["lga"],
              title_c, desc_c, price_c, contact, cat, photo_path)
         )
@@ -1409,7 +1404,7 @@ async def post_farm_product(
             (PRODUCT_POST_XP, current_user["phone"])
         )
         await conn.commit()
-    return RedirectResponse(url="/portal/feed?active_tab=market&pending=1", status_code=303)
+    return RedirectResponse(url="/portal/feed?active_tab=market&posted=1", status_code=303)
 
 
 @app.post("/portal/market/interest")
@@ -2238,7 +2233,8 @@ async def farmer_feed_portal(
     invite_sent: Optional[str] = Query(None),
     view_profile: Optional[str] = Query(None),
     friend_name: Optional[str] = Query(None),
-    soil_saved: Optional[str] = Query(None)
+    soil_saved: Optional[str] = Query(None),
+    posted: Optional[str] = Query(None),
 ):
     if not current_user: return RedirectResponse(url="/portal/login?error=Session required.", status_code=303)
     # Always define tip_of_day early so it is never unbound
@@ -3341,6 +3337,7 @@ async def farmer_feed_portal(
             <div id="tab_market" style="{show_market}">
                 <div class="portal-card" style="max-width:720px; margin:0 auto 20px;">
                     <div class="card-header">🛒 <h3 class="card-title">Farm Market</h3></div>
+                    {('<div style="background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.4); border-radius:12px; padding:14px; margin-bottom:14px; color:#6ee7b7; font-weight:700;">✅ Your listing was posted successfully and is now visible on the market.</div>') if posted else ''}
                     <div style="background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.35); border-radius:12px; padding:14px 16px; margin-bottom:16px; font-size:14px; color:#fecaca; line-height:1.5;">
                         <strong>⚠️ Scam Warning:</strong> Never send money before seeing the goods. Meet in a public place. Use the <b>Report</b> button if a listing looks suspicious. Farm Watch does not handle payments.
                     </div>
@@ -3363,9 +3360,9 @@ async def farmer_feed_portal(
                         <input type="text" name="description" maxlength="{MAX_PRODUCT_DESC}" placeholder="Quality, quantity, location notes…"
                                style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; box-sizing:border-box; margin-bottom:12px;">
                         <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Photos (optional, up to 5)</label>
-                        <input type="file" name="photos" accept="image/jpeg,image/png,image/webp" multiple
+                        <input type="file" name="photos" accept="image/*" multiple
                                style="width:100%; padding:12px; font-size:14px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; box-sizing:border-box; margin-bottom:12px;">
-                        <p style="font-size:12px; color:#94a3b8; margin:0 0 12px 0;">You can select multiple images at once.</p>
+                        <p style="font-size:12px; color:#94a3b8; margin:0 0 12px 0;">iPhone and Android photos are accepted. Images are resized automatically.</p>
                         <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Contact phone (optional)</label>
                         <input type="text" name="contact_phone" placeholder="Leave blank to use your registered number" inputmode="numeric"
                                style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; box-sizing:border-box; margin-bottom:14px;">
