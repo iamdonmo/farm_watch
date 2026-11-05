@@ -14,11 +14,14 @@ Admin access (not linked publicly):
 import os
 import hmac
 import hashlib
+import secrets
+import time
 import html
 import json
 import httpx
 import asyncio
 import aiosqlite
+import shutil
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, List
@@ -26,7 +29,6 @@ from contextlib import asynccontextmanager
 from fastapi import BackgroundTasks, FastAPI, Form, Response, Depends, HTTPException, status, Cookie, File, UploadFile, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -36,13 +38,13 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 # Never commit real credentials. Rotate any keys that were previously hardcoded.
 # ---------------------------------------------------------------------------
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@iamdonmo")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")  # Required in production
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 if not ADMIN_PASSWORD:
-    ADMIN_PASSWORD = "Froggagaga1"  # Safe fallback only for local dev
-    print("WARNING: Using default admin password. Set ADMIN_PASSWORD env var.")
+    print("WARNING: ADMIN_PASSWORD is not configured. Admin login is disabled.")
 
-ADMIN_SECRET_HASH = hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest()
-COOKIE_SIGNING_KEY = os.getenv("COOKIE_SECRET_KEY", "dev-only-change-me-32-chars-min!!").encode()
+ADMIN_SECRET_HASH = hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest() if ADMIN_PASSWORD else None
+COOKIE_SIGNING_KEY = os.getenv("COOKIE_SECRET_KEY", "").encode() or secrets.token_bytes(32)
+ADMIN_SESSION_TTL_SECONDS = 15 * 60
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -53,10 +55,20 @@ ENABLE_DEMO_DATA = os.getenv("ENABLE_DEMO_DATA", "").strip().lower() in {"1", "t
 if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
     print("WARNING: Twilio credentials not set. WhatsApp alerts will fail.")
 
-DB_FILE = "farm_watch.db"
-MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static_media")
+DEFAULT_DB_FILE = "farm_watch.db"
+DB_FILE = os.getenv("DB_FILE", DEFAULT_DB_FILE)
+DEFAULT_MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static_media")
+MEDIA_DIR = os.path.abspath(os.getenv("MEDIA_DIR", DEFAULT_MEDIA_DIR))
 
+os.makedirs(os.path.dirname(os.path.abspath(DB_FILE)), exist_ok=True)
 os.makedirs(MEDIA_DIR, exist_ok=True)
+legacy_media_dir = os.path.abspath(DEFAULT_MEDIA_DIR)
+if MEDIA_DIR != legacy_media_dir and os.path.isdir(legacy_media_dir):
+    for media_filename in os.listdir(legacy_media_dir):
+        source_path = os.path.join(legacy_media_dir, media_filename)
+        destination_path = os.path.join(MEDIA_DIR, media_filename)
+        if os.path.isfile(source_path) and not os.path.exists(destination_path):
+            shutil.copy2(source_path, destination_path)
 
 # Limit concurrent Twilio dispatches
 DISPATCH_SEMAPHORE = asyncio.Semaphore(10)
@@ -115,6 +127,14 @@ FARMING_TIPS = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    legacy_db_path = os.path.abspath(DEFAULT_DB_FILE)
+    configured_db_path = os.path.abspath(DB_FILE)
+    if configured_db_path != legacy_db_path and not os.path.exists(configured_db_path):
+        if os.path.isfile(legacy_db_path):
+            async with aiosqlite.connect(legacy_db_path) as source_db:
+                async with aiosqlite.connect(configured_db_path) as persistent_db:
+                    await source_db.backup(persistent_db)
+
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("""
@@ -285,6 +305,23 @@ async def lifespan(app: FastAPI):
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        async with conn.execute("PRAGMA table_info(farm_products)") as cursor:
+            farm_product_columns = {row[1] for row in await cursor.fetchall()}
+        if "is_demo" not in farm_product_columns:
+            await conn.execute(
+                "ALTER TABLE farm_products ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0"
+            )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS farm_product_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                farmer_phone TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_read INTEGER NOT NULL DEFAULT 0
+            );
+        """)
         try:
             await conn.execute("ALTER TABLE farmers ADD COLUMN password_hash TEXT;")
         except Exception:
@@ -325,6 +362,7 @@ async def lifespan(app: FastAPI):
                 farmer_phone TEXT NOT NULL,
                 joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 whatsapp_enabled INTEGER NOT NULL DEFAULT 0,
+                membership_status TEXT NOT NULL DEFAULT 'accepted',
                 PRIMARY KEY (group_id, farmer_phone)
             );
         """)
@@ -333,6 +371,10 @@ async def lifespan(app: FastAPI):
         if "whatsapp_enabled" not in trust_member_columns:
             await conn.execute(
                 "ALTER TABLE trust_group_members ADD COLUMN whatsapp_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        if "membership_status" not in trust_member_columns:
+            await conn.execute(
+                "ALTER TABLE trust_group_members ADD COLUMN membership_status TEXT NOT NULL DEFAULT 'accepted'"
             )
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS trust_trips (
@@ -391,7 +433,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Farm Watch Enterprise Node", version="5.2.1", lifespan=lifespan)
-security = HTTPBasic(auto_error=False)
 app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 
 @app.get("/product-photo/{filename}")
@@ -503,7 +544,8 @@ def render_status_card(status, comments) -> str:
 
 async def is_trust_group_member(conn, group_id: int, farmer_phone: str) -> bool:
     async with conn.execute(
-        "SELECT 1 FROM trust_group_members WHERE group_id = ? AND farmer_phone = ?",
+        """SELECT 1 FROM trust_group_members
+           WHERE group_id = ? AND farmer_phone = ? AND membership_status = 'accepted'""",
         (group_id, farmer_phone)
     ) as cursor:
         return await cursor.fetchone() is not None
@@ -520,6 +562,28 @@ def verify_cookie_value(signed_value: Optional[str]) -> Optional[str]:
     value, signature = signed_value.rsplit(".", 1)
     expected = hmac.new(COOKIE_SIGNING_KEY, value.encode(), hashlib.sha256).hexdigest()
     return value if hmac.compare_digest(signature, expected) else None
+
+
+def sign_admin_session(username: str) -> str:
+    payload = f"admin-v1:{username}:{int(time.time()) + ADMIN_SESSION_TTL_SECONDS}"
+    signature = hmac.new(COOKIE_SIGNING_KEY, payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def verify_admin_session(session: Optional[str]) -> Optional[str]:
+    if not session or "." not in session:
+        return None
+    payload, signature = session.rsplit(".", 1)
+    expected = hmac.new(COOKIE_SIGNING_KEY, payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        version, username, expires_at = payload.split(":", 2)
+        if version != "admin-v1" or int(expires_at) <= int(time.time()):
+            return None
+    except (ValueError, TypeError):
+        return None
+    return username if username == ADMIN_USERNAME else None
 
 
 def mask_phone_number(phone: str) -> str:
@@ -558,6 +622,7 @@ async def send_trust_group_whatsapp_alert(group_id: int, sender_phone: str, mess
             FROM trust_group_members tgm
             JOIN farmers f ON f.phone = tgm.farmer_phone
             WHERE tgm.group_id = ?
+              AND tgm.membership_status = 'accepted'
               AND tgm.farmer_phone != ?
               AND tgm.whatsapp_enabled = 1
               AND f.status = 'Approved'
@@ -852,28 +917,12 @@ async def get_latest_soil_reading(farmer_phone: str, lga: str) -> dict:
     }
 
 
-def authenticate_admin(
-    credentials: Optional[HTTPBasicCredentials] = Depends(security),
-    admin_session: Optional[str] = Cookie(None),
-):
-    """Accept either HTTP Basic or a signed admin_session cookie."""
-    # Prefer cookie if present and valid
-    if admin_session:
-        verified = verify_cookie_value(admin_session)
-        if verified == ADMIN_USERNAME:
-            return ADMIN_USERNAME
-
-    # Fall back to Basic Auth
-    if credentials:
-        input_hash = hashlib.sha256(credentials.password.encode()).hexdigest()
-        if hmac.compare_digest(credentials.username, ADMIN_USERNAME) and hmac.compare_digest(input_hash, ADMIN_SECRET_HASH):
-            return credentials.username
-
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid Node Credentials",
-        headers={"WWW-Authenticate": "Basic"},
-    )
+def authenticate_admin(admin_session: Optional[str] = Cookie(None)):
+    """Require a recently authenticated, signed admin session."""
+    verified = verify_admin_session(admin_session)
+    if verified:
+        return verified
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin login required")
 
 
 async def get_current_farmer(farmer_session: Optional[str] = Cookie(None)):
@@ -887,7 +936,11 @@ async def get_current_farmer(farmer_session: Optional[str] = Cookie(None)):
 
 
 @app.post("/portal/auth")
-async def farmer_authentication(phone: str = Form(...), password: str = Form(...)):
+async def farmer_authentication(
+    phone: str = Form(...),
+    password: str = Form(...),
+    next_page: str = Form("/portal/feed"),
+):
     target = normalize_nigerian_mobile(phone)
     if not target:
         return RedirectResponse(
@@ -915,7 +968,9 @@ async def farmer_authentication(phone: str = Form(...), password: str = Form(...
         return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting verification clearance.", status_code=303)
     if farmer["status"] == STATUS_REPORTED:
         return RedirectResponse(url="/portal/login?error=Access Restricted. Your node has been reported and is under review.", status_code=303)
-    res = RedirectResponse(url="/portal/feed", status_code=303)
+    if not next_page.startswith("/") or next_page.startswith("//"):
+        next_page = "/portal/feed"
+    res = RedirectResponse(url=next_page, status_code=303)
     signed_token = sign_cookie_value(target)
     cookie_secure = os.getenv("COOKIE_SECURE", "0") == "1"
     res.set_cookie(key="farmer_session", value=signed_token, max_age=31536000, httponly=True, secure=cookie_secure, samesite="lax")
@@ -1287,7 +1342,21 @@ async def admin_flush_grid_data(username: str = Depends(authenticate_admin)):
 @app.post("/admin/approve-product")
 async def admin_approve_product(product_id: int = Form(...), username: str = Depends(authenticate_admin)):
     async with aiosqlite.connect(DB_FILE) as conn:
-        await conn.execute("UPDATE farm_products SET status = 'Active' WHERE id = ?", (product_id,))
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT farmer_phone, title, status, is_demo FROM farm_products WHERE id = ?",
+            (product_id,)
+        ) as cursor:
+            product = await cursor.fetchone()
+        if product and product["status"] == "Pending":
+            await conn.execute("UPDATE farm_products SET status = 'Active' WHERE id = ?", (product_id,))
+            if not product["is_demo"]:
+                await conn.execute(
+                    """INSERT INTO farm_product_notifications
+                       (farmer_phone, product_id, title, status)
+                       VALUES (?, ?, ?, 'Active')""",
+                    (product["farmer_phone"], product_id, product["title"])
+                )
         await conn.commit()
     return RedirectResponse(url="/dashboard", status_code=303)
 
@@ -1295,9 +1364,59 @@ async def admin_approve_product(product_id: int = Form(...), username: str = Dep
 @app.post("/admin/reject-product")
 async def admin_reject_product(product_id: int = Form(...), username: str = Depends(authenticate_admin)):
     async with aiosqlite.connect(DB_FILE) as conn:
-        await conn.execute("UPDATE farm_products SET status = 'Rejected' WHERE id = ?", (product_id,))
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT farmer_phone, title, status, is_demo FROM farm_products WHERE id = ?",
+            (product_id,)
+        ) as cursor:
+            product = await cursor.fetchone()
+        if product and product["status"] == "Pending":
+            await conn.execute("UPDATE farm_products SET status = 'Rejected' WHERE id = ?", (product_id,))
+            if not product["is_demo"]:
+                await conn.execute(
+                    """INSERT INTO farm_product_notifications
+                       (farmer_phone, product_id, title, status)
+                       VALUES (?, ?, ?, 'Rejected')""",
+                    (product["farmer_phone"], product_id, product["title"])
+                )
         await conn.commit()
     return RedirectResponse(url="/dashboard", status_code=303)
+
+
+@app.post("/admin/seed-demo-products")
+async def admin_seed_demo_products(username: str = Depends(authenticate_admin)):
+    """Add clearly labeled sample marketplace listings in a demo deployment."""
+    if not ENABLE_DEMO_DATA:
+        raise HTTPException(
+            status_code=403,
+            detail="Demo data is disabled. Enable it only on a separate test deployment.",
+        )
+    demo_products = [
+        ("DEMO: Fresh cassava roots — 50kg", "Test listing only; not a real offer.", "₦12,000", "Crops", "Osogbo"),
+        ("DEMO: Yellow maize — 100kg bag", "Sample listing for marketplace testing.", "₦45,000", "Crops", "Ibadan"),
+        ("DEMO: Ripe tomatoes — basket", "Test listing only; not a real offer.", "₦8,500", "Produce", "Ile-Ife"),
+        ("DEMO: White yam tubers", "Sample listing for marketplace testing.", "₦15,000", "Crops", "Ogbomoso"),
+        ("DEMO: Local chicken — 10 birds", "Test listing only; not a real offer.", "₦45,000", "Livestock", "Kano Municipal"),
+        ("DEMO: Carrots — fresh bundle", "Sample listing for marketplace testing.", "₦3,000", "Produce", "Osogbo"),
+        ("DEMO: Groundnuts — 50kg", "Test listing only; not a real offer.", "₦38,000", "Crops", "Ibadan"),
+        ("DEMO: Healthy rabbit", "Sample listing for marketplace testing.", "₦18,000", "Livestock", "Ile-Ife"),
+        ("DEMO: Vegetable seed pack", "Test listing only; not a real offer.", "₦2,500", "Seeds", "Ogbomoso"),
+    ]
+    async with aiosqlite.connect(DB_FILE) as conn:
+        for title, description, price, category, lga in demo_products:
+            await conn.execute(
+                """INSERT INTO farm_products
+                   (farmer_phone, farmer_name, lga, title, description, price,
+                    contact_phone, category, status, is_demo)
+                   SELECT ?, 'DEMO: Sample Farmer', ?, ?, ?, ?, '', ?, 'Active', 1
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM farm_products WHERE is_demo = 1 AND title = ?
+                   )""",
+                ("DEMO-" + lga.upper().replace(" ", "-"), lga, title, description,
+                 price, category, title)
+            )
+        await conn.commit()
+    return RedirectResponse(url="/dashboard?demo_products_added=1", status_code=303)
 
 
 @app.post("/admin/delete-product")
@@ -1485,7 +1604,13 @@ async def admin_post_decoy_product(
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def admin_dashboard(username: str = Depends(authenticate_admin)):
+async def admin_dashboard(request: Request):
+    if verify_admin_session(request.cookies.get("admin_session")) != ADMIN_USERNAME:
+        return RedirectResponse(
+            url="/admin/login?next_page=%2Fdashboard",
+            status_code=303
+        )
+    username = ADMIN_USERNAME
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         async with conn.execute("SELECT * FROM farmers ORDER BY xp DESC") as c1:
@@ -1635,9 +1760,10 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
 
     active_table = f'<div style="overflow-x: auto;"><table class="data-table"><thead><tr><th>Node Name</th><th>Phone Address</th><th>Geographic Network Path</th><th>Status</th><th>Management</th></tr></thead><tbody>{active_nodes_html}</tbody></table></div>' if active_nodes_html else '<p style="color: var(--text-muted); font-style: italic; text-align: center;">No active nodes operating on current security grid.</p>'
     demo_controls_html = (
-        '<form action="/admin/simulate-grid" method="post" style="margin:0;"><button type="submit" class="btn btn-emerald">⚙️ Add labeled demo data</button></form>'
+        '<form action="/admin/simulate-grid" method="post" style="margin:0;"><button type="submit" class="btn btn-emerald">⚙️ Add labeled demo farmers</button></form>'
+        '<form action="/admin/seed-demo-products" method="post" style="margin:0;"><button type="submit" class="btn btn-emerald">🛒 Add sample marketplace posts</button></form>'
         if ENABLE_DEMO_DATA else
-        '<span style="font-size:12px; color:#94a3b8;">Demo data and listings are disabled outside test deployments.</span>'
+        '<span style="font-size:12px; color:#94a3b8;">To test, set ENABLE_DEMO_DATA=true in your separate staging service environment, then reload this page. Do not enable on the live service.</span>'
     )
 
     reports_rows = ""
@@ -1666,6 +1792,7 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
                 <div><h1>📡 Global Command Control</h1><p style="margin: 4px 0 0 0; color: var(--text-muted); font-size: 14px;">Farm Watch Security Operations Matrix</p></div>
                 <div style="display: flex; gap: 10px; align-items: center;">
                     <a href="/" class="btn" style="background: rgba(255,255,255,0.08); color: #e2e8f0; border: 1px solid var(--border-glass); padding: 10px 18px; font-size: 13px;">🏠 Exit to Home</a>
+                    <a href="/portal/login?next_page=%2Fportal%2Ffeed%3Factive_tab%3Dfarm_market" target="_blank" rel="noopener" class="btn btn-blue" style="padding:10px 14px; font-size:13px;">👨‍🌾 Open farmer account</a>
                     {demo_controls_html}
                     <form action="/admin/flush-grid" method="post" style="margin:0;"><button type="submit" class="btn btn-danger">🗑️ Flush Grid Records</button></form>
                 </div>
@@ -1681,7 +1808,7 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
             </div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🏆 Node Reliability Leaderboard</h3><table class="data-table"><thead><tr><th>Rank</th><th>Farmer Deployed Node Name</th><th>Grid Sector Focus</th><th>Network Rating</th></tr></thead><tbody>{leaderboard_html or "<tr><td colspan='4' style='color:var(--text-muted); font-style:italic;'>No XP metrics available.</td></tr>"}</tbody></table></div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3><span style="color: #ef4444;" class="pulse">&bull;</span> Real-Time Emergency Vector Feed</h3><div id="live_threat_feed_target"><p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">Connecting link matrix...</p></div></div>
-            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⚡ Demo Market Listings</h3><p style="color:var(--text-muted); font-size:14px; margin:0 0 16px 0;">Available only when ENABLE_DEMO_DATA is explicitly enabled on an isolated test deployment. Never enable on the live marketplace.</p>{ready_decoys_table}</div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⚡ Demo Market Listings</h3><p style="color:var(--text-muted); font-size:14px; margin:0 0 16px 0;">For staging only. In Render, open your staging web service → Environment → add ENABLE_DEMO_DATA with value true → save and redeploy. Then use “Add sample marketplace posts” above and open the farmer account link to view the clearly labeled examples. Do not enable demo data on the live service.</p>{ready_decoys_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🧪 Demo Listing Creator</h3><p style="color:var(--text-muted); font-size:14px; margin:0 0 16px 0;">Test listings are disabled on production deployments.</p>{decoy_form_html}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🛒 Manage Adverts / Products</h3>{pending_products_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⏳ Executive Node Approvals Pending</h3>{pending_table}</div>
@@ -1750,6 +1877,7 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
                         '/admin/flush-grid': 'Grid records cleared',
                         '/admin/approve-product': 'Product approved',
                         '/admin/reject-product': 'Product rejected',
+                        '/admin/seed-demo-products': 'Sample marketplace posts added',
                         '/admin/delete-product': 'Product deleted',
                         '/admin/post-decoy-product': 'Test listing posted',
                         '/admin/post-ready-decoy': 'Market listing posted'
@@ -1870,14 +1998,18 @@ async def admin_export_ledger(username: str = Depends(authenticate_admin)):
 
 
 @app.get("/portal/login", response_class=HTMLResponse)
-def farmer_login_page(error: str = None):
+def farmer_login_page(error: str = None, next_page: str = "/portal/feed"):
+    if not next_page.startswith("/") or next_page.startswith("//"):
+        next_page = "/portal/feed"
     err_msg = f"<p style='color:#fecaca; background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.3); padding:12px 14px; border-radius:10px; font-size:15px; line-height:1.4; margin-bottom:16px;'>{error}</p>" if error else ""
     return f"""<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>{UPGRADED_CSS}</style></head>
     <body><div class='glass-panel' style='max-width:420px; margin:60px auto;'>
         <h2 style="font-size:26px; margin-bottom:8px;">Member Sign In</h2>
         <p style="color:#94a3b8; font-size:15px; margin-bottom:20px;">Enter your phone number and password</p>
+        <p style="color:#cbd5e1; font-size:13px; margin-bottom:16px;">Signing in here keeps your Admin session active in this browser.</p>
         {err_msg}
         <form action='/portal/auth' method='post'>
+            <input type='hidden' name='next_page' value='{html.escape(next_page, quote=True)}'>
             <label>Phone Number</label>
             <input type='text' name='phone' placeholder='e.g. 0803 123 4567' required inputmode='numeric'>
             <label style="margin-top:12px; display:block;">Password</label>
@@ -2833,12 +2965,62 @@ async def add_trust_group_member(
             is_approved = await cursor.fetchone()
         if not is_approved:
             raise HTTPException(status_code=400, detail="The friend must be an approved farmer")
+        async with conn.execute(
+            """SELECT membership_status FROM trust_group_members
+               WHERE group_id = ? AND farmer_phone = ?""",
+            (group_id, target_phone)
+        ) as cursor:
+            existing_membership = await cursor.fetchone()
+        if existing_membership:
+            return RedirectResponse(
+                url="/portal/feed?active_tab=community&trust_invite_exists=1",
+                status_code=303
+            )
         await conn.execute(
-            "INSERT OR IGNORE INTO trust_group_members (group_id, farmer_phone) VALUES (?, ?)",
+            """INSERT INTO trust_group_members
+               (group_id, farmer_phone, membership_status)
+               VALUES (?, ?, 'pending')""",
             (group_id, target_phone)
         )
         await conn.commit()
-    return RedirectResponse(url="/portal/feed?active_tab=community&trust_member_added=1", status_code=303)
+    return RedirectResponse(url="/portal/feed?active_tab=community&trust_invite_sent=1", status_code=303)
+
+
+@app.post("/portal/trust-groups/respond")
+async def respond_to_trust_group_invite(
+    group_id: int = Form(...),
+    decision: str = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can respond to trust group invites")
+    if decision not in ("accept", "reject"):
+        raise HTTPException(status_code=400, detail="Choose whether to accept or reject the invitation")
+
+    async with aiosqlite.connect(DB_FILE) as conn:
+        if decision == "accept":
+            result = await conn.execute(
+                """UPDATE trust_group_members
+                   SET membership_status = 'accepted', joined_at = CURRENT_TIMESTAMP
+                   WHERE group_id = ? AND farmer_phone = ? AND membership_status = 'pending'""",
+                (group_id, current_user["phone"])
+            )
+        else:
+            result = await conn.execute(
+                """UPDATE trust_group_members
+                   SET membership_status = 'rejected', whatsapp_enabled = 0
+                   WHERE group_id = ? AND farmer_phone = ? AND membership_status = 'pending'""",
+                (group_id, current_user["phone"])
+            )
+        await conn.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Trust group invitation not found or already handled")
+    return RedirectResponse(
+        url=f"/portal/feed?active_tab=community&trust_invite_{decision}d=1",
+        status_code=303
+    )
 
 
 @app.post("/portal/trust-groups/whatsapp")
@@ -3171,6 +3353,41 @@ async def message_notifications(current_user=Depends(get_current_farmer)):
     }
 
 
+@app.get("/portal/market/notifications")
+async def farm_product_notifications(current_user=Depends(get_current_farmer)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("""
+            SELECT id, product_id, title, status, created_at
+            FROM farm_product_notifications
+            WHERE farmer_phone = ? AND is_read = 0
+            ORDER BY id DESC LIMIT 10
+        """, (current_user["phone"],)) as cursor:
+            notifications = await cursor.fetchall()
+        if notifications:
+            ids = [notification["id"] for notification in notifications]
+            placeholders = ",".join("?" for _ in ids)
+            await conn.execute(
+                f"UPDATE farm_product_notifications SET is_read = 1 WHERE id IN ({placeholders})",
+                ids
+            )
+            await conn.commit()
+    return {
+        "notifications": [
+            {
+                "id": notification["id"],
+                "product_id": notification["product_id"],
+                "title": notification["title"],
+                "status": notification["status"],
+                "created_at": notification["created_at"],
+            }
+            for notification in notifications
+        ]
+    }
+
+
 
 @app.get("/portal/chat", response_class=HTMLResponse)
 async def simple_chat_page(
@@ -3367,13 +3584,14 @@ async def delete_account(current_user=Depends(get_current_farmer)):
         await conn.execute("DELETE FROM farmers WHERE phone = ?", (phone,))
         await conn.commit()
     resp = RedirectResponse(url="/register?deleted=1", status_code=303)
-    resp.delete_cookie(key=COOKIE_NAME)
+    resp.delete_cookie(key="farmer_session")
     return resp
 
 
 
 @app.get("/portal/feed", response_class=HTMLResponse)
 async def farmer_feed_portal(
+    request: Request,
     current_user=Depends(get_current_farmer),
     active_tab: Optional[str] = Query(None),
     search_phone: Optional[str] = Query(None),
@@ -3397,6 +3615,7 @@ async def farmer_feed_portal(
     tip_of_day = FARMING_TIPS[int(__import__('datetime').datetime.now().strftime('%j')) % len(FARMING_TIPS)]
     # Unread message count for badge (safe if column missing)
     unread_count = 0
+    unread_product_count = 0
     try:
         async with aiosqlite.connect(DB_FILE) as conn:
             async with conn.execute(
@@ -3404,9 +3623,26 @@ async def farmer_feed_portal(
                 (current_user["phone"],)
             ) as cur:
                 unread_count = (await cur.fetchone())[0]
+            async with conn.execute(
+                """SELECT COUNT(*) FROM farm_product_notifications
+                   WHERE farmer_phone = ? AND is_read = 0""",
+                (current_user["phone"],)
+            ) as cur:
+                unread_product_count = (await cur.fetchone())[0]
     except Exception:
         unread_count = 0
     unread_badge = f'<span id="unread-message-badge" style="display:{"inline-block" if unread_count else "none"}; background:#ef4444; color:white; font-size:11px; font-weight:800; padding:2px 7px; border-radius:10px; margin-left:6px;">{unread_count}</span>'
+    product_notification_badge = (
+        f'<span id="market-notification-count" style="background:#ef4444;color:white;font-size:11px;font-weight:800;padding:2px 7px;border-radius:10px;margin-left:6px;">{unread_product_count}</span>'
+        if unread_product_count else
+        '<span id="market-notification-count" style="display:none;background:#ef4444;color:white;font-size:11px;font-weight:800;padding:2px 7px;border-radius:10px;margin-left:6px;">0</span>'
+    )
+    admin_dashboard_link = (
+        '<a href="/admin/login?next_page=%2Fdashboard" class="btn" '
+        'style="background:rgba(245,158,11,0.12);color:#fbbf24;'
+        'border:1px solid rgba(245,158,11,0.35);padding:10px 14px;'
+        'font-size:13px;border-radius:10px;">🔐 Admin Login</a>'
+    )
     if current_user.get("status") in RESTRICTED_STATUSES:
         return HTMLResponse(content=f"""
         <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head>
@@ -3516,10 +3752,19 @@ async def farmer_feed_portal(
             SELECT tg.id, tg.name, tg.owner_phone
             FROM trust_groups tg
             JOIN trust_group_members tgm ON tgm.group_id = tg.id
-            WHERE tgm.farmer_phone = ?
+            WHERE tgm.farmer_phone = ? AND tgm.membership_status = 'accepted'
             ORDER BY tg.id DESC
         """, (current_user["phone"],)) as c_tg:
             trust_groups = await c_tg.fetchall()
+        async with conn.execute("""
+            SELECT tg.id, tg.name, f.name AS owner_name
+            FROM trust_group_members tgm
+            JOIN trust_groups tg ON tg.id = tgm.group_id
+            JOIN farmers f ON f.phone = tg.owner_phone
+            WHERE tgm.farmer_phone = ? AND tgm.membership_status = 'pending'
+            ORDER BY tgm.joined_at DESC
+        """, (current_user["phone"],)) as c_tgi:
+            pending_trust_group_invites = await c_tgi.fetchall()
         async with conn.execute("""
             SELECT id, title, embed_path FROM spotify_links
             WHERE farmer_phone = ? ORDER BY id DESC LIMIT 20
@@ -3619,6 +3864,25 @@ async def farmer_feed_portal(
         friends_html = '<p style="color:var(--text-muted); font-size:13px;">No friends yet. Add some from your neighbors!</p>'
 
     trust_groups_html = ""
+    pending_trust_group_invites_html = ""
+    for invite in pending_trust_group_invites:
+        pending_trust_group_invites_html += f"""
+        <div style="background:rgba(59,130,246,.08); border:1px solid rgba(59,130,246,.25); border-radius:10px; padding:12px; margin:8px 0;">
+            <div style="font-weight:700; color:#f1f5f9;">Invitation to {html.escape(invite["name"])}</div>
+            <div style="font-size:12px; color:#94a3b8; margin-top:4px;">From {html.escape(invite["owner_name"] or "a friend")}. Accept to receive this group's travel alerts and check-ins.</div>
+            <div style="display:flex; gap:8px; margin-top:10px;">
+                <form action="/portal/trust-groups/respond" method="post" style="margin:0;">
+                    <input type="hidden" name="group_id" value="{invite["id"]}">
+                    <input type="hidden" name="decision" value="accept">
+                    <button type="submit" class="btn btn-emerald" style="padding:8px 12px; font-size:12px;">Accept</button>
+                </form>
+                <form action="/portal/trust-groups/respond" method="post" style="margin:0;">
+                    <input type="hidden" name="group_id" value="{invite["id"]}">
+                    <input type="hidden" name="decision" value="reject">
+                    <button type="submit" class="btn btn-danger" style="padding:8px 12px; font-size:12px;">Reject</button>
+                </form>
+            </div>
+        </div>"""
     whatsapp_delivery_note = (
         "WhatsApp delivery is enabled for this app."
         if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN
@@ -3632,7 +3896,7 @@ async def farmer_feed_portal(
                 SELECT f.phone, f.name, tgm.whatsapp_enabled
                 FROM trust_group_members tgm
                 JOIN farmers f ON f.phone = tgm.farmer_phone
-                WHERE tgm.group_id = ?
+                WHERE tgm.group_id = ? AND tgm.membership_status = 'accepted'
                 ORDER BY f.name COLLATE NOCASE
             """, (group_id,)) as cursor:
                 group_members = await cursor.fetchall()
@@ -3645,7 +3909,11 @@ async def farmer_feed_portal(
             """, (group_id,)) as cursor:
                 active_trips = await cursor.fetchall()
 
-            group_member_phones = {member["phone"] for member in group_members}
+            async with conn.execute(
+                "SELECT farmer_phone FROM trust_group_members WHERE group_id = ?",
+                (group_id,)
+            ) as cursor:
+                group_member_phones = {row["farmer_phone"] for row in await cursor.fetchall()}
             current_group_member = next(
                 (member for member in group_members if member["phone"] == current_user["phone"]),
                 None
@@ -3675,9 +3943,9 @@ async def farmer_feed_portal(
                     <form action="/portal/trust-groups/add-member" method="post" style="display:flex; gap:8px; margin:10px 0; align-items:center; flex-wrap:wrap;">
                         <input type="hidden" name="group_id" value="{group_id}">
                         <select name="friend_phone" required style="flex:1; min-width:160px; padding:9px; font-size:14px;">
-                            <option value="">Add an accepted friend…</option>{friend_options}
+                            <option value="">Invite an accepted friend…</option>{friend_options}
                         </select>
-                        <button type="submit" class="btn btn-blue" style="padding:9px 12px; font-size:12px;">Add member</button>
+                        <button type="submit" class="btn btn-blue" style="padding:9px 12px; font-size:12px;">Send invitation</button>
                     </form>"""
                 else:
                     add_member_html = '<p style="font-size:12px; color:#94a3b8; margin:8px 0;">Only the group creator can add members.</p>'
@@ -3744,7 +4012,7 @@ async def farmer_feed_portal(
                 {trip_form_html}
             </div>"""
     if not trust_groups_html:
-        trust_groups_html = '<p style="font-size:13px; color:#94a3b8;">Create a group, then add accepted friends so they can receive your travel alerts.</p>'
+        trust_groups_html = '<p style="font-size:13px; color:#94a3b8;">Create a group and invite accepted friends. They must accept before receiving travel alerts.</p>'
 
     # Profile viewer: accepted friends can see and reply to each other's statuses.
     profile_card_html = ""
@@ -3848,6 +4116,7 @@ async def farmer_feed_portal(
 
     products_html = ""
     for p in market_products:
+        is_demo_listing = bool(p["is_demo"])
         is_mine = p["farmer_phone"] == current_user["phone"]
         is_sold = p["status"] == "Sold"
         actions = ""
@@ -3905,11 +4174,12 @@ async def farmer_feed_portal(
                     </div>'''
                 photo_html = f'<div class="photo-wrap" data-count="{len(paths)}" style="width:100%;"><div style="width:100%; height:180px; overflow:hidden; border-radius:12px;">{"".join(imgs)}</div>{nav}</div>'
 
+        demo_badge = '<span style="background:rgba(245,158,11,0.2); color:#fbbf24; font-size:12px; font-weight:800; padding:4px 10px; border-radius:6px; margin-left:6px;">DEMO — NOT A REAL OFFER</span>' if is_demo_listing else ""
         sold_badge = '<span style="background:rgba(245,158,11,0.2); color:#fbbf24; font-size:12px; font-weight:800; padding:4px 10px; border-radius:6px; margin-left:6px;">SOLD</span>' if is_sold else ""
         pending_badge = '<span style="background:rgba(59,130,246,0.2); color:#93c5fd; font-size:12px; font-weight:800; padding:4px 10px; border-radius:6px; margin-left:6px;">PENDING APPROVAL</span>' if p["status"] == "Pending" else ""
         price_color = "#94a3b8" if is_sold else "#6ee7b7"
         card_opacity = "opacity:0.75;" if is_sold else ""
-        contact_raw = p["contact_phone"] or p["farmer_phone"] or ""
+        contact_raw = "" if is_demo_listing else (p["contact_phone"] or p["farmer_phone"] or "")
         call_btn = ""
         msg_btn = ""
         if contact_raw and not is_sold:
@@ -3922,25 +4192,14 @@ async def farmer_feed_portal(
         # Safe strings for share button (no backslashes in f-string)
         safe_title = html.escape(p['title'] or '').replace("'", "\\'")
         safe_price = html.escape(p['price'] or '').replace("'", "\\'")
-
-        products_html += f"""
-        <div class="product-card" id="product-card-{p['id']}" data-card="{p['id']}" style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; {card_opacity} width:100%; box-sizing:border-box; min-width:0;">
-            {photo_html}
-            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap; margin-top:12px;">
-                <div style="flex:1; min-width:140px;">
-                    <div style="font-size:13px; color:#94a3b8; font-weight:700;">{html.escape(p['category'] or 'General')} · {html.escape(p['lga'] or '')}{sold_badge}{pending_badge}</div>
-                    <div class="prod-title" style="font-size:18px; font-weight:800; color:#f1f5f9; margin-top:6px; line-height:1.3;">{html.escape(p['title'])}</div>
-                </div>
-                <div style="font-size:18px; font-weight:800; color:{price_color}; white-space:nowrap;">{html.escape(p['price']) if p['price'] else ''}</div>
-            </div>
-            <p style="font-size:15px; color:#cbd5e1; margin:12px 0; line-height:1.5;">{html.escape(p['description'] or '')}</p>
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; font-size:14px;">
-                <span style="color:#94a3b8; min-width:0;">Seller: <b style="color:#e2e8f0;">{html.escape(p['farmer_name'] or '')}</b></span>
-                <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; max-width:100%;">{call_btn}{msg_btn}{actions}
-                    <button type="button" onclick="shareListing('{safe_title}', '{safe_price}')" style="display:inline-block;padding:8px 12px;background:rgba(167,139,250,0.2);border:1px solid rgba(167,139,250,0.4);color:#c4b5fd;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap;">🔗 Share</button>
-                </span>
-            </div>
-            {interest_html}
+        if is_demo_listing:
+            safety_html = (
+                '<div style="margin-top:14px; padding:12px; background:rgba(245,158,11,0.08); '
+                'border:1px solid rgba(245,158,11,0.25); border-radius:10px; color:#fbbf24; '
+                'font-size:13px;">Demo listing for testing only. Do not contact or arrange a purchase.</div>'
+            )
+        else:
+            safety_html = f'''
             <div style="margin-top:14px; padding:12px; background:rgba(239,68,68,0.06); border:1px solid rgba(239,68,68,0.2); border-radius:10px;">
                 <div style="font-size:12px; color:#f87171; font-weight:700; margin-bottom:8px; text-transform:uppercase; letter-spacing:0.04em;">🔒 Privacy & Safety</div>
                 <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
@@ -3968,7 +4227,27 @@ async def farmer_feed_portal(
                         <button type="submit" class="btn btn-emerald" style="padding:6px 12px; font-size:12px; margin-left:6px;">Submit</button>
                     </form>
                 </details>
+            </div>'''
+
+        products_html += f"""
+        <div class="product-card" id="product-card-{p['id']}" data-card="{p['id']}" style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; {card_opacity} width:100%; box-sizing:border-box; min-width:0;">
+            {photo_html}
+            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap; margin-top:12px;">
+                <div style="flex:1; min-width:140px;">
+                    <div style="font-size:13px; color:#94a3b8; font-weight:700;">{html.escape(p['category'] or 'General')} · {html.escape(p['lga'] or '')}{demo_badge}{sold_badge}{pending_badge}</div>
+                    <div class="prod-title" style="font-size:18px; font-weight:800; color:#f1f5f9; margin-top:6px; line-height:1.3;">{html.escape(p['title'])}</div>
+                </div>
+                <div style="font-size:18px; font-weight:800; color:{price_color}; white-space:nowrap;">{html.escape(p['price']) if p['price'] else ''}</div>
             </div>
+            <p style="font-size:15px; color:#cbd5e1; margin:12px 0; line-height:1.5;">{html.escape(p['description'] or '')}</p>
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; font-size:14px;">
+                <span style="color:#94a3b8; min-width:0;">Seller: <b style="color:#e2e8f0;">{html.escape(p['farmer_name'] or '')}</b></span>
+                <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; max-width:100%;">{call_btn}{msg_btn}{actions}
+                    <button type="button" onclick="shareListing('{safe_title}', '{safe_price}')" style="display:inline-block;padding:8px 12px;background:rgba(167,139,250,0.2);border:1px solid rgba(167,139,250,0.4);color:#c4b5fd;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap;">🔗 Share</button>
+                </span>
+            </div>
+            {interest_html}
+            {safety_html}
         </div>
         </div>"""
     if not products_html:
@@ -4482,6 +4761,7 @@ async def farmer_feed_portal(
                     <div><h1 style="margin:0; font-size:22px; font-weight:800; color:#fff;">Terminal: {html.escape(current_user['name'])} {'✅' if current_user.get('status') == 'Approved' else ''}</h1><span class="badge badge-emerald" style="margin-top:6px;">📍 {html.escape(current_user['lga'])} Sector Grid</span></div>
                 </div>
                 <div style="display:flex; gap:12px; align-items:center;"><span id="grid_score_display" class="badge badge-amber" style="font-weight:800; padding:8px 16px; font-size:13px;">⚡ {current_user['xp']} Grid XP</span>
+                    {admin_dashboard_link}
                     <a href="/portal/profile/edit" class="btn" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); padding:10px 16px; font-size:13px; border-radius:10px;">✏️ Edit Profile</a>
                     <a href="/portal/logout" class="btn btn-danger" style="padding:10px 20px; font-size:13px; border-radius:10px;">🔌 Disconnect</a></div>
             </div>
@@ -4499,7 +4779,7 @@ async def farmer_feed_portal(
                 <a href="/portal/feed?active_tab=incidents" class="tab-btn" style="{tab_incidents_active}">🛡️ Alerts</a>
                 <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community{pending_request_badge}</a>
                 <a href="/portal/feed?active_tab=market" class="tab-btn" style="{tab_market_active}">🔍 Find Products</a>
-                <a href="/portal/feed?active_tab=farm_market" class="tab-btn" style="{tab_farm_market_active}">🛒 Farm Market</a>
+                <a href="/portal/feed?active_tab=farm_market" class="tab-btn" style="{tab_farm_market_active}">🛒 Farm Market{product_notification_badge}</a>
                 <a id="messages-nav-link" href="/portal/messages" class="tab-btn" style="background:transparent; color:var(--text-muted);">💬 Messages{unread_badge}</a>
                 <button type="button" onclick="enableMessageNotifications()" class="tab-btn" style="background:transparent; color:var(--text-muted); border:0; cursor:pointer;">🔔 Enable alerts</button>
             </div>
@@ -4527,7 +4807,7 @@ async def farmer_feed_portal(
                                 </div>
                                 <div><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">Tactical Coordinates</label><input type="text" id="alert_message" name="message" placeholder="State coordinates..." required></div>
                             </div>
-                            <div style="margin-bottom:20px;"><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">📷 Attach Video Clip Evidence (Optional)</label><input type="file" name="video_evidence" accept="video/*" style="background:#090d16; color:white; padding:10px; border-radius:12px; border:1px solid var(--border-glass); width:100%;"></div>
+                            <div style="margin-bottom:20px;"><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">📷 Attach Video Clip Evidence (Optional, MP4/MOV/WebM/AVI, up to 15 MB)</label><input type="file" name="video_evidence" accept="video/mp4,video/quicktime,video/webm,video/x-msvideo,.mp4,.mov,.webm,.avi" style="background:#090d16; color:white; padding:10px; border-radius:12px; border:1px solid var(--border-glass); width:100%;"></div>
                             <div style="margin-bottom:16px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.4); border-radius:12px; padding:14px;">
                                 <div style="font-size:13px; font-weight:800; color:#fecaca; margin-bottom:8px; text-transform:uppercase; letter-spacing:0.04em;">⚠️ Strict Warning — Fake News</div>
                                 <p style="font-size:14px; color:#fecaca; margin:0 0 12px 0; line-height:1.5;">Broadcasting false or unverified information is a serious offence. Fake alerts can cause panic, harm neighbours, and will lead to account restriction or reporting to authorities.</p>
@@ -4615,7 +4895,8 @@ async def farmer_feed_portal(
                     <div class="portal-card"><div class="card-header">👥 <h3 class="card-title">Active Neighbors ({len(approved_neighbors)})</h3></div><div style="flex:1; max-height:220px; overflow-y:auto;">{nb_approved or '<p style="color:var(--text-muted); font-size:13px; margin:0;">No active nodes nearby.</p>'}</div></div>
                     <div class="portal-card">
                         <div class="card-header">🛡️ <h3 class="card-title">Trust Groups</h3></div>
-                        <p style="font-size:13px; color:#cbd5e1; margin:0 0 10px;">Create a private group with accepted friends. Travel alerts and every “I'm OK” check-in appear here for all group members. Enable WhatsApp alerts for yourself if you want messages too; {whatsapp_delivery_note} Twilio/WhatsApp messaging charges may apply. Earn +5 XP for your first 3 check-ins per trip; later check-ins still notify the group.</p>
+                        <p style="font-size:13px; color:#cbd5e1; margin:0 0 10px;">Create a private group and invite accepted friends. They must accept before joining or receiving alerts. Travel alerts and every “I'm OK” check-in appear here for group members. Enable WhatsApp alerts for yourself if you want messages too; {whatsapp_delivery_note} Twilio/WhatsApp messaging charges may apply. Earn +5 XP for your first 3 check-ins per trip; later check-ins still notify the group.</p>
+                        {pending_trust_group_invites_html}
                         <form action="/portal/trust-groups/create" method="post" style="display:flex; gap:8px; margin-bottom:12px;">
                             <input type="text" name="name" maxlength="60" placeholder="New group name (e.g. Family)" required style="padding:9px; font-size:14px;">
                             <button type="submit" class="btn btn-emerald" style="padding:9px 12px; font-size:12px; white-space:nowrap;">Create group</button>
@@ -4942,7 +5223,16 @@ async def farmer_feed_portal(
                 if (radarScreen) radarScreen.style.display = 'block';
                 try {{
                     const res = await fetch(form.action, {{ method: form.method, body: new FormData(form), credentials: 'same-origin' }});
-                    if (!res.ok) throw new Error('Alert could not be sent. Please check the form and try again.');
+                    if (!res.ok) {{
+                        let errorMessage = 'Alert could not be sent. Please check the form and try again.';
+                        try {{
+                            const errorData = await res.json();
+                            if (typeof errorData.detail === 'string') errorMessage = errorData.detail;
+                        }} catch (parseError) {{
+                            console.error('Could not read alert error response:', parseError);
+                        }}
+                        throw new Error(errorMessage);
+                    }}
                     form.reset();
                     showFlash('Alert sent successfully', false);
                 }} catch (err) {{
@@ -5321,6 +5611,48 @@ async def farmer_feed_portal(
                 }});
             }}
 
+            function showProductStatusNotification(notification) {{
+                const toast = document.createElement('a');
+                toast.href = '/portal/feed?active_tab=farm_market&market_mine=1';
+                toast.style.cssText = 'position:fixed;top:24px;right:20px;z-index:10001;display:block;width:min(360px,calc(100vw - 40px));padding:16px;background:#0f172a;color:#f8fafc;border:1px solid rgba(52,211,153,.5);border-radius:14px;box-shadow:0 12px 36px rgba(0,0,0,.45);text-decoration:none;';
+                const heading = document.createElement('strong');
+                heading.textContent = notification.status === 'Active'
+                    ? '✅ Your advert was approved'
+                    : 'ℹ️ Your advert was not approved';
+                const title = document.createElement('div');
+                title.textContent = notification.title;
+                title.style.cssText = 'margin-top:7px;color:#cbd5e1;font-size:14px;line-height:1.4;overflow-wrap:anywhere;';
+                const hint = document.createElement('div');
+                hint.textContent = 'Tap to view your marketplace listings';
+                hint.style.cssText = 'margin-top:8px;color:#6ee7b7;font-size:12px;font-weight:700;';
+                toast.append(heading, title, hint);
+                document.body.appendChild(toast);
+                setTimeout(() => toast.remove(), 9000);
+            }}
+
+            async function pollFarmProductNotifications() {{
+                try {{
+                    const response = await fetch('/portal/market/notifications', {{
+                        credentials: 'same-origin',
+                        cache: 'no-store'
+                    }});
+                    if (!response.ok) return;
+                    const data = await response.json();
+                    const notifications = data.notifications || [];
+                    if (!notifications.length) return;
+                    const badge = document.getElementById('market-notification-count');
+                    if (badge) {{
+                        badge.textContent = '0';
+                        badge.style.display = 'none';
+                    }}
+                    notifications.forEach(showProductStatusNotification);
+                }} catch (error) {{
+                    console.error('Could not check advert notifications:', error);
+                }}
+            }}
+            pollFarmProductNotifications();
+            setInterval(pollFarmProductNotifications, 15000);
+
             function showIncomingMessageNotification(message, totalNew) {{
                 const title = message.kind === 'marketplace' ? 'Marketplace message' : 'New friend message';
                 const toast = document.createElement('a');
@@ -5641,22 +5973,26 @@ async def farmer_raise_alert(alert_type: str = Form(...), message: str = Form(..
     v_name = None
 
     if video_evidence and video_evidence.filename:
-        # Inspect binary magic signature headers to prevent structural file mismatches
-        file_head = await video_evidence.read(8)
-        await video_evidence.seek(0)
-        valid_signatures = [b'ftypmp42', b'ftypisom', b'ftypMSNV', b'1A45DFA3', b'RIFF', b'ftypqt  ']
-
-        if not any(sig in file_head for sig in valid_signatures):
-            raise HTTPException(status_code=400, detail="Invalid video format header uploaded.")
-        # Enforce size limit
-        content_bytes = await video_evidence.read()
+        content_bytes = await video_evidence.read(MAX_UPLOAD_SIZE + 1)
         if len(content_bytes) > MAX_UPLOAD_SIZE:
-            raise HTTPException(status_code=400, detail="Video file too large (max 5MB).")
-        await video_evidence.seek(0)
+            raise HTTPException(status_code=413, detail="Video file too large. Maximum size is 15 MB.")
 
-        v_name = f"{hashlib.md5(os.urandom(16)).hexdigest()}_{sanitize(video_evidence.filename)}"
+        file_head = content_bytes[:12]
+        if len(file_head) >= 12 and file_head[4:8] == b"ftyp":
+            extension = ".mov" if file_head[8:12] == b"qt  " else ".mp4"
+        elif file_head[:4] == bytes.fromhex("1A45DFA3"):
+            extension = ".webm"
+        elif file_head[:4] == b"RIFF" and file_head[8:12] == b"AVI ":
+            extension = ".avi"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported video format. Upload an MP4, MOV, WebM, or AVI video.",
+            )
+
+        v_name = f"{hashlib.md5(os.urandom(16)).hexdigest()}{extension}"
         with open(os.path.join(MEDIA_DIR, v_name), "wb") as f:
-            f.write(await video_evidence.read())
+            f.write(content_bytes)
 
     a_type, msg = sanitize(alert_type), sanitize(message)
     async with aiosqlite.connect(DB_FILE) as conn:
@@ -5741,15 +6077,59 @@ async def handle_incoming_alert(From: Optional[str] = Form(None), Body: Optional
     return Response(content="<Response></Response>", media_type="application/xml")
 
 
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login_page(next_page: str = "/dashboard", error: str = ""):
+    if not next_page.startswith("/") or next_page.startswith("//"):
+        next_page = "/dashboard"
+    error_html = (
+        '<p style="color:#fecaca; background:rgba(239,68,68,.15); padding:12px; '
+        'border-radius:10px;">Admin login failed. Check your credentials and try again.</p>'
+        if error else ""
+    )
+    return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>{UPGRADED_CSS}</style></head>
+        <body><div class="glass-panel" style="max-width:440px; margin:60px auto;">
+            <h2 style="margin-top:0;">🔐 Admin sign-in</h2>
+            <p style="color:#cbd5e1;">Enter the administrator credentials to open the dashboard.</p>
+            {error_html}
+            <form action="/admin/login" method="post">
+                <input type="hidden" name="next_page" value="{html.escape(next_page, quote=True)}">
+                <label>Admin username</label>
+                <input type="text" name="username" required autocomplete="username">
+                <label>Admin password</label>
+                <input type="password" name="password" required autocomplete="current-password">
+                <button type="submit" class="btn btn-emerald" style="width:100%; margin-top:18px;">Sign in to Admin</button>
+            </form>
+            <p style="margin-top:18px;"><a href="/" style="color:#93c5fd;">Back to home</a></p>
+        </div></body></html>"""
+
+
 @app.post("/admin/login")
-async def admin_login(username: str = Form(...), password: str = Form(...)):
+async def admin_login(
+    username: str = Form(...),
+    password: str = Form(...),
+    next_page: str = Form("/dashboard"),
+):
+    if not next_page.startswith("/") or next_page.startswith("//"):
+        next_page = "/dashboard"
     input_hash = hashlib.sha256(password.encode()).hexdigest()
-    if hmac.compare_digest(username, ADMIN_USERNAME) and hmac.compare_digest(input_hash, ADMIN_SECRET_HASH):
-        resp = RedirectResponse("/dashboard", status_code=303)
-        resp.set_cookie("admin_session", sign_cookie_value(ADMIN_USERNAME), httponly=True, samesite="lax", max_age=86400)
+    valid_password = bool(
+        ADMIN_SECRET_HASH
+        and hmac.compare_digest(username, ADMIN_USERNAME)
+        and hmac.compare_digest(input_hash, ADMIN_SECRET_HASH)
+    )
+    if valid_password:
+        resp = RedirectResponse(next_page, status_code=303)
+        resp.set_cookie(
+            "admin_session",
+            sign_admin_session(ADMIN_USERNAME),
+            httponly=True,
+            secure=os.getenv("COOKIE_SECURE", "0") == "1",
+            samesite="lax",
+            max_age=ADMIN_SESSION_TTL_SECONDS,
+        )
         return resp
-    # Wrong credentials
-    return RedirectResponse("/?admin_error=1", status_code=303)
+    return RedirectResponse(url="/admin/login?error=1", status_code=303)
 
 @app.get("/admin/logout")
 def admin_logout():
