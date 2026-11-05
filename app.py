@@ -32,10 +32,10 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 # SECURITY: All secrets MUST come from environment variables in production.
 # Never commit real credentials. Rotate any keys that were previously hardcoded.
 # ---------------------------------------------------------------------------
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "chief")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@iamdonmo")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")  # Required in production
 if not ADMIN_PASSWORD:
-    ADMIN_PASSWORD = "CHANGE_ME_IN_PRODUCTION"  # Safe fallback only for local dev
+    ADMIN_PASSWORD = "Froggagaga1"  # Safe fallback only for local dev
     print("WARNING: Using default admin password. Set ADMIN_PASSWORD env var.")
 
 ADMIN_SECRET_HASH = hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest()
@@ -186,6 +186,54 @@ async def lifespan(app: FastAPI):
             );
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS statuses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                author_phone TEXT NOT NULL,
+                author_name TEXT,
+                content TEXT NOT NULL,
+                original_id INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS status_likes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status_id INTEGER NOT NULL,
+                user_phone TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(status_id, user_phone)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS status_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status_id INTEGER NOT NULL,
+                author_phone TEXT NOT NULL,
+                author_name TEXT,
+                text TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS status_hides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status_id INTEGER NOT NULL,
+                user_phone TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(status_id, user_phone)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS status_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status_id INTEGER NOT NULL,
+                reporter_phone TEXT NOT NULL,
+                reason TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(status_id, reporter_phone)
+            );
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS game_scores (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 farmer_phone TEXT NOT NULL,
@@ -269,7 +317,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Farm Watch Enterprise Node", version="5.2.1", lifespan=lifespan)
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
 app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 
 
@@ -509,13 +557,28 @@ async def get_latest_soil_reading(farmer_phone: str, lga: str) -> dict:
     }
 
 
-def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    input_hash = hashlib.sha256(credentials.password.encode()).hexdigest()
-    if not (hmac.compare_digest(credentials.username, ADMIN_USERNAME) and hmac.compare_digest(input_hash,
-                                                                                              ADMIN_SECRET_HASH)):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Node Credentials",
-                            headers={"WWW-Authenticate": "Basic"})
-    return credentials.username
+def authenticate_admin(
+    credentials: Optional[HTTPBasicCredentials] = Depends(security),
+    admin_session: Optional[str] = Cookie(None),
+):
+    """Accept either HTTP Basic or a signed admin_session cookie."""
+    # Prefer cookie if present and valid
+    if admin_session:
+        verified = verify_cookie_value(admin_session)
+        if verified == ADMIN_USERNAME:
+            return ADMIN_USERNAME
+
+    # Fall back to Basic Auth
+    if credentials:
+        input_hash = hashlib.sha256(credentials.password.encode()).hexdigest()
+        if hmac.compare_digest(credentials.username, ADMIN_USERNAME) and hmac.compare_digest(input_hash, ADMIN_SECRET_HASH):
+            return credentials.username
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid Node Credentials",
+        headers={"WWW-Authenticate": "Basic"},
+    )
 
 
 async def get_current_farmer(farmer_session: Optional[str] = Cookie(None)):
@@ -1182,6 +1245,107 @@ async def post_shoutout(message: str = Form(...), current_user=Depends(get_curre
     return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
 
 
+@app.post("/portal/status/post")
+async def post_status(content: str = Form(...), current_user=Depends(get_current_farmer)):
+    """Post a normal status update."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    text = sanitize(content)[:280]
+    if not text:
+        return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute(
+            "INSERT INTO statuses (author_phone, author_name, content) VALUES (?, ?, ?)",
+            (current_user["phone"], current_user["name"], text)
+        )
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+
+
+@app.post("/portal/status/like")
+async def like_status(status_id: int = Form(...), current_user=Depends(get_current_farmer)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO status_likes (status_id, user_phone) VALUES (?, ?)",
+                (status_id, current_user["phone"])
+            )
+            await conn.commit()
+        except Exception:
+            pass  # already liked
+    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+
+
+@app.post("/portal/status/comment")
+async def comment_status(status_id: int = Form(...), text: str = Form(...), current_user=Depends(get_current_farmer)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    clean = sanitize(text)[:200]
+    if clean:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            await conn.execute(
+                "INSERT INTO status_comments (status_id, author_phone, author_name, text) VALUES (?, ?, ?, ?)",
+                (status_id, current_user["phone"], current_user["name"], clean)
+            )
+            await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+
+
+@app.post("/portal/status/repost")
+async def repost_status(status_id: int = Form(...), current_user=Depends(get_current_farmer)):
+    """Repost a status so the user's friends can see it."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT content, author_name FROM statuses WHERE id = ?", (status_id,)) as c:
+            orig = await c.fetchone()
+        if orig:
+            repost_text = f"🔁 {orig['author_name']}: {orig['content']}"
+            await conn.execute(
+                "INSERT INTO statuses (author_phone, author_name, content, original_id) VALUES (?, ?, ?, ?)",
+                (current_user["phone"], current_user["name"], repost_text[:280], status_id)
+            )
+            await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+
+
+@app.post("/portal/status/hide")
+async def hide_status(status_id: int = Form(...), current_user=Depends(get_current_farmer)):
+    """Hide a post from the current user's feed."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO status_hides (status_id, user_phone) VALUES (?, ?)",
+                (status_id, current_user["phone"])
+            )
+            await conn.commit()
+        except Exception:
+            pass
+    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+
+
+@app.post("/portal/status/report")
+async def report_status(status_id: int = Form(...), reason: str = Form("Inappropriate"), current_user=Depends(get_current_farmer)):
+    """Report a post for moderation."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO status_reports (status_id, reporter_phone, reason) VALUES (?, ?, ?)",
+                (status_id, current_user["phone"], sanitize(reason)[:100])
+            )
+            await conn.commit()
+        except Exception:
+            pass
+    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+
+
 @app.post("/portal/market/post")
 async def post_farm_product(
     title: str = Form(...),
@@ -1246,6 +1410,49 @@ async def post_farm_product(
         )
         await conn.commit()
     return RedirectResponse(url="/portal/feed?active_tab=market&pending=1", status_code=303)
+
+
+@app.post("/portal/market/interest")
+async def express_interest(
+    product_id: int = Form(...),
+    seller_phone: str = Form(...),
+    interest_photo: Optional[UploadFile] = File(None),
+    current_user=Depends(get_current_farmer)
+):
+    """Buyer marks interest, optionally uploads a photo, and auto-sends a message to the seller."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if seller_phone == current_user["phone"]:
+        return RedirectResponse(url="/portal/feed?active_tab=market", status_code=303)
+
+    photo_note = ""
+    if interest_photo and interest_photo.filename:
+        content = await interest_photo.read()
+        if len(content) <= MAX_UPLOAD_SIZE:
+            ext = os.path.splitext(interest_photo.filename)[1].lower() or ".jpg"
+            fname = f"interest_{current_user['phone']}_{product_id}_{hashlib.md5(os.urandom(8)).hexdigest()[:8]}{ext}"
+            path = os.path.join(MEDIA_DIR, fname)
+            with open(path, "wb") as f:
+                f.write(content)
+            photo_note = f" (photo attached: /media/{fname})"
+
+    listing_name = "your listing"
+    listing_price = ""
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT title, price FROM farm_products WHERE id = ?", (product_id,)) as cur:
+            prod = await cur.fetchone()
+            if prod:
+                listing_name = prod["title"] or listing_name
+                listing_price = prod["price"] or ""
+        price_bit = f" ({listing_price})" if listing_price else ""
+        msg = f"I am interested in your listing: {listing_name}{price_bit}.{photo_note}"
+        await conn.execute(
+            "INSERT INTO direct_messages (sender_phone, receiver_phone, body) VALUES (?, ?, ?)",
+            (current_user["phone"], seller_phone, msg)
+        )
+        await conn.commit()
+    return RedirectResponse(url=f"/portal/feed?active_tab=market&interested=1", status_code=303)
 
 
 @app.post("/portal/market/sold")
@@ -2068,6 +2275,16 @@ async def farmer_feed_portal(
         async with conn.execute("SELECT * FROM farmers WHERE lga = ? AND status = 'Approved' AND phone != ?",
                                 (current_user['lga'], current_user['phone'])) as c2:
             approved_neighbors = await c2.fetchall()
+        # Existing friendships (pending or accepted) for current user
+        async with conn.execute("""
+            SELECT requester_phone, receiver_phone, status FROM friendships
+            WHERE requester_phone = ? OR receiver_phone = ?
+        """, (current_user['phone'], current_user['phone'])) as cf:
+            friend_rows = await cf.fetchall()
+        friend_status_map = {}
+        for fr in friend_rows:
+            other = fr["receiver_phone"] if fr["requester_phone"] == current_user["phone"] else fr["requester_phone"]
+            friend_status_map[other] = fr["status"]
         async with conn.execute("SELECT * FROM alerts_log WHERE lga = ? AND status = 'Active' ORDER BY id DESC",
                                 (current_user['lga'],)) as c3:
             active_threats = await c3.fetchall()
@@ -2084,6 +2301,27 @@ async def farmer_feed_portal(
             WHERE lga = ? ORDER BY id DESC LIMIT 25
         """, (current_user['lga'],)) as c5:
             recent_shoutouts = await c5.fetchall()
+        # Statuses from friends + own (network growth)
+        friend_phones = [ph for ph, st in friend_status_map.items() if st == 'accepted']
+        friend_phones.append(current_user['phone'])
+        placeholders = ",".join("?" * len(friend_phones))
+        async with conn.execute(f"""
+            SELECT s.id, s.author_phone, s.author_name, s.content, s.timestamp,
+                   (SELECT COUNT(*) FROM status_likes WHERE status_id = s.id) as likes,
+                   (SELECT COUNT(*) FROM status_comments WHERE status_id = s.id) as comments
+            FROM statuses s
+            WHERE s.author_phone IN ({placeholders})
+              AND s.id NOT IN (SELECT status_id FROM status_hides WHERE user_phone = ?)
+            ORDER BY s.id DESC LIMIT 30
+        """, friend_phones + [current_user['phone']]) as cs:
+            status_posts = await cs.fetchall()
+        status_comments_map = {}
+        if status_posts:
+            ids = [s['id'] for s in status_posts]
+            ph = ",".join("?" * len(ids))
+            async with conn.execute(f"SELECT status_id, author_name, text FROM status_comments WHERE status_id IN ({ph}) ORDER BY id ASC", ids) as cc:
+                for row in await cc.fetchall():
+                    status_comments_map.setdefault(row['status_id'], []).append(row)
         async with conn.execute("""
             SELECT id FROM checkins
             WHERE farmer_phone = ? AND date(timestamp) = date('now', 'localtime') LIMIT 1
@@ -2232,6 +2470,11 @@ async def farmer_feed_portal(
     if not leaderboard_html:
         leaderboard_html = '<p style="color:var(--text-muted); font-size:13px;">No ranked farmers yet.</p>'
 
+    # Compact ticker text for tip / check-in / leaderboard
+    top_names = " · ".join([f"{r['name']} ({r['xp']} XP)" for r in list(leaderboard_rows)[:3]]) or "No rankings yet"
+    checkin_bit = "Checked in today" if checked_in_today else f"Daily check-in available (+{CHECKIN_XP} XP)"
+    ticker_text = f"💡 Tip: {tip_of_day}   •   ✅ {checkin_bit}   •   🏆 Top: {top_names}"
+
     products_html = ""
     for p in market_products:
         is_mine = p["farmer_phone"] == current_user["phone"]
@@ -2276,6 +2519,20 @@ async def farmer_feed_portal(
             call_btn = f'<a href="tel:{html.escape(str(contact_raw))}" style="display:inline-block;padding:10px 16px;background:rgba(59,130,246,0.2);border:1px solid rgba(59,130,246,0.4);color:#93c5fd;border-radius:10px;font-size:14px;font-weight:700;text-decoration:none;">📞 Call seller</a>'
             msg_btn = f'<a href="/portal/chat?with={html.escape(str(p["farmer_phone"] or ""))}" style="display:inline-block;padding:10px 16px;background:rgba(16,185,129,0.2);border:1px solid rgba(16,185,129,0.4);color:#6ee7b7;border-radius:10px;font-size:14px;font-weight:700;text-decoration:none;">💬 Message seller</a>'
 
+        interest_html = ""
+        if not is_mine and not is_sold:
+            interest_html = f"""
+            <div style="margin-top:12px;">
+                <form action="/portal/market/interest" method="post" enctype="multipart/form-data" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+                    <input type="hidden" name="product_id" value="{p['id']}">
+                    <input type="hidden" name="seller_phone" value="{html.escape(str(p['farmer_phone'] or ''))}">
+                    <label style="font-size:13px; color:#94a3b8;">Photo of goods (optional)</label>
+                    <input type="file" name="interest_photo" accept="image/*" capture="environment" style="font-size:13px; color:#cbd5e1;">
+                    <button type="submit" class="btn btn-emerald" style="padding:8px 14px; font-size:13px;">I am interested</button>
+                </form>
+            </div>
+            """
+
         products_html += f"""
         <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:16px; margin-bottom:14px; {card_opacity}">
             {photo_html}
@@ -2291,6 +2548,7 @@ async def farmer_feed_portal(
                 <span style="color:#94a3b8;">Seller: <b style="color:#e2e8f0;">{html.escape(p['farmer_name'] or '')}</b></span>
                 <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">{call_btn}{msg_btn}{actions}</span>
             </div>
+            {interest_html}
             <div style="margin-top:14px; padding:12px; background:rgba(239,68,68,0.06); border:1px solid rgba(239,68,68,0.2); border-radius:10px;">
                 <div style="font-size:12px; color:#f87171; font-weight:700; margin-bottom:8px; text-transform:uppercase; letter-spacing:0.04em;">🔒 Privacy & Safety</div>
                 <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
@@ -2382,24 +2640,64 @@ async def farmer_feed_portal(
             <div style="color:#64748b; font-size:11px; margin-top:4px;">{s['timestamp']}</div>
         </div>""" for s in recent_shoutouts]) or '<p style="color:var(--text-muted); font-size:13px;">No shout-outs yet. Say hello to your neighbours!</p>'
 
+    status_html = ""
+    for s in status_posts:
+        comments_html = "".join([
+            f'<div style="font-size:13px; margin:4px 0; color:#cbd5e1;"><b style="color:#6ee7b7;">{html.escape(c["author_name"] or "")}</b>: {html.escape(c["text"])}</div>'
+            for c in status_comments_map.get(s["id"], [])
+        ])
+        status_html += f"""
+        <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:14px; margin-bottom:12px;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div style="font-weight:700; color:#f1f5f9;">{html.escape(s['author_name'] or '')}</div>
+                <span style="font-size:11px; color:#64748b;">{s['timestamp']}</span>
+            </div>
+            <p style="margin:10px 0; color:#e2e8f0; font-size:15px; line-height:1.4;">{html.escape(s['content'])}</p>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
+                <form action="/portal/status/like" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{s['id']}"><button type="submit" style="background:none;border:none;color:#60a5fa;cursor:pointer;font-size:13px;">👍 {s['likes']}</button></form>
+                <form action="/portal/status/repost" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{s['id']}"><button type="submit" style="background:none;border:none;color:#34d399;cursor:pointer;font-size:13px;">🔁 Repost</button></form>
+                <form action="/portal/status/hide" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{s['id']}"><button type="submit" style="background:none;border:none;color:#94a3b8;cursor:pointer;font-size:13px;">🙈 Hide</button></form>
+                <form action="/portal/status/report" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{s['id']}"><input type="hidden" name="reason" value="Inappropriate"><button type="submit" style="background:none;border:none;color:#f87171;cursor:pointer;font-size:13px;">🚩 Report</button></form>
+            </div>
+            {comments_html}
+            <form action="/portal/status/comment" method="post" style="display:flex; gap:6px; margin-top:8px;">
+                <input type="hidden" name="status_id" value="{s['id']}">
+                <input type="text" name="text" placeholder="Comment…" maxlength="200" required style="flex:1; padding:8px; font-size:13px; background:#1e293b; border:1px solid #475569; color:#fff; border-radius:8px; margin:0;">
+                <button type="submit" class="btn btn-blue" style="padding:6px 12px; font-size:12px;">Reply</button>
+            </form>
+        </div>"""
+    if not status_html:
+        status_html = '<p style="color:var(--text-muted); font-size:13px;">No statuses yet. Be the first to post!</p>'
+
     nb_pending = "".join([f"""
         <div style='background:#1e293b; padding:16px; margin:10px 0; border-radius:12px; display:flex; justify-content:space-between; align-items:center;'>
             <div><div style='font-weight:600; color:#fff;'>{n['name']}</div><div style='font-size:12px; color:var(--text-muted);'>{mask_phone_number(n['phone'])}</div></div>
             <form action='/portal/approve-node' method='post' style='margin:0;'><input type='hidden' name='target_phone' value='{n['phone']}'><button type='submit' class='btn btn-emerald' style='padding:8px 16px; font-size:12px; border-radius:8px;'>🔒 Verify Identity</button></form>
         </div>""" for n in pending_neighbors])
-    nb_approved = "".join([f"""
+    nb_approved_parts = []
+    for f in approved_neighbors:
+        fphone = f['phone']
+        fstatus = friend_status_map.get(fphone)
+        if fstatus == 'accepted':
+            friend_btn = '<span style="color:#34d399; font-size:12px; font-weight:700;">✅ Friends</span>'
+        elif fstatus == 'pending':
+            friend_btn = '<span style="color:#fbbf24; font-size:12px; font-weight:700;">⏳ Pending</span>'
+        else:
+            friend_btn = f"""<form action='/portal/friend/request' method='post' style='margin:0;' onsubmit="return confirm('⚠️ Verify this person first!\\n\\nMake sure you know them or have verified their identity before sending a friend request.\\n\\nContinue?');">
+                <input type='hidden' name='target_phone' value='{fphone}'>
+                <button type='submit' class='btn' style='padding:6px 12px; font-size:12px; background:rgba(59,130,246,0.2); color:#93c5fd; border:1px solid rgba(59,130,246,0.4);'>👋 Add Friend</button>
+            </form>"""
+        nb_approved_parts.append(f"""
         <div style='padding:12px 16px; background:rgba(16,185,129,0.03); border:1px solid rgba(16,185,129,0.15); border-radius:10px; margin-bottom:8px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;'>
             🟢 <div style='flex:1; min-width:120px;'>
                 <span style='font-weight:600; color:#f1f5f9;'>{html.escape(f['name'])}</span>
                 <span title="Verified & Approved" style="color:#34d399; font-size:14px; margin-left:6px;">✅</span>
             </div>
-            <form action='/portal/friend/request' method='post' style='margin:0;' onsubmit="return confirm('⚠️ Verify this person first!\n\nMake sure you know them or have verified their identity before sending a friend request.\n\nContinue?');">
-                <input type='hidden' name='target_phone' value='{f['phone']}'>
-                <button type='submit' class='btn' style='padding:6px 12px; font-size:12px; background:rgba(59,130,246,0.2); color:#93c5fd; border:1px solid rgba(59,130,246,0.4);'>👋 Add Friend</button>
-            </form>
-            <form action='/portal/flag-node' method='post' style='margin:0;'><input type='hidden' name='target_phone' value='{f['phone']}'><button type='submit' class='btn btn-danger' style='padding:4px 10px; font-size:11px; border-radius:6px;'>Flag</button></form>
+            {friend_btn}
+            <form action='/portal/flag-node' method='post' style='margin:0;'><input type='hidden' name='target_phone' value='{fphone}'><button type='submit' class='btn btn-danger' style='padding:4px 10px; font-size:11px; border-radius:6px;'>Flag</button></form>
             <span style='font-size:11px; color:var(--accent-emerald); background:rgba(16,185,129,0.1); padding:2px 8px; border-radius:4px;'>Verified</span>
-        </div>""" for f in approved_neighbors])
+        </div>""")
+    nb_approved = "".join(nb_approved_parts)
 
     # --- Direct Messages / Peer Lookup logic ---
     peer_card_html = ""
@@ -2557,9 +2855,12 @@ async def farmer_feed_portal(
                     <button type="submit" style="background:rgba(239,68,68,0.2); border:1px solid rgba(239,68,68,0.5); color:#fecaca; font-size:13px; font-weight:700; padding:10px 16px; border-radius:8px; cursor:pointer;">🚩 Report</button>
                 </form>"""
 
-                # Friend request button (built outside f-string to avoid escaping issues)
-                if is_friend:
+                # Friend request button
+                fstatus = friend_status_map.get(peer_phone)
+                if is_friend or fstatus == 'accepted':
                     friend_request_btn = '<span style="color:#34d399; font-weight:700; font-size:13px;">✅ Already friends</span>'
+                elif fstatus == 'pending':
+                    friend_request_btn = '<span style="color:#fbbf24; font-weight:700; font-size:13px;">⏳ Pending friend request</span>'
                 else:
                     friend_request_btn = (
                         f'<form action="/portal/friend/request" method="post" style="margin:0;" '
@@ -2773,6 +3074,36 @@ async def farmer_feed_portal(
             </div>
 
             <div id="tab_incidents" style="{show_incidents}">
+                <div class="portal-grid" style="grid-template-columns: 1fr; margin-top:24px;">
+                    <div class="portal-card" style="border-color: rgba(239,68,68,0.2);"><div class="card-header" style="border-color: rgba(239,68,68,0.15);">🛡️ <h3 class="card-title" style="color:#ef4444;">Active Sector Threat Vectors</h3></div>{echo_feed_html or '<div style="text-align:center; padding:20px; color:var(--text-muted); font-style:italic; font-size:14px;">🟢 Secure baseline. Local sector is quiet.</div>'}</div>
+                    <div class="portal-card" style="border-color: rgba(245,158,11,0.2);">
+                        <div class="card-header" style="border-color: rgba(245,158,11,0.15);">🚨 <h3 class="card-title" style="color:var(--accent-amber);">Broadcast Emergency Panic Vector</h3></div>
+                        <form id="emergency_form" action="/portal/alert/raise" method="post" enctype="multipart/form-data" onsubmit="executeTransmissionSequence(event)">
+                            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:15px; margin-bottom:15px;">
+                                <div>
+                                    <label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700; text-transform:uppercase; letter-spacing:0.04em;">Classification</label>
+                                    <select id="alert_type" name="alert_type" style="width:100%; padding:14px 16px; font-size:15px; background:#0f172a; border:1.5px solid rgba(239,68,68,0.4); color:#f1f5f9; border-radius:12px; appearance:none; background-image:url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2212%22 height=%228%22><path fill=%22%2394a3b8%22 d=%22M0 0l6 8 6-8z%22/></svg>'); background-repeat:no-repeat; background-position:right 14px center; cursor:pointer;">
+                                        <option value="Intruder Spotted">Intruder Spotted</option>
+                                        <option value="Critical Disaster">Critical Disaster</option>
+                                        <option value="Armed Attack">Armed Attack</option>
+                                        <option value="Police Brutality">Police Brutality</option>
+                                        <option value="Kidnapping">Kidnapping</option>
+                                        <option value="Assault">Assault</option>
+                                        <option value="Child Abuse">Child Abuse</option>
+                                        <option value="Rape">Rape</option>
+                                        <option value="Land Grabbing">Land Grabbing</option>
+                                    </select>
+                                </div>
+                                <div><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">Tactical Coordinates</label><input type="text" id="alert_message" name="message" placeholder="State coordinates..." required></div>
+                            </div>
+                            <div style="margin-bottom:20px;"><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">📷 Attach Video Clip Evidence (Optional)</label><input type="file" name="video_evidence" accept="video/*" style="background:#090d16; color:white; padding:10px; border-radius:12px; border:1px solid var(--border-glass); width:100%;"></div>
+                            <button type="submit" id="panic_btn" class="btn" style="width:100%; padding:16px; background:#ef4444; color:white; font-size:15px; font-weight:bold; box-shadow: 0 4px 20px rgba(239,68,68,0.25);">📡 Execute Strategic Grid Alarm</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <div id="tab_community" style="{show_community}">
                 <div class="portal-grid">
                     <div class="portal-card">
                         <div class="card-header">🌤️ <h3 class="card-title">Live Weather</h3></div>
@@ -2916,26 +3247,7 @@ async def farmer_feed_portal(
                     </div>
                     <p id="radio_status" style="font-size:13px; color:#94a3b8; margin:8px 0 0 0;">Stopped — choose a station and press Play</p>
                     <audio id="radio_audio" crossorigin="anonymous" preload="none" style="display:none;"></audio>
-                </div>
 
-                <div class="portal-grid" style="grid-template-columns: 1fr; margin-top:24px;">
-                    <div class="portal-card" style="border-color: rgba(239,68,68,0.2);"><div class="card-header" style="border-color: rgba(239,68,68,0.15);">🛡️ <h3 class="card-title" style="color:#ef4444;">Active Sector Threat Vectors</h3></div>{echo_feed_html or '<div style="text-align:center; padding:20px; color:var(--text-muted); font-style:italic; font-size:14px;">🟢 Secure baseline. Local sector is quiet.</div>'}</div>
-                    <div class="portal-card" style="border-color: rgba(245,158,11,0.2);">
-                        <div class="card-header" style="border-color: rgba(245,158,11,0.15);">🚨 <h3 class="card-title" style="color:var(--accent-amber);">Broadcast Emergency Panic Vector</h3></div>
-                        <form id="emergency_form" action="/portal/alert/raise" method="post" enctype="multipart/form-data" onsubmit="executeTransmissionSequence(event)">
-                            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:15px; margin-bottom:15px;">
-                                <div><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">Classification</label><select id="alert_type" name="alert_type"><option value="Intruder Spotted">⚠️ Intruder Spotted</option><option value="Critical Disaster">🔥 Critical Disaster</option><option value="Armed Attack">⚔️ Armed Attack</option></select></div>
-                                <div><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">Tactical Coordinates</label><input type="text" id="alert_message" name="message" placeholder="State coordinates..." required></div>
-                            </div>
-                            <div style="margin-bottom:20px;"><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">📷 Attach Video Clip Evidence (Optional)</label><input type="file" name="video_evidence" accept="video/*" style="background:#090d16; color:white; padding:10px; border-radius:12px; border:1px solid var(--border-glass); width:100%;"></div>
-                            <button type="submit" id="panic_btn" class="btn" style="width:100%; padding:16px; background:#ef4444; color:white; font-size:15px; font-weight:bold; box-shadow: 0 4px 20px rgba(239,68,68,0.25);">📡 Execute Strategic Grid Alarm</button>
-                        </form>
-                    </div>
-                </div>
-            </div>
-
-            <div id="tab_community" style="{show_community}">
-                <div class="portal-grid">
                     {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Friend request sent! It will appear under their Requests.</div></div>') if friend_sent else ''}
                     {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Profile updated successfully.</div></div>') if profile_updated else ''}
                     <div class="portal-card" style="grid-column:1 / -1; background:linear-gradient(145deg, rgba(22,52,38,0.9), rgba(18,40,48,0.85)); border:1px solid rgba(52,211,153,0.2);">
@@ -2979,30 +3291,16 @@ async def farmer_feed_portal(
                             </div>
                         </div>
                     </div>
-                    <div class="portal-card">
-                        <div class="card-header">✅ <h3 class="card-title">Daily Check-in</h3></div>
-                        <p style="font-size:14px; color:#cbd5e1; margin:0 0 14px 0;">Let neighbours know you are safe today.</p>
-                        <form action="/portal/checkin" method="post">
-                            <button type="submit" class="btn btn-emerald" style="width:100%; padding:16px; font-size:17px; {checked_in_btn}">{checked_in_label}</button>
+
+                    <div class="portal-card" style="grid-column:1 / -1;">
+                        <div class="card-header">📝 <h3 class="card-title">Status Feed</h3></div>
+                        <p style="font-size:13px; color:#94a3b8; margin:0 0 12px 0;">Post an update. Friends can like, comment, or repost to grow the network.</p>
+                        <form action="/portal/status/post" method="post" style="display:flex; gap:10px; margin-bottom:16px;">
+                            <input type="text" name="content" maxlength="280" required placeholder="What's happening on the farm…"
+                                   style="flex:1; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px;">
+                            <button type="submit" class="btn btn-emerald" style="padding:12px 18px;">Post</button>
                         </form>
-                        <div style="margin-top:18px; max-height:200px; overflow-y:auto;">
-                            <div style="font-size:12px; color:var(--text-muted); text-transform:uppercase; font-weight:700; margin-bottom:8px;">Who checked in (24h)</div>
-                            {checkins_html}
-                        </div>
-                    </div>
-
-                    <div class="portal-card">
-                        <div class="card-header">💡 <h3 class="card-title">Tip of the Day</h3></div>
-                        <p style="font-size:16px; color:#f1f5f9; line-height:1.55; margin:0;">{tip_of_day}</p>
-                        <div style="margin-top:16px; padding:12px; background:rgba(16,185,129,0.08); border-radius:10px; font-size:13px; color:#a7f3d0;">
-                            Weekly challenge: Log a soil reading or verify a neighbour — earn XP!
-                        </div>
-                    </div>
-
-                    <div class="portal-card">
-                        <div class="card-header">🏆 <h3 class="card-title">LGA Leaderboard</h3></div>
-                        <p style="font-size:13px; color:#94a3b8; margin:0 0 12px 0;">Top farmers in your sector by Grid XP</p>
-                        <div style="max-height:320px; overflow-y:auto;">{leaderboard_html}</div>
+                        <div style="max-height:480px; overflow-y:auto;">{status_html}</div>
                     </div>
 
                     <div class="portal-card" style="grid-column:1 / -1;">
@@ -3367,6 +3665,22 @@ async def farmer_feed_portal(
             }}, 20000);
 
         </script>
+        <div style="position:fixed; bottom:0; left:0; right:0; background:rgba(15,23,42,0.95); border-top:1px solid rgba(52,211,153,0.3); padding:8px 0; z-index:1000; overflow:hidden;">
+            <div style="display:flex; align-items:center; gap:12px; padding:0 12px;">
+                <form action="/portal/checkin" method="post" style="margin:0; flex-shrink:0;">
+                    <button type="submit" style="background:rgba(16,185,129,0.2); border:1px solid rgba(16,185,129,0.4); color:#6ee7b7; padding:6px 12px; border-radius:8px; font-size:12px; font-weight:700; cursor:pointer; {checked_in_btn}">{checked_in_label}</button>
+                </form>
+                <div style="flex:1; overflow:hidden; white-space:nowrap;">
+                    <div style="display:inline-block; animation:ticker 40s linear infinite; color:#cbd5e1; font-size:14px;">
+                        {html.escape(ticker_text)} &nbsp;&nbsp;&nbsp; {html.escape(ticker_text)}
+                    </div>
+                </div>
+            </div>
+        </div>
+        <style>
+            @keyframes ticker {{ from {{ transform: translateX(0); }} to {{ transform: translateX(-50%); }} }}
+            body {{ padding-bottom: 70px !important; }}
+        </style>
     </body></html>"""
 
 
@@ -3469,6 +3783,18 @@ async def handle_incoming_alert(From: Optional[str] = Form(None), Body: Optional
         alert_type = "Intruder Spotted"
     elif "attack" in msg_lower or "armed" in msg_lower:
         alert_type = "Armed Attack"
+    elif "police" in msg_lower or "brutality" in msg_lower:
+        alert_type = "Police Brutality"
+    elif "kidnap" in msg_lower:
+        alert_type = "Kidnapping"
+    elif "assault" in msg_lower or "beat" in msg_lower:
+        alert_type = "Assault"
+    elif "child" in msg_lower and ("abuse" in msg_lower or "molest" in msg_lower):
+        alert_type = "Child Abuse"
+    elif "rape" in msg_lower or "sexual" in msg_lower:
+        alert_type = "Rape"
+    elif "land" in msg_lower and ("grab" in msg_lower or "seize" in msg_lower):
+        alert_type = "Land Grabbing"
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute(
             "INSERT INTO alerts_log (type, sender, lga, message, status, video_path) VALUES (?, ?, ?, ?, 'Active', NULL)",
@@ -3477,8 +3803,24 @@ async def handle_incoming_alert(From: Optional[str] = Form(None), Body: Optional
     return Response(content="<Response></Response>", media_type="application/xml")
 
 
+@app.post("/admin/login")
+async def admin_login(username: str = Form(...), password: str = Form(...)):
+    input_hash = hashlib.sha256(password.encode()).hexdigest()
+    if hmac.compare_digest(username, ADMIN_USERNAME) and hmac.compare_digest(input_hash, ADMIN_SECRET_HASH):
+        resp = RedirectResponse("/dashboard", status_code=303)
+        resp.set_cookie("admin_session", sign_cookie_value(ADMIN_USERNAME), httponly=True, samesite="lax", max_age=86400)
+        return resp
+    # Wrong credentials
+    return RedirectResponse("/?admin_error=1", status_code=303)
+
+@app.get("/admin/logout")
+def admin_logout():
+    r = RedirectResponse("/", status_code=303)
+    r.delete_cookie("admin_session")
+    return r
+
 @app.get("/", response_class=HTMLResponse)
-def community_homepage():
+def community_homepage(admin_error: Optional[str] = None):
     clean_logo_svg = """
     <svg width="90" height="90" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 16px rgba(16,185,129,0.35)); margin-bottom: 10px;">
         <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
@@ -3486,6 +3828,13 @@ def community_homepage():
         <circle cx="12" cy="11" r="1" fill="#10b981"/>
     </svg>
     """
+    error_html = ""
+    if admin_error:
+        error_html = '''
+        <div style="background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.3); color:#f87171; padding:12px; border-radius:10px; margin-bottom:16px; font-size:14px;">
+            Enter correct login or email admin.
+        </div>
+        '''
     return f"""<html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -3494,6 +3843,14 @@ def community_homepage():
             .welcome-title {{ margin: 5px 0 8px 0; font-size: 32px; font-weight: 900; letter-spacing: -0.02em; color: #fff; }}
             .subtitle {{ color: #cbd5e1; line-height: 1.65; font-size: 17px; margin: 0 auto 32px auto; max-width: 420px; }}
             .action-link {{ padding: 20px; font-size: 18px; font-weight: 800; color: #ffffff; border-radius: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }}
+            details summary {{ cursor: pointer; list-style: none; }}
+            details summary::-webkit-details-marker {{ display: none; }}
+            .admin-toggle {{
+                width: 100%;
+                box-sizing: border-box;
+                text-align: center;
+                margin-top: 14px;
+            }}
         </style>
     </head>
     <body>
@@ -3513,6 +3870,22 @@ def community_homepage():
                 <a href="/portal/login" class="btn action-link" style="background: rgba(59,130,246,0.15); border: 2px solid rgba(59,130,246,0.4); color: #93c5fd;">
                     I Already Have an Account — Sign In
                 </a>
+                <details class="admin-toggle" style="margin-top:0;">
+                    <summary class="btn action-link" style="background:rgba(245,158,11,0.12); color:#fbbf24; border:2px solid rgba(245,158,11,0.4); width:100%; box-sizing:border-box;">
+                        Admin Command Center Login
+                    </summary>
+                    <div style="margin-top:16px; padding:16px; background:rgba(0,0,0,0.2); border-radius:12px; text-align:left;">
+                        {error_html}
+                        <form action="/admin/login" method="post">
+                            <label style="color:var(--text-muted); font-size:13px;">Admin Username</label>
+                            <input type="text" name="username" required style="width:100%; padding:12px; margin:6px 0 12px; background:#090d16; border:1px solid var(--border-glass); color:#fff; border-radius:10px; box-sizing:border-box;">
+                            <label style="color:var(--text-muted); font-size:13px;">Admin Password</label>
+                            <input type="password" name="password" required style="width:100%; padding:12px; margin:6px 0 16px; background:#090d16; border:1px solid var(--border-glass); color:#fff; border-radius:10px; box-sizing:border-box;">
+                            <button type="submit" class="btn btn-emerald" style="width:100%;">Enter Command Center</button>
+                        </form>
+                        <p style="font-size:11px; color:#64748b; margin-top:10px; text-align:center;">For authorized administrators only.</p>
+                    </div>
+                </details>
             </div>
         </div>
     </body>
