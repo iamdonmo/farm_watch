@@ -19,9 +19,11 @@ import json
 import httpx
 import asyncio
 import aiosqlite
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, List
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Form, Response, Depends, HTTPException, status, Cookie, File, UploadFile, Query, Request
+from fastapi import BackgroundTasks, FastAPI, Form, Response, Depends, HTTPException, status, Cookie, File, UploadFile, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -46,6 +48,7 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "whatsapp:+14155238886")
 SITE_URL = os.getenv("SITE_URL", "https://olode.com.ng")
+ENABLE_DEMO_DATA = os.getenv("ENABLE_DEMO_DATA", "").strip().lower() in {"1", "true", "yes"}
 
 if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
     print("WARNING: Twilio credentials not set. WhatsApp alerts will fail.")
@@ -89,6 +92,7 @@ MAX_SHOUTOUT_LEN = 120
 MAX_PRODUCT_TITLE = 80
 MAX_PRODUCT_DESC = 300
 PRODUCT_CATEGORIES = ("Crops", "Livestock", "Tools", "Seeds", "Produce", "Other")
+FAITH_PREFERENCES = ("Christian", "Muslim", "Traditionalist", "Atheist", "Private")
 LIVESTOCK_TYPES = ("Dog", "Birds", "Cow", "Goats", "Chicken", "Exotic Pets")
 DOG_SEX = ("Male", "Female")
 COW_BREEDS = ("White Fulani", "Red Bororo", "Sokoto Gudali", "Muturu", "Ndama", "Holstein", "Other")
@@ -116,8 +120,26 @@ async def lifespan(app: FastAPI):
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS farmers (
                 phone TEXT PRIMARY KEY, name TEXT, country TEXT, state TEXT, 
-                city TEXT, lga TEXT, area TEXT, token TEXT, status TEXT, xp INTEGER DEFAULT 100
+                city TEXT, lga TEXT, area TEXT, token TEXT, status TEXT, xp INTEGER DEFAULT 100,
+                faith_preference TEXT NOT NULL DEFAULT 'Private',
+                is_demo INTEGER NOT NULL DEFAULT 0
             );
+        """)
+        async with conn.execute("PRAGMA table_info(farmers)") as cursor:
+            farmer_columns = {row[1] for row in await cursor.fetchall()}
+        if "faith_preference" not in farmer_columns:
+            await conn.execute(
+                "ALTER TABLE farmers ADD COLUMN faith_preference TEXT NOT NULL DEFAULT 'Private'"
+            )
+        if "is_demo" not in farmer_columns:
+            await conn.execute(
+                "ALTER TABLE farmers ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0"
+            )
+        await conn.execute("""
+            UPDATE farmers
+            SET is_demo = 1,
+                name = CASE WHEN name LIKE 'DEMO: %' THEN name ELSE 'DEMO: ' || name END
+            WHERE token = 'mock_token'
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS alerts_log (
@@ -290,6 +312,50 @@ async def lifespan(app: FastAPI):
             );
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS trust_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                owner_phone TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS trust_group_members (
+                group_id INTEGER NOT NULL,
+                farmer_phone TEXT NOT NULL,
+                joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                whatsapp_enabled INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (group_id, farmer_phone)
+            );
+        """)
+        async with conn.execute("PRAGMA table_info(trust_group_members)") as cursor:
+            trust_member_columns = {row[1] for row in await cursor.fetchall()}
+        if "whatsapp_enabled" not in trust_member_columns:
+            await conn.execute(
+                "ALTER TABLE trust_group_members ADD COLUMN whatsapp_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS trust_trips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                farmer_phone TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                note TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                ended_at DATETIME
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS trust_trip_checkins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trip_id INTEGER NOT NULL,
+                farmer_phone TEXT NOT NULL,
+                xp_awarded INTEGER NOT NULL DEFAULT 0,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS spotify_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 farmer_phone TEXT NOT NULL,
@@ -378,6 +444,71 @@ def sanitize(text: str) -> str:
     return html.escape(text.strip())
 
 
+async def can_view_status(conn, status_id: int, viewer_phone: str) -> bool:
+    async with conn.execute("""
+        SELECT s.author_phone
+        FROM statuses s
+        JOIN farmers f ON f.phone = s.author_phone
+        WHERE s.id = ? AND f.status = 'Approved'
+    """, (status_id,)) as cursor:
+        status = await cursor.fetchone()
+    if not status:
+        return False
+    author_phone = status["author_phone"] if isinstance(status, aiosqlite.Row) else status[0]
+    if author_phone == viewer_phone:
+        return True
+    async with conn.execute("""
+        SELECT 1 FROM friendships
+        WHERE status = 'accepted'
+          AND ((requester_phone = ? AND receiver_phone = ?)
+            OR (requester_phone = ? AND receiver_phone = ?))
+    """, (viewer_phone, author_phone, author_phone, viewer_phone)) as cursor:
+        return await cursor.fetchone() is not None
+
+
+def render_status_card(status, comments) -> str:
+    author_phone = html.escape(str(status["author_phone"]), quote=True)
+    author_name = html.escape(status["author_name"] or "")
+    author_link = (
+        f'<a href="/portal/feed?active_tab=community&view_profile={author_phone}" '
+        f'style="color:#f1f5f9; text-decoration:none;">{author_name}</a>'
+    )
+    comments_html = "".join(
+        f'<div style="font-size:13px; margin:4px 0; color:#cbd5e1;">'
+        f'<b style="color:#6ee7b7;">{html.escape(c["author_name"] or "")}</b>: '
+        f'{html.escape(c["text"])}</div>'
+        for c in comments
+    )
+    return f"""
+    <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:14px; margin-bottom:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div style="font-weight:700;">{author_link}</div>
+            <span style="font-size:11px; color:#64748b;">{html.escape(str(status['timestamp']))}</span>
+        </div>
+        <p style="margin:10px 0; color:#e2e8f0; font-size:15px; line-height:1.4;">{html.escape(status['content'])}</p>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
+            <form action="/portal/status/like" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{status['id']}"><button type="submit" style="background:none;border:none;color:#60a5fa;cursor:pointer;font-size:13px;">👍 {status['likes']}</button></form>
+            <form action="/portal/status/repost" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{status['id']}"><button type="submit" style="background:none;border:none;color:#34d399;cursor:pointer;font-size:13px;">🔁 Repost</button></form>
+            <form action="/portal/status/hide" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{status['id']}"><button type="submit" style="background:none;border:none;color:#94a3b8;cursor:pointer;font-size:13px;">🙈 Hide</button></form>
+            <form action="/portal/status/report" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{status['id']}"><input type="hidden" name="reason" value="Inappropriate"><button type="submit" style="background:none;border:none;color:#f87171;cursor:pointer;font-size:13px;">🚩 Report</button></form>
+        </div>
+        {comments_html}
+        <form action="/portal/status/comment" method="post" style="display:flex; gap:6px; margin-top:8px;">
+            <input type="hidden" name="status_id" value="{status['id']}">
+            <input type="text" name="text" placeholder="Comment or reply…" maxlength="200" required style="flex:1; padding:8px; font-size:13px; background:#1e293b; border:1px solid #475569; color:#fff; border-radius:8px; margin:0;">
+            <button type="submit" class="btn btn-blue" style="padding:6px 12px; font-size:12px;">Reply</button>
+        </form>
+    </div>"""
+
+
+async def is_trust_group_member(conn, group_id: int, farmer_phone: str) -> bool:
+    async with conn.execute(
+        "SELECT 1 FROM trust_group_members WHERE group_id = ? AND farmer_phone = ?",
+        (group_id, farmer_phone)
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
 def sign_cookie_value(value: str) -> str:
     signature = hmac.new(COOKIE_SIGNING_KEY, value.encode(), hashlib.sha256).hexdigest()
     return f"{value}.{signature}"
@@ -398,17 +529,44 @@ def mask_phone_number(phone: str) -> str:
 
 
 async def async_dispatch_whatsapp(to_number: str, message_text: str):
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        print("WhatsApp dispatch skipped: Twilio credentials are not configured.")
+        return
     async with DISPATCH_SEMAPHORE:
         url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
-        clean_target = f"whatsapp:+{clean_phone(to_number)}" if not to_number.startswith(
-            "+") else f"whatsapp:{to_number}"
+        digits = clean_phone(to_number)
+        if len(digits) == 11 and digits.startswith("0"):
+            digits = "234" + digits[1:]
+        clean_target = f"whatsapp:+{digits}"
         payload = {"To": clean_target, "From": TWILIO_PHONE_NUMBER, "Body": message_text}
         async with httpx.AsyncClient(timeout=5.0) as client:
             try:
                 res = await client.post(url, data=payload, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
                 print(f"📡 Background Dispatch Status: {res.status_code}")
+                if res.is_error:
+                    print(f"WhatsApp dispatch failed for {clean_target}: {res.text[:300]}")
             except Exception as e:
                 print(f"❌ Non-blocking network alert exception: {e}")
+
+
+async def send_trust_group_whatsapp_alert(group_id: int, sender_phone: str, message: str):
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        return
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute("""
+            SELECT tgm.farmer_phone
+            FROM trust_group_members tgm
+            JOIN farmers f ON f.phone = tgm.farmer_phone
+            WHERE tgm.group_id = ?
+              AND tgm.farmer_phone != ?
+              AND tgm.whatsapp_enabled = 1
+              AND f.status = 'Approved'
+        """, (group_id, sender_phone)) as cursor:
+            recipients = [row[0] for row in await cursor.fetchall()]
+    if recipients:
+        await asyncio.gather(
+            *(async_dispatch_whatsapp(phone, message) for phone in recipients)
+        )
 
 
 async def get_realtime_weather(lga: str) -> dict:
@@ -492,6 +650,126 @@ async def get_realtime_weather(lga: str) -> dict:
             }
         except Exception:
             return fallback
+
+
+async def get_prayer_times(city: str) -> dict | None:
+    """Fetch today's prayer times for a Muslim user's chosen city."""
+    if not city.strip():
+        return None
+    local_date = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%d-%m-%Y")
+    url = f"https://api.aladhan.com/v1/timingsByCity/{local_date}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                url,
+                params={"city": city, "country": "Nigeria", "method": 3},
+            )
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        timings = data.get("data", {}).get("timings", {})
+        keys = ("Fajr", "Dhuhr", "Asr", "Maghrib", "Isha")
+        if not all(timings.get(key) for key in keys):
+            return None
+        return {key: timings[key].split(" ")[0] for key in keys}
+    except (httpx.RequestError, ValueError):
+        return None
+
+
+async def render_faith_card(preference: str, city: str) -> str:
+    """Render optional, private content based on a user's own preference."""
+    audio_stations = {
+        "Christian": (
+            "Nigerian Gospel Music Radio",
+            "https://stream.zeno.fm/3fmqr74a7f8uv",
+            "Gospel radio; Sunday service availability follows the station's schedule.",
+        ),
+        "Muslim": (
+            "Qurango — Tarateel",
+            "https://qurango.net/radio/tarateel",
+            "Qur'an recitation stream via MP3Quran.",
+        ),
+        "Traditionalist": (
+            "Afrikana Radio — Live African",
+            "https://radio.afrikanabestsounds.com/listen/live_african/radio.mp3",
+            "African music and culture; this is not a traditional worship service.",
+        ),
+        "Atheist": (
+            "Nature Radio Rain",
+            "https://maggie.torontocast.com:2020/stream/natureradiorain",
+            "A calm nature-sounds stream.",
+        ),
+    }
+    content = {
+        "Christian": (
+            "Optional reading: Luke 10:25–37. Reflect on one practical way to care "
+            "for a neighbour today."
+        ),
+        "Traditionalist": (
+            "Explore local cultural and harvest celebrations with your community. "
+            "Examples include Osun-Osogbo and New Yam festivals; customs and dates "
+            "vary by place, so confirm details with local organizers."
+        ),
+        "Atheist": (
+            "A secular wellbeing prompt: take a short pause, notice one thing that "
+            "went well today, and choose one helpful next step."
+        ),
+        "Private": (
+            "Faith-based personalization is off. You can choose or change this "
+            "private preference in Edit Profile at any time."
+        ),
+    }
+    if preference == "Muslim":
+        prayer_times = await get_prayer_times(city)
+        if prayer_times:
+            schedule = " · ".join(
+                f"{html.escape(name)} {html.escape(time)}"
+                for name, time in prayer_times.items()
+            )
+            text = (
+                f"Today's prayer times for {html.escape(city)}: {schedule}. "
+                "Times are provided by AlAdhan and may vary by calculation method "
+                "or local mosque."
+            )
+        else:
+            text = (
+                "Prayer times are temporarily unavailable for your city. Check a "
+                "local mosque for today's schedule."
+            )
+        content["Muslim"] = (
+            "Optional Qur'an reading: Al-Hujurat 49:13, on knowing and respecting "
+            "one another. " + text
+        )
+    text = content.get(preference, content["Private"])
+    station = audio_stations.get(preference)
+    if station:
+        station_name, stream_url, station_note = station
+        audio_html = f"""
+        <div style="border-top:1px solid rgba(255,255,255,0.06); margin-top:14px; padding-top:12px;">
+            <div style="font-size:13px; font-weight:700; color:#e2e8f0; margin-bottom:8px;">🎧 Listen here: {html.escape(station_name)}</div>
+            <audio controls preload="none" aria-label="Play {html.escape(station_name)}"
+                   onerror="document.getElementById('faith_audio_status').style.display='block';"
+                   style="display:block; width:100%; min-height:46px;">
+                <source src="{html.escape(stream_url, quote=True)}" type="audio/mpeg">
+                Your browser cannot play this audio stream.
+            </audio>
+            <p id="faith_audio_status" role="status" style="display:none; font-size:12px; color:#fbbf24; margin:8px 0 0;">This stream is temporarily unavailable. Please try again later.</p>
+            <p style="font-size:11px; color:#94a3b8; margin:8px 0 0;">Tap Play on this player; it stays on this page. {html.escape(station_note)} Data charges may apply.</p>
+        </div>"""
+    else:
+        audio_html = (
+            '<p style="font-size:12px; color:#94a3b8; margin:12px 0 0;">'
+            'Choose a content preference in Edit Profile if you would like a matching audio stream.</p>'
+        )
+    return (
+        '<div class="portal-card" style="margin-top:16px;">'
+        '<div class="card-header">🌿 <h3 class="card-title">Your optional daily reflection</h3></div>'
+        f'<p style="font-size:13px; color:#cbd5e1; margin:0; line-height:1.6;">{text}</p>'
+        f'{audio_html}'
+        '<p style="font-size:11px; color:#94a3b8; margin:10px 0 0;">'
+        'Visible only to you. For prayer times, your city is sent to AlAdhan. Religious and cultural dates can vary by locality.</p>'
+        '</div>'
+    )
 
 
 async def get_latest_soil_reading(farmer_phone: str, lga: str) -> dict:
@@ -605,7 +883,7 @@ async def get_current_farmer(farmer_session: Optional[str] = Cookie(None)):
         conn.row_factory = aiosqlite.Row
         async with conn.execute("SELECT * FROM farmers WHERE phone = ?", (verified_phone,)) as cursor:
             row = await cursor.fetchone()
-            return dict(row) if row else None
+            return dict(row) if row and not row["is_demo"] else None
 
 
 @app.post("/portal/auth")
@@ -625,6 +903,8 @@ async def farmer_authentication(phone: str = Form(...), password: str = Form(...
             farmer = await cursor.fetchone()
         if not farmer:
             return RedirectResponse(url="/portal/login?error=Phone number not recognized on network scale.", status_code=303)
+        if farmer["is_demo"]:
+            return RedirectResponse(url="/portal/login?error=Demo profiles cannot sign in.", status_code=303)
         stored = farmer["password_hash"] if "password_hash" in farmer.keys() else None
         if not stored:
             await conn.execute("UPDATE farmers SET password_hash = ? WHERE phone = ?", (pw_hash, target))
@@ -643,7 +923,15 @@ async def farmer_authentication(phone: str = Form(...), password: str = Form(...
 
 
 @app.post("/submit-registration")
-async def handle_registration(name: str = Form(...), phone: str = Form(...), city_manual: str = Form(...), password: str = Form(...)):
+async def handle_registration(
+    name: str = Form(...),
+    phone: str = Form(...),
+    city_manual: str = Form(...),
+    password: str = Form(...),
+    faith_preference: str = Form("Private"),
+):
+    if faith_preference not in FAITH_PREFERENCES:
+        raise HTTPException(status_code=422, detail="Choose a valid faith-content preference")
     clean_p = normalize_nigerian_mobile(phone)
     if not clean_p:
         return HTMLResponse(content=f"""
@@ -670,7 +958,7 @@ async def handle_registration(name: str = Form(...), phone: str = Form(...), cit
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         async with conn.execute(
-            "SELECT phone FROM farmers WHERE phone = ? OR phone = ?",
+            "SELECT phone FROM farmers WHERE (phone = ? OR phone = ?) AND COALESCE(is_demo, 0) = 0",
             (clean_p, alt or clean_p)
         ) as cur:
             existing = await cur.fetchone()
@@ -695,10 +983,15 @@ async def handle_registration(name: str = Form(...), phone: str = Form(...), cit
     pw_hash = hashlib.sha256(password.encode()).hexdigest()
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("""
-            INSERT INTO farmers (phone, name, country, state, city, lga, area, token, status, xp, password_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 100, ?)
-        """, (clean_p, sanitize(name), geo["country"], geo["state"], sanitize(city_manual), geo["lga"], geo["area"],
-              unique_token, pw_hash))
+            INSERT INTO farmers (
+                phone, name, country, state, city, lga, area, token, status, xp,
+                password_hash, faith_preference
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 100, ?, ?)
+        """, (
+            clean_p, sanitize(name), geo["country"], geo["state"],
+            sanitize(city_manual), geo["lga"], geo["area"], unique_token,
+            pw_hash, faith_preference
+        ))
         await conn.commit()
     return HTMLResponse(content=f"""
     <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head>
@@ -848,6 +1141,28 @@ async def admin_direct_approve_farmer(phone: str = Form(...), username: str = De
 async def handle_delete_farmer(phone: str = Form(...), username: str = Depends(authenticate_admin)):
     clean_p = clean_phone(phone)
     async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("""
+            DELETE FROM trust_trip_checkins
+            WHERE farmer_phone = ? OR trip_id IN (
+                SELECT id FROM trust_trips
+                WHERE farmer_phone = ? OR group_id IN (
+                    SELECT id FROM trust_groups WHERE owner_phone = ?
+                )
+            )
+        """, (clean_p, clean_p, clean_p))
+        await conn.execute("""
+            DELETE FROM trust_trips
+            WHERE farmer_phone = ? OR group_id IN (
+                SELECT id FROM trust_groups WHERE owner_phone = ?
+            )
+        """, (clean_p, clean_p))
+        await conn.execute("""
+            DELETE FROM trust_group_members
+            WHERE farmer_phone = ? OR group_id IN (
+                SELECT id FROM trust_groups WHERE owner_phone = ?
+            )
+        """, (clean_p, clean_p))
+        await conn.execute("DELETE FROM trust_groups WHERE owner_phone = ?", (clean_p,))
         await conn.execute("DELETE FROM farmers WHERE phone = ?", (clean_p,))
         await conn.commit()
     return RedirectResponse(url="/dashboard", status_code=303)
@@ -886,7 +1201,12 @@ async def admin_live_threat_feed_stream(username: str = Depends(authenticate_adm
 
 @app.post("/admin/simulate-grid")
 async def admin_simulate_grid_data(username: str = Depends(authenticate_admin)):
-    """Injects mock data for testing. Safe to run multiple times (uses INSERT OR REPLACE)."""
+    """Create labeled demo profiles only when explicitly enabled for an isolated test deployment."""
+    if not ENABLE_DEMO_DATA:
+        raise HTTPException(
+            status_code=403,
+            detail="Demo data is disabled. Enable it only in an isolated test deployment.",
+        )
     mock_farmers = [
         ("08031112201", "Bello Kano", "Kano Municipal", "Kano City Center", 245),
         ("08031112202", "Adewale Osogbo", "Osogbo", "Ataoja Sector", 410),
@@ -932,8 +1252,9 @@ async def admin_simulate_grid_data(username: str = Depends(authenticate_admin)):
     async with aiosqlite.connect(DB_FILE) as conn:
         for phone, name, lga, area, xp in mock_farmers:
             await conn.execute("""
-                INSERT OR REPLACE INTO farmers (phone, name, country, state, city, lga, area, token, status, xp)
-                VALUES (?, ?, 'Nigeria', 'Region', 'City', ?, ?, 'mock_token', 'Approved', ?)
+                INSERT OR IGNORE INTO farmers
+                    (phone, name, country, state, city, lga, area, token, status, xp, is_demo)
+                VALUES (?, 'DEMO: ' || ?, 'Nigeria', 'Region', 'City', ?, ?, 'mock_token', 'Approved', ?, 1)
             """, (phone, name, lga, area, xp))
         await conn.commit()
     return RedirectResponse(url="/dashboard", status_code=303)
@@ -943,6 +1264,10 @@ async def admin_simulate_grid_data(username: str = Depends(authenticate_admin)):
 async def admin_flush_grid_data(username: str = Depends(authenticate_admin)):
     """WARNING: Destructive endpoint. Use with care."""
     async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("DELETE FROM trust_trip_checkins;")
+        await conn.execute("DELETE FROM trust_trips;")
+        await conn.execute("DELETE FROM trust_group_members;")
+        await conn.execute("DELETE FROM trust_groups;")
         await conn.execute("DELETE FROM farmers;")
         await conn.execute("DELETE FROM alerts_log;")
         await conn.execute("DELETE FROM alert_comments;")
@@ -1013,7 +1338,12 @@ async def admin_post_ready_decoy(
     request: Request,
     username: str = Depends(authenticate_admin),
 ):
-    """Post one of the 20 ready-made Nigerian market decoys as an injected farmer. Goes Active immediately. Supports photos."""
+    """Create test listings only in an explicitly enabled isolated demo deployment."""
+    if not ENABLE_DEMO_DATA:
+        raise HTTPException(
+            status_code=403,
+            detail="Demo listings are disabled. Enable them only in an isolated test deployment.",
+        )
     form = await request.form()
     try:
         decoy_index = int(form.get("decoy_index") or -1)
@@ -1061,7 +1391,7 @@ async def admin_post_ready_decoy(
 
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT phone, name, lga FROM farmers WHERE status = 'Approved' ORDER BY RANDOM() LIMIT 1") as cur:
+        async with conn.execute("SELECT phone, name, lga FROM farmers WHERE status = 'Approved' AND COALESCE(is_demo, 0) = 0 ORDER BY RANDOM() LIMIT 1") as cur:
             farmer = await cur.fetchone()
         if not farmer:
             return RedirectResponse(url="/dashboard?decoy_err=nofarmer", status_code=303)
@@ -1081,7 +1411,12 @@ async def admin_post_decoy_product(
     request: Request,
     username: str = Depends(authenticate_admin),
 ):
-    """Post a decoy/test product listing as an injected (or any) farmer. Goes live immediately. Supports photos."""
+    """Create test listings only in an explicitly enabled isolated demo deployment."""
+    if not ENABLE_DEMO_DATA:
+        raise HTTPException(
+            status_code=403,
+            detail="Demo listings are disabled. Enable them only in an isolated test deployment.",
+        )
     form = await request.form()
     farmer_phone = str(form.get("farmer_phone") or "")
     title = str(form.get("title") or "")
@@ -1135,7 +1470,7 @@ async def admin_post_decoy_product(
 
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT name, lga, phone FROM farmers WHERE phone = ?", (clean_phone_num,)) as cur:
+        async with conn.execute("SELECT name, lga, phone FROM farmers WHERE phone = ? AND COALESCE(is_demo, 0) = 0", (clean_phone_num,)) as cur:
             farmer = await cur.fetchone()
         if not farmer:
             return RedirectResponse(url="/dashboard?decoy_err=1", status_code=303)
@@ -1167,22 +1502,23 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
         async with conn.execute("SELECT * FROM farm_products ORDER BY id DESC LIMIT 100") as c4:
             all_products = await c4.fetchall()
 
-    total_nodes = len(all_farmers)
-    pending_clearance = sum(1 for f in all_farmers if f["status"] in RESTRICTED_STATUSES)
+    live_farmers = [f for f in all_farmers if not f["is_demo"]]
+    total_nodes = len(live_farmers)
+    pending_clearance = sum(1 for f in live_farmers if f["status"] in RESTRICTED_STATUSES)
     active_threats = len(active_alerts)
     pulse_class = "pulse" if pending_clearance > 0 else ""
 
     # Safe data preparation for JavaScript extraction
     map_nodes_json = html.escape(json.dumps([
         {"name": f["name"], "lga": f["lga"], "status": f["status"]}
-        for f in all_farmers if f["status"] == "Approved"
+        for f in live_farmers if f["status"] == "Approved"
     ]), quote=True)
     map_threats_json = html.escape(json.dumps([
         {"type": a["type"], "lga": a["lga"]} for a in active_alerts
     ]), quote=True)
 
     pending_html = ""
-    for f in all_farmers:
+    for f in live_farmers:
         if f["status"] in RESTRICTED_STATUSES:
             badge_class = "badge-amber" if f["status"] == STATUS_REPORTED else "badge-blue"
             status_badge = f'<span class="badge {badge_class}">{f["status"]}</span>'
@@ -1200,7 +1536,7 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
     active_nodes_html = ""
     leaderboard_html = ""
     rank = 1
-    for f in all_farmers:
+    for f in live_farmers:
         if f['status'] == 'Approved':
             if rank <= 5:
                 leaderboard_html += f"<tr><td>🏅 <b>#{rank}</b></td><td>{f['name']}</td><td><span class='badge badge-blue'>{f['lga']}</span></td><td style='color:var(--accent-amber); font-weight:bold;'>{f['xp']} XP</td></tr>"
@@ -1240,10 +1576,10 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
     # Farmer dropdown for decoy product posting (injected mock + any approved farmers)
     farmer_options = ""
     for f in all_farmers:
-        if f["status"] == "Approved":
+        if f["status"] == "Approved" and not f["is_demo"]:
             farmer_options += f'<option value="{f["phone"]}">{html.escape(f["name"] or "")} — {html.escape(f["lga"] or "")} ({f["phone"]})</option>'
     if not farmer_options:
-        farmer_options = '<option value="">No approved farmers yet — inject mock data first</option>'
+        farmer_options = '<option value="">No approved farmers yet</option>'
     cat_options = "".join([f'<option value="{c}">{c}</option>' for c in PRODUCT_CATEGORIES])
     decoy_form_html = f'''
     <form action="/admin/post-decoy-product" method="post" enctype="multipart/form-data" style="display:grid; gap:12px; max-width:640px;">
@@ -1298,6 +1634,11 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
     ready_decoys_table = f'<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Item</th><th>Price</th><th>Category</th><th>Details</th><th>Photos + Post</th></tr></thead><tbody>{ready_rows}</tbody></table></div>'
 
     active_table = f'<div style="overflow-x: auto;"><table class="data-table"><thead><tr><th>Node Name</th><th>Phone Address</th><th>Geographic Network Path</th><th>Status</th><th>Management</th></tr></thead><tbody>{active_nodes_html}</tbody></table></div>' if active_nodes_html else '<p style="color: var(--text-muted); font-style: italic; text-align: center;">No active nodes operating on current security grid.</p>'
+    demo_controls_html = (
+        '<form action="/admin/simulate-grid" method="post" style="margin:0;"><button type="submit" class="btn btn-emerald">⚙️ Add labeled demo data</button></form>'
+        if ENABLE_DEMO_DATA else
+        '<span style="font-size:12px; color:#94a3b8;">Demo data and listings are disabled outside test deployments.</span>'
+    )
 
     reports_rows = ""
     for r in recent_reports:
@@ -1325,7 +1666,7 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
                 <div><h1>📡 Global Command Control</h1><p style="margin: 4px 0 0 0; color: var(--text-muted); font-size: 14px;">Farm Watch Security Operations Matrix</p></div>
                 <div style="display: flex; gap: 10px; align-items: center;">
                     <a href="/" class="btn" style="background: rgba(255,255,255,0.08); color: #e2e8f0; border: 1px solid var(--border-glass); padding: 10px 18px; font-size: 13px;">🏠 Exit to Home</a>
-                    <form action="/admin/simulate-grid" method="post" style="margin:0;"><button type="submit" class="btn btn-emerald">⚙️ Inject Mock Data</button></form>
+                    {demo_controls_html}
                     <form action="/admin/flush-grid" method="post" style="margin:0;"><button type="submit" class="btn btn-danger">🗑️ Flush Grid Records</button></form>
                 </div>
             </div>
@@ -1340,8 +1681,8 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
             </div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🏆 Node Reliability Leaderboard</h3><table class="data-table"><thead><tr><th>Rank</th><th>Farmer Deployed Node Name</th><th>Grid Sector Focus</th><th>Network Rating</th></tr></thead><tbody>{leaderboard_html or "<tr><td colspan='4' style='color:var(--text-muted); font-style:italic;'>No XP metrics available.</td></tr>"}</tbody></table></div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3><span style="color: #ef4444;" class="pulse">&bull;</span> Real-Time Emergency Vector Feed</h3><div id="live_threat_feed_target"><p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">Connecting link matrix...</p></div></div>
-            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⚡ 20 Ready Nigerian Market Decoys</h3><p style="color:var(--text-muted); font-size:14px; margin:0 0 16px 0;">One click posts the listing as a random injected farmer. Goes <b>Active / online</b> immediately. (Inject Mock Data first.)</p>{ready_decoys_table}</div>
-            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🧪 Post Decoy Listing (from injected farmers)</h3><p style="color:var(--text-muted); font-size:14px; margin:0 0 16px 0;">Use injected mock farmers to post test items. Listings go <b>Active / online</b> immediately so you can see them in the market.</p>{decoy_form_html}</div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⚡ Demo Market Listings</h3><p style="color:var(--text-muted); font-size:14px; margin:0 0 16px 0;">Available only when ENABLE_DEMO_DATA is explicitly enabled on an isolated test deployment. Never enable on the live marketplace.</p>{ready_decoys_table}</div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🧪 Demo Listing Creator</h3><p style="color:var(--text-muted); font-size:14px; margin:0 0 16px 0;">Test listings are disabled on production deployments.</p>{decoy_form_html}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🛒 Manage Adverts / Products</h3>{pending_products_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⏳ Executive Node Approvals Pending</h3>{pending_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🚩 Recent Message Reports</h3>{reports_table}</div>
@@ -1480,6 +1821,20 @@ def registration_form():
                 <input type='text' name='city_manual' placeholder='Example: Osogbo' required autocomplete='address-level2'>
                 <p class="field-help">
                     Write the name of your town (e.g. Osogbo, Ibadan, Ile-Ife, Ogbomoso)
+                </p>
+
+                <label>Optional: Content preference</label>
+                <select name="faith_preference">
+                    <option value="Private" selected>Private / no personalization</option>
+                    <option value="Christian">Christian</option>
+                    <option value="Muslim">Muslim</option>
+                    <option value="Traditionalist">Traditionalist</option>
+                    <option value="Atheist">Atheist / secular</option>
+                </select>
+                <p class="field-help">
+                    This is voluntary and private. It is used only to tailor your daily content,
+                    is not shown on your profile, and can be changed or removed later.
+                    If you choose Muslim content, your town is sent to AlAdhan to fetch prayer times.
                 </p>
 
                 <label>4. Create a Password</label>
@@ -1646,6 +2001,8 @@ async def like_status(status_id: int = Form(...), current_user=Depends(get_curre
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     async with aiosqlite.connect(DB_FILE) as conn:
+        if not await can_view_status(conn, status_id, current_user["phone"]):
+            raise HTTPException(status_code=404, detail="Status not found")
         try:
             await conn.execute(
                 "INSERT INTO status_likes (status_id, user_phone) VALUES (?, ?)",
@@ -1664,6 +2021,8 @@ async def comment_status(status_id: int = Form(...), text: str = Form(...), curr
     clean = sanitize(text)[:200]
     if clean:
         async with aiosqlite.connect(DB_FILE) as conn:
+            if not await can_view_status(conn, status_id, current_user["phone"]):
+                raise HTTPException(status_code=404, detail="Status not found")
             await conn.execute(
                 "INSERT INTO status_comments (status_id, author_phone, author_name, text) VALUES (?, ?, ?, ?)",
                 (status_id, current_user["phone"], current_user["name"], clean)
@@ -1678,6 +2037,8 @@ async def repost_status(status_id: int = Form(...), current_user=Depends(get_cur
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     async with aiosqlite.connect(DB_FILE) as conn:
+        if not await can_view_status(conn, status_id, current_user["phone"]):
+            raise HTTPException(status_code=404, detail="Status not found")
         conn.row_factory = aiosqlite.Row
         async with conn.execute("SELECT content, author_name FROM statuses WHERE id = ?", (status_id,)) as c:
             orig = await c.fetchone()
@@ -1697,6 +2058,8 @@ async def hide_status(status_id: int = Form(...), current_user=Depends(get_curre
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     async with aiosqlite.connect(DB_FILE) as conn:
+        if not await can_view_status(conn, status_id, current_user["phone"]):
+            raise HTTPException(status_code=404, detail="Status not found")
         try:
             await conn.execute(
                 "INSERT INTO status_hides (status_id, user_phone) VALUES (?, ?)",
@@ -1714,6 +2077,8 @@ async def report_status(status_id: int = Form(...), reason: str = Form("Inapprop
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     async with aiosqlite.connect(DB_FILE) as conn:
+        if not await can_view_status(conn, status_id, current_user["phone"]):
+            raise HTTPException(status_code=404, detail="Status not found")
         try:
             await conn.execute(
                 "INSERT INTO status_reports (status_id, reporter_phone, reason) VALUES (?, ?, ?)",
@@ -2182,7 +2547,7 @@ async def send_direct_message(
         conn.row_factory = aiosqlite.Row
 
         # Resolve peer (with Nigerian format fallback)
-        async with conn.execute("SELECT phone, lga, status FROM farmers WHERE phone = ?", (clean_r,)) as cur:
+        async with conn.execute("SELECT phone, lga, status FROM farmers WHERE phone = ? AND COALESCE(is_demo, 0) = 0", (clean_r,)) as cur:
             peer = await cur.fetchone()
         if not peer:
             if clean_r.startswith("0") and len(clean_r) == 11:
@@ -2192,7 +2557,7 @@ async def send_direct_message(
             else:
                 alt = None
             if alt:
-                async with conn.execute("SELECT phone, lga, status FROM farmers WHERE phone = ?", (alt,)) as cur:
+                async with conn.execute("SELECT phone, lga, status FROM farmers WHERE phone = ? AND COALESCE(is_demo, 0) = 0", (alt,)) as cur:
                     peer = await cur.fetchone()
                 if peer:
                     clean_r = peer["phone"]
@@ -2409,6 +2774,207 @@ async def reject_friend_request(
         await conn.commit()
     return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
 
+
+@app.post("/portal/trust-groups/create")
+async def create_trust_group(name: str = Form(...), current_user=Depends(get_current_farmer)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can create trust groups")
+    group_name = name.strip()[:60]
+    if not group_name:
+        return RedirectResponse(url="/portal/feed?active_tab=community&trust_error=name", status_code=303)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute(
+            "INSERT INTO trust_groups (name, owner_phone) VALUES (?, ?)",
+            (group_name, current_user["phone"])
+        ) as cursor:
+            group_id = cursor.lastrowid
+        await conn.execute(
+            "INSERT INTO trust_group_members (group_id, farmer_phone) VALUES (?, ?)",
+            (group_id, current_user["phone"])
+        )
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=community&trust_created=1", status_code=303)
+
+
+@app.post("/portal/trust-groups/add-member")
+async def add_trust_group_member(
+    group_id: int = Form(...),
+    friend_phone: str = Form(...),
+    current_user=Depends(get_current_farmer)
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can manage trust groups")
+    target_phone = clean_phone(friend_phone)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute(
+            "SELECT owner_phone FROM trust_groups WHERE id = ?",
+            (group_id,)
+        ) as cursor:
+            group = await cursor.fetchone()
+        if not group or group[0] != current_user["phone"]:
+            raise HTTPException(status_code=403, detail="Only the group creator can add members")
+        async with conn.execute("""
+            SELECT 1 FROM friendships
+            WHERE status = 'accepted'
+              AND ((requester_phone = ? AND receiver_phone = ?)
+                OR (requester_phone = ? AND receiver_phone = ?))
+        """, (current_user["phone"], target_phone, target_phone, current_user["phone"])) as cursor:
+            is_friend = await cursor.fetchone()
+        if not is_friend:
+            raise HTTPException(status_code=400, detail="Only accepted friends can join this group")
+        async with conn.execute(
+            "SELECT 1 FROM farmers WHERE phone = ? AND status = 'Approved' AND COALESCE(is_demo, 0) = 0",
+            (target_phone,)
+        ) as cursor:
+            is_approved = await cursor.fetchone()
+        if not is_approved:
+            raise HTTPException(status_code=400, detail="The friend must be an approved farmer")
+        await conn.execute(
+            "INSERT OR IGNORE INTO trust_group_members (group_id, farmer_phone) VALUES (?, ?)",
+            (group_id, target_phone)
+        )
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=community&trust_member_added=1", status_code=303)
+
+
+@app.post("/portal/trust-groups/whatsapp")
+async def set_trust_group_whatsapp_alerts(
+    group_id: int = Form(...),
+    enabled: bool = Form(...),
+    current_user=Depends(get_current_farmer)
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can manage trust group alerts")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        if not await is_trust_group_member(conn, group_id, current_user["phone"]):
+            raise HTTPException(status_code=403, detail="You are not a member of this trust group")
+        await conn.execute(
+            """UPDATE trust_group_members SET whatsapp_enabled = ?
+               WHERE group_id = ? AND farmer_phone = ?""",
+            (1 if enabled else 0, group_id, current_user["phone"])
+        )
+        await conn.commit()
+    return RedirectResponse(
+        url=f"/portal/feed?active_tab=community&trust_whatsapp={1 if enabled else 0}",
+        status_code=303
+    )
+
+
+@app.post("/portal/trust-groups/travel")
+async def start_trust_group_trip(
+    background_tasks: BackgroundTasks,
+    group_id: int = Form(...),
+    destination: str = Form(...),
+    note: str = Form(""),
+    current_user=Depends(get_current_farmer)
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can start travel alerts")
+    destination_text = destination.strip()[:120]
+    note_text = note.strip()[:240]
+    if not destination_text:
+        return RedirectResponse(url="/portal/feed?active_tab=community&trust_error=destination", status_code=303)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        if not await is_trust_group_member(conn, group_id, current_user["phone"]):
+            raise HTTPException(status_code=403, detail="You are not a member of this trust group")
+        async with conn.execute("SELECT name FROM trust_groups WHERE id = ?", (group_id,)) as cursor:
+            group = await cursor.fetchone()
+        if not group:
+            raise HTTPException(status_code=404, detail="Trust group not found")
+        await conn.execute(
+            """INSERT INTO trust_trips (group_id, farmer_phone, destination, note)
+               VALUES (?, ?, ?, ?)""",
+            (group_id, current_user["phone"], destination_text, note_text)
+        )
+        await conn.commit()
+    message = (
+        f"Travel alert for {group[0]}: {current_user['name']} is travelling to "
+        f"{destination_text}."
+        + (f" Details: {note_text}" if note_text else "")
+        + " They will send an I'm OK update when safe."
+    )
+    background_tasks.add_task(
+        send_trust_group_whatsapp_alert, group_id, current_user["phone"], message
+    )
+    return RedirectResponse(url="/portal/feed?active_tab=community&trust_trip_started=1", status_code=303)
+
+
+@app.post("/portal/trust-groups/check-in")
+async def trust_group_check_in(
+    background_tasks: BackgroundTasks,
+    trip_id: int = Form(...),
+    current_user=Depends(get_current_farmer)
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can check in")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("BEGIN IMMEDIATE")
+        async with conn.execute(
+            """SELECT t.id, t.group_id, t.destination, g.name AS group_name
+               FROM trust_trips t JOIN trust_groups g ON g.id = t.group_id
+               WHERE t.id = ? AND t.farmer_phone = ? AND t.status = 'active'""",
+            (trip_id, current_user["phone"])
+        ) as cursor:
+            trip = await cursor.fetchone()
+        if not trip or not await is_trust_group_member(conn, trip["group_id"], current_user["phone"]):
+            await conn.rollback()
+            raise HTTPException(status_code=404, detail="Active trip not found")
+        async with conn.execute(
+            "SELECT COUNT(*) FROM trust_trip_checkins WHERE trip_id = ? AND farmer_phone = ? AND xp_awarded > 0",
+            (trip_id, current_user["phone"])
+        ) as cursor:
+            xp_checkins = (await cursor.fetchone())[0]
+        xp_awarded = CHECKIN_XP if xp_checkins < 3 else 0
+        await conn.execute(
+            "INSERT INTO trust_trip_checkins (trip_id, farmer_phone, xp_awarded) VALUES (?, ?, ?)",
+            (trip_id, current_user["phone"], xp_awarded)
+        )
+        if xp_awarded:
+            await conn.execute(
+                "UPDATE farmers SET xp = xp + ? WHERE phone = ?",
+                (xp_awarded, current_user["phone"])
+            )
+        await conn.commit()
+    message = (
+        f"✅ {current_user['name']} is OK and checked in while travelling to "
+        f"{trip['destination']} (Trust Group: {trip['group_name']})."
+    )
+    background_tasks.add_task(
+        send_trust_group_whatsapp_alert, trip["group_id"], current_user["phone"], message
+    )
+    return RedirectResponse(
+        url=f"/portal/feed?active_tab=community&trust_checkin={xp_awarded}",
+        status_code=303
+    )
+
+
+@app.post("/portal/trust-groups/finish-trip")
+async def finish_trust_group_trip(trip_id: int = Form(...), current_user=Depends(get_current_farmer)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can finish travel alerts")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute(
+            """UPDATE trust_trips SET status = 'completed', ended_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND farmer_phone = ? AND status = 'active'""",
+            (trip_id, current_user["phone"])
+        )
+        await conn.commit()
+    return RedirectResponse(url="/portal/feed?active_tab=community&trust_trip_finished=1", status_code=303)
+
+
 @app.get("/portal/profile/edit", response_class=HTMLResponse)
 async def edit_profile_form(current_user=Depends(get_current_farmer)):
     if not current_user:
@@ -2416,13 +2982,18 @@ async def edit_profile_form(current_user=Depends(get_current_farmer)):
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head>
     <body><div class="glass-panel" style="max-width:480px; margin:40px auto;">
         <h2 style="margin:0 0 8px 0;">Edit Profile</h2>
-        <p style="color:var(--text-muted); font-size:14px; margin-bottom:20px;">Update your name and town. Your phone number cannot be changed.</p>
+        <p style="color:var(--text-muted); font-size:14px; margin-bottom:20px;">Update your name, town, and optional private content preference. Your phone number cannot be changed.</p>
         <form action="/portal/profile/update" method="post">
             <label>Full Name</label>
             <input type="text" name="name" value="{html.escape(current_user.get('name') or '')}" required maxlength="80">
             <label>Town / City</label>
             <input type="text" name="city" value="{html.escape(current_user.get('city') or '')}" required maxlength="60">
             <p style="font-size:13px; color:#94a3b8; margin:8px 0 16px 0;">Changing town may affect your LGA sector and who can see your posts.</p>
+            <label>Optional content preference (private)</label>
+            <select name="faith_preference">
+                {''.join(f'<option value="{option}" {"selected" if current_user.get("faith_preference", "Private") == option else ""}>{option}</option>' for option in FAITH_PREFERENCES)}
+            </select>
+            <p style="font-size:13px; color:#94a3b8; margin:8px 0 16px 0;">Used only to personalize your daily reflection. Choose Private to remove this preference; it is never shown on your profile. Muslim prayer-time lookups send your town to AlAdhan.</p>
             <button type="submit" class="btn btn-emerald" style="width:100%; padding:14px; margin-top:8px;">Save Changes</button>
         </form>
         <p style="text-align:center; margin-top:20px;">
@@ -2440,6 +3011,7 @@ async def edit_profile_form(current_user=Depends(get_current_farmer)):
 async def update_profile(
     name: str = Form(...),
     city: str = Form(...),
+    faith_preference: str = Form("Private"),
     current_user=Depends(get_current_farmer)
 ):
     if not current_user:
@@ -2448,6 +3020,8 @@ async def update_profile(
     clean_city = sanitize(city)[:60]
     if not clean_name or not clean_city:
         return RedirectResponse(url="/portal/profile/edit?error=empty", status_code=303)
+    if faith_preference not in FAITH_PREFERENCES:
+        raise HTTPException(status_code=422, detail="Choose a valid content preference")
     # Re-resolve LGA from city map if possible
     lookup = clean_city.strip().lower()
     geo = CITY_AUTOFILL_MAP.get(lookup, {
@@ -2458,9 +3032,13 @@ async def update_profile(
     })
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute(
-            """UPDATE farmers SET name = ?, city = ?, lga = ?, state = ?, area = ?
+            """UPDATE farmers SET name = ?, city = ?, lga = ?, state = ?, area = ?,
+               faith_preference = ?
                WHERE phone = ?""",
-            (clean_name, clean_city, geo["lga"], geo["state"], geo["area"], current_user["phone"])
+            (
+                clean_name, clean_city, geo["lga"], geo["state"], geo["area"],
+                faith_preference, current_user["phone"]
+            )
         )
         await conn.commit()
     return RedirectResponse(url="/portal/feed?active_tab=community&profile_updated=1", status_code=303)
@@ -2510,6 +3088,7 @@ async def simple_messages_page(current_user=Depends(get_current_farmer)):
             JOIN farmers fa ON fa.phone = CASE WHEN f.requester_phone = ? THEN f.receiver_phone ELSE f.requester_phone END
             WHERE f.status = 'accepted'
               AND (f.requester_phone = ? OR f.receiver_phone = ?)
+              AND COALESCE(fa.is_demo, 0) = 0
         """, (my_phone, my_phone, my_phone, my_phone)) as cur:
             friends = await cur.fetchall()
         # Anyone who has sent or received a message with me
@@ -2519,7 +3098,8 @@ async def simple_messages_page(current_user=Depends(get_current_farmer)):
                 fa.name as name
             FROM direct_messages dm
             JOIN farmers fa ON fa.phone = CASE WHEN dm.sender_phone = ? THEN dm.receiver_phone ELSE dm.sender_phone END
-            WHERE dm.sender_phone = ? OR dm.receiver_phone = ?
+            WHERE (dm.sender_phone = ? OR dm.receiver_phone = ?)
+              AND COALESCE(fa.is_demo, 0) = 0
         """, (my_phone, my_phone, my_phone, my_phone)) as cur:
             chat_partners = await cur.fetchall()
     # Merge: friends first, then other chat partners
@@ -2625,13 +3205,13 @@ async def simple_chat_page(
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         peer = None
-        async with conn.execute("SELECT name, phone FROM farmers WHERE phone = ?", (clean_with,)) as cur:
+        async with conn.execute("SELECT name, phone FROM farmers WHERE phone = ? AND COALESCE(is_demo, 0) = 0", (clean_with,)) as cur:
             peer = await cur.fetchone()
         if not peer and clean_with.startswith("0") and len(clean_with) == 11:
-            async with conn.execute("SELECT name, phone FROM farmers WHERE phone = ?", ("234" + clean_with[1:],)) as cur:
+            async with conn.execute("SELECT name, phone FROM farmers WHERE phone = ? AND COALESCE(is_demo, 0) = 0", ("234" + clean_with[1:],)) as cur:
                 peer = await cur.fetchone()
         elif not peer and clean_with.startswith("234") and len(clean_with) == 13:
-            async with conn.execute("SELECT name, phone FROM farmers WHERE phone = ?", ("0" + clean_with[3:],)) as cur:
+            async with conn.execute("SELECT name, phone FROM farmers WHERE phone = ? AND COALESCE(is_demo, 0) = 0", ("0" + clean_with[3:],)) as cur:
                 peer = await cur.fetchone()
         msgs = []
         peer_phone = clean_with
@@ -2756,6 +3336,28 @@ async def delete_account(current_user=Depends(get_current_farmer)):
         raise HTTPException(status_code=401, detail="Unauthorized")
     phone = current_user["phone"]
     async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("""
+            DELETE FROM trust_trip_checkins
+            WHERE farmer_phone = ? OR trip_id IN (
+                SELECT id FROM trust_trips
+                WHERE farmer_phone = ? OR group_id IN (
+                    SELECT id FROM trust_groups WHERE owner_phone = ?
+                )
+            )
+        """, (phone, phone, phone))
+        await conn.execute("""
+            DELETE FROM trust_trips
+            WHERE farmer_phone = ? OR group_id IN (
+                SELECT id FROM trust_groups WHERE owner_phone = ?
+            )
+        """, (phone, phone))
+        await conn.execute("""
+            DELETE FROM trust_group_members
+            WHERE farmer_phone = ? OR group_id IN (
+                SELECT id FROM trust_groups WHERE owner_phone = ?
+            )
+        """, (phone, phone))
+        await conn.execute("DELETE FROM trust_groups WHERE owner_phone = ?", (phone,))
         await conn.execute("DELETE FROM direct_messages WHERE sender_phone = ? OR receiver_phone = ?", (phone, phone))
         await conn.execute("DELETE FROM friendships WHERE requester_phone = ? OR receiver_phone = ?", (phone, phone))
         await conn.execute("DELETE FROM farm_products WHERE farmer_phone = ?", (phone,))
@@ -2819,12 +3421,18 @@ async def farmer_feed_portal(
         </div></body></html>""")
     weather = await get_realtime_weather(current_user['lga'])
     soil = await get_latest_soil_reading(current_user['phone'], current_user['lga'])
+    faith_card_html = ""
+    if active_tab in (None, "community"):
+        faith_card_html = await render_faith_card(
+            current_user.get("faith_preference", "Private"),
+            current_user.get("city") or current_user.get("lga") or "",
+        )
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM farmers WHERE lga = ? AND status = 'Pending'",
+        async with conn.execute("SELECT * FROM farmers WHERE lga = ? AND status = 'Pending' AND COALESCE(is_demo, 0) = 0",
                                 (current_user['lga'],)) as c1:
             pending_neighbors = await c1.fetchall()
-        async with conn.execute("SELECT * FROM farmers WHERE lga = ? AND status = 'Approved' AND phone != ?",
+        async with conn.execute("SELECT * FROM farmers WHERE lga = ? AND status = 'Approved' AND phone != ? AND COALESCE(is_demo, 0) = 0",
                                 (current_user['lga'], current_user['phone'])) as c2:
             approved_neighbors = await c2.fetchall()
         # Existing friendships (pending or accepted) for current user
@@ -2881,7 +3489,7 @@ async def farmer_feed_portal(
             checked_in_today = await c6.fetchone() is not None
         async with conn.execute("""
             SELECT name, xp, phone FROM farmers
-            WHERE lga = ? AND status = 'Approved'
+            WHERE lga = ? AND status = 'Approved' AND COALESCE(is_demo, 0) = 0
             ORDER BY xp DESC LIMIT 10
         """, (current_user['lga'],)) as c7:
             leaderboard_rows = await c7.fetchall()
@@ -2890,6 +3498,7 @@ async def farmer_feed_portal(
             FROM friendships f
             JOIN farmers fa ON fa.phone = f.requester_phone
             WHERE f.receiver_phone = ? AND f.status = 'pending'
+              AND COALESCE(fa.is_demo, 0) = 0
         """, (current_user['phone'],)) as c_fr:
             pending_requests = await c_fr.fetchall()
         async with conn.execute("""
@@ -2900,8 +3509,17 @@ async def farmer_feed_portal(
             JOIN farmers fa ON fa.phone = CASE WHEN f.requester_phone = ? THEN f.receiver_phone ELSE f.requester_phone END
             WHERE f.status = 'accepted'
               AND (f.requester_phone = ? OR f.receiver_phone = ?)
+              AND COALESCE(fa.is_demo, 0) = 0
         """, (current_user['phone'], current_user['phone'], current_user['phone'], current_user['phone'])) as c_ff:
             my_friends = await c_ff.fetchall()
+        async with conn.execute("""
+            SELECT tg.id, tg.name, tg.owner_phone
+            FROM trust_groups tg
+            JOIN trust_group_members tgm ON tgm.group_id = tg.id
+            WHERE tgm.farmer_phone = ?
+            ORDER BY tg.id DESC
+        """, (current_user["phone"],)) as c_tg:
+            trust_groups = await c_tg.fetchall()
         async with conn.execute("""
             SELECT id, title, embed_path FROM spotify_links
             WHERE farmer_phone = ? ORDER BY id DESC LIMIT 20
@@ -2988,45 +3606,221 @@ async def farmer_feed_portal(
 
     friends_html = ""
     for fr in my_friends:
+        friend_profile_url = (
+            f"/portal/feed?active_tab=community&view_profile="
+            f"{html.escape(str(fr['friend_phone']), quote=True)}"
+        )
         friends_html += f"""
         <div style="padding:10px 12px; background:rgba(16,185,129,0.06); border-radius:8px; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-weight:600; color:#f1f5f9;">{html.escape(fr['friend_name'])} <span title="Verified" style="color:#34d399;">✅</span></span>
+            <a href="{friend_profile_url}" style="font-weight:600; color:#f1f5f9; text-decoration:none;">{html.escape(fr['friend_name'] or '')} <span title="Verified" style="color:#34d399;">✅</span></a>
             <a href="/portal/chat?with={fr['friend_phone']}" style="font-size:12px; color:#93c5fd; text-decoration:none; background:rgba(59,130,246,0.15); padding:6px 12px; border-radius:8px; border:1px solid rgba(59,130,246,0.3);">💬 Message</a>
         </div>"""
     if not friends_html:
         friends_html = '<p style="color:var(--text-muted); font-size:13px;">No friends yet. Add some from your neighbors!</p>'
 
-    # Profile viewer for friend request sender (masked phone)
-    profile_card_html = ""
-    if view_profile:
-        clean_view = normalize_nigerian_mobile(view_profile) or clean_phone(view_profile)
+    trust_groups_html = ""
+    whatsapp_delivery_note = (
+        "WhatsApp delivery is enabled for this app."
+        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN
+        else "WhatsApp delivery is not configured yet; group updates will still appear here."
+    )
+    for group in trust_groups:
+        group_id = group["id"]
         async with aiosqlite.connect(DB_FILE) as conn:
             conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT * FROM farmers WHERE phone = ?", (clean_view,)) as cur:
-                prof = await cur.fetchone()
-            if not prof and clean_view.startswith("0") and len(clean_view) == 11:
-                async with conn.execute("SELECT * FROM farmers WHERE phone = ?", ("234" + clean_view[1:],)) as cur:
-                    prof = await cur.fetchone()
-            elif not prof and clean_view.startswith("234") and len(clean_view) == 13:
-                async with conn.execute("SELECT * FROM farmers WHERE phone = ?", ("0" + clean_view[3:],)) as cur:
-                    prof = await cur.fetchone()
-        if prof:
-            profile_card_html = f"""
-            <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.25); border-radius:14px; padding:18px; margin-bottom:16px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                    <div style="font-weight:800; font-size:18px; color:#fff;">{html.escape(prof['name'] or '')} {'✅' if prof['status']=='Approved' else ''}</div>
-                    <a href="/portal/feed?active_tab=community" style="color:#94a3b8; font-size:12px; text-decoration:none;">✕ Close</a>
-                </div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; font-size:14px;">
-                    <div><span style="color:#94a3b8;">Phone</span><br><b style="color:#e2e8f0; font-family:monospace;">{mask_phone_number(prof['phone'])}</b></div>
-                    <div><span style="color:#94a3b8;">Status</span><br><b style="color:#e2e8f0;">{html.escape(prof['status'] or '')}</b></div>
-                    <div><span style="color:#94a3b8;">LGA / Sector</span><br><b style="color:#e2e8f0;">{html.escape(prof['lga'] or '')}</b></div>
-                    <div><span style="color:#94a3b8;">Area</span><br><b style="color:#e2e8f0;">{html.escape(prof['area'] or '')}</b></div>
-                    <div><span style="color:#94a3b8;">State</span><br><b style="color:#e2e8f0;">{html.escape(prof['state'] or '')}</b></div>
-                    <div><span style="color:#94a3b8;">Grid XP</span><br><b style="color:#fbbf24;">⚡ {prof['xp'] or 0}</b></div>
-                </div>
-                <p style="font-size:12px; color:#94a3b8; margin:12px 0 0 0;">Full phone number is hidden until you accept the request.</p>
+            async with conn.execute("""
+                SELECT f.phone, f.name, tgm.whatsapp_enabled
+                FROM trust_group_members tgm
+                JOIN farmers f ON f.phone = tgm.farmer_phone
+                WHERE tgm.group_id = ?
+                ORDER BY f.name COLLATE NOCASE
+            """, (group_id,)) as cursor:
+                group_members = await cursor.fetchall()
+            async with conn.execute("""
+                SELECT t.id, t.farmer_phone, t.destination, t.note, t.started_at, f.name
+                FROM trust_trips t
+                JOIN farmers f ON f.phone = t.farmer_phone
+                WHERE t.group_id = ? AND t.status = 'active'
+                ORDER BY t.id DESC
+            """, (group_id,)) as cursor:
+                active_trips = await cursor.fetchall()
+
+            group_member_phones = {member["phone"] for member in group_members}
+            current_group_member = next(
+                (member for member in group_members if member["phone"] == current_user["phone"]),
+                None
+            )
+            addable_friends = [
+                friend for friend in my_friends
+                if friend["friend_phone"] not in group_member_phones
+            ]
+            whatsapp_enabled = bool(current_group_member and current_group_member["whatsapp_enabled"])
+            whatsapp_toggle_html = f"""
+            <form action="/portal/trust-groups/whatsapp" method="post" style="margin:8px 0;">
+                <input type="hidden" name="group_id" value="{group_id}">
+                <input type="hidden" name="enabled" value="{'false' if whatsapp_enabled else 'true'}">
+                <button type="submit" class="btn" style="padding:7px 10px; font-size:12px; background:rgba(37,211,102,.12); color:#86efac;">
+                    {'🔕 Turn off WhatsApp alerts' if whatsapp_enabled else '📲 Enable WhatsApp alerts for me'}
+                </button>
+                <span style="font-size:11px; color:#94a3b8;">Only you control WhatsApp alerts to your number.</span>
+            </form>""" if current_group_member else ""
+            if group["owner_phone"] == current_user["phone"]:
+                if addable_friends:
+                    friend_options = "".join(
+                        f'<option value="{html.escape(str(friend["friend_phone"]), quote=True)}">'
+                        f'{html.escape(friend["friend_name"] or "")}</option>'
+                        for friend in addable_friends
+                    )
+                    add_member_html = f"""
+                    <form action="/portal/trust-groups/add-member" method="post" style="display:flex; gap:8px; margin:10px 0; align-items:center; flex-wrap:wrap;">
+                        <input type="hidden" name="group_id" value="{group_id}">
+                        <select name="friend_phone" required style="flex:1; min-width:160px; padding:9px; font-size:14px;">
+                            <option value="">Add an accepted friend…</option>{friend_options}
+                        </select>
+                        <button type="submit" class="btn btn-blue" style="padding:9px 12px; font-size:12px;">Add member</button>
+                    </form>"""
+                else:
+                    add_member_html = '<p style="font-size:12px; color:#94a3b8; margin:8px 0;">Only the group creator can add members.</p>'
+            else:
+                add_member_html = ""
+
+            trips_html = ""
+            for trip in active_trips:
+                async with conn.execute("""
+                    SELECT f.name, tc.timestamp, tc.xp_awarded
+                    FROM trust_trip_checkins tc
+                    JOIN farmers f ON f.phone = tc.farmer_phone
+                    WHERE tc.trip_id = ?
+                    ORDER BY tc.id DESC LIMIT 10
+                """, (trip["id"],)) as cursor:
+                    trip_checkins = await cursor.fetchall()
+                checkin_rows = "".join(
+                    f'<div style="font-size:12px; color:#cbd5e1; padding:4px 0;">'
+                    f'✅ <b>{html.escape(row["name"] or "")}</b> is OK '
+                    f'<span style="color:#94a3b8;">· {html.escape(row["timestamp"])}'
+                    f'{" · +5 XP" if row["xp_awarded"] else ""}</span></div>'
+                    for row in trip_checkins
+                ) or '<div style="font-size:12px; color:#94a3b8;">No check-ins yet.</div>'
+                trip_actions = ""
+                if trip["farmer_phone"] == current_user["phone"]:
+                    trip_actions = f"""
+                    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+                        <form action="/portal/trust-groups/check-in" method="post" style="margin:0;">
+                            <input type="hidden" name="trip_id" value="{trip['id']}">
+                            <button type="submit" class="btn btn-emerald" style="padding:9px 14px; font-size:13px;">✅ I'm OK</button>
+                        </form>
+                        <form action="/portal/trust-groups/finish-trip" method="post" style="margin:0;">
+                            <input type="hidden" name="trip_id" value="{trip['id']}">
+                            <button type="submit" class="btn" style="padding:9px 14px; font-size:13px; background:rgba(255,255,255,.08); color:#e2e8f0;">Finish trip</button>
+                        </form>
+                    </div>"""
+                trips_html += f"""
+                <div style="background:rgba(16,185,129,.06); border:1px solid rgba(16,185,129,.2); border-radius:10px; padding:12px; margin-top:10px;">
+                    <div style="font-weight:700; color:#f1f5f9;">🚗 {html.escape(trip["name"] or "")} is travelling to {html.escape(trip["destination"])}</div>
+                    <div style="font-size:11px; color:#94a3b8; margin-top:4px;">Started {html.escape(trip["started_at"])}</div>
+                    {f'<div style="font-size:13px; color:#cbd5e1; margin-top:6px;">{html.escape(trip["note"] or "")}</div>' if trip["note"] else ''}
+                    <div style="margin-top:8px;">{checkin_rows}</div>
+                    {trip_actions}
+                </div>"""
+            if not trips_html:
+                trips_html = '<p style="font-size:13px; color:#94a3b8;">No active travel alerts in this group.</p>'
+
+            members_html = ", ".join(html.escape(member["name"] or "") for member in group_members)
+            trip_form_html = f"""
+            <form action="/portal/trust-groups/travel" method="post" style="border-top:1px solid rgba(255,255,255,.08); padding-top:10px; margin-top:10px;">
+                <input type="hidden" name="group_id" value="{group_id}">
+                <label style="font-size:12px; margin:0 0 6px;">Starting a trip? Alert this group</label>
+                <input type="text" name="destination" maxlength="120" placeholder="Where are you travelling?" required style="padding:9px; font-size:14px; margin-bottom:8px;">
+                <input type="text" name="note" maxlength="240" placeholder="Optional details or estimated arrival" style="padding:9px; font-size:14px; margin-bottom:8px;">
+                <button type="submit" class="btn btn-blue" style="padding:9px 14px; font-size:13px;">🚗 Start travel alert</button>
+            </form>"""
+            trust_groups_html += f"""
+            <div style="background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.1); border-radius:12px; padding:14px; margin:10px 0;">
+                <div style="font-weight:800; color:#f1f5f9; font-size:16px;">🛡️ {html.escape(group["name"])}</div>
+                <div style="font-size:12px; color:#94a3b8; margin-top:4px;">Members: {members_html}</div>
+                {whatsapp_toggle_html}
+                {add_member_html}
+                {trips_html}
+                {trip_form_html}
             </div>"""
+    if not trust_groups_html:
+        trust_groups_html = '<p style="font-size:13px; color:#94a3b8;">Create a group, then add accepted friends so they can receive your travel alerts.</p>'
+
+    # Profile viewer: accepted friends can see and reply to each other's statuses.
+    profile_card_html = ""
+    profile_status_html = ""
+    if view_profile:
+        clean_view = normalize_nigerian_mobile(view_profile) or clean_phone(view_profile)
+        alternate_view = None
+        if clean_view.startswith("0") and len(clean_view) == 11:
+            alternate_view = "234" + clean_view[1:]
+        elif clean_view.startswith("234") and len(clean_view) == 13:
+            alternate_view = "0" + clean_view[3:]
+        async with aiosqlite.connect(DB_FILE) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(
+                "SELECT * FROM farmers WHERE phone IN (?, ?) AND COALESCE(is_demo, 0) = 0",
+                (clean_view, alternate_view or clean_view)
+            ) as cur:
+                prof = await cur.fetchone()
+            can_view_profile = bool(prof and prof["phone"] == current_user["phone"])
+            is_accepted_friend = False
+            if prof and not can_view_profile:
+                async with conn.execute("""
+                    SELECT status FROM friendships
+                    WHERE (requester_phone = ? AND receiver_phone = ?)
+                       OR (requester_phone = ? AND receiver_phone = ?)
+                """, (current_user["phone"], prof["phone"], prof["phone"], current_user["phone"])) as cur:
+                    relationship = await cur.fetchone()
+                relation_status = relationship["status"] if relationship else None
+                can_view_profile = relation_status in ("accepted", "pending")
+                is_accepted_friend = relation_status == "accepted"
+            if prof and can_view_profile and (is_accepted_friend or prof["phone"] == current_user["phone"]) and prof["status"] == STATUS_APPROVED:
+                async with conn.execute("""
+                    SELECT s.id, s.author_phone, s.author_name, s.content, s.timestamp,
+                           (SELECT COUNT(*) FROM status_likes WHERE status_id = s.id) as likes,
+                           (SELECT COUNT(*) FROM status_comments WHERE status_id = s.id) as comments
+                    FROM statuses s
+                    WHERE s.author_phone = ?
+                      AND s.id NOT IN (SELECT status_id FROM status_hides WHERE user_phone = ?)
+                    ORDER BY s.id DESC LIMIT 50
+                """, (prof["phone"], current_user["phone"])) as cur:
+                    prof_statuses = await cur.fetchall()
+                prof_comments_map = {}
+                if prof_statuses:
+                    prof_status_ids = [status["id"] for status in prof_statuses]
+                    placeholders = ",".join("?" * len(prof_status_ids))
+                    async with conn.execute(
+                        f"""SELECT status_id, author_name, text FROM status_comments
+                            WHERE status_id IN ({placeholders}) ORDER BY id ASC""",
+                        prof_status_ids
+                    ) as cur:
+                        for comment in await cur.fetchall():
+                            prof_comments_map.setdefault(comment["status_id"], []).append(comment)
+                profile_status_html = "".join(
+                    render_status_card(status, prof_comments_map.get(status["id"], []))
+                    for status in prof_statuses
+                ) or '<p style="color:var(--text-muted); font-size:13px;">No statuses posted yet.</p>'
+        if prof:
+            if not can_view_profile:
+                profile_card_html = '<div style="color:#fbbf24; padding:12px;">You can view this profile after they accept your friend request.</div>'
+            else:
+                profile_card_html = f"""
+                <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.25); border-radius:14px; padding:18px; margin-bottom:16px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                        <div style="font-weight:800; font-size:18px; color:#fff;">{html.escape(prof['name'] or '')} {'✅' if prof['status']=='Approved' else ''}</div>
+                        <a href="/portal/feed?active_tab=community" style="color:#94a3b8; font-size:12px; text-decoration:none;">✕ Close</a>
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; font-size:14px;">
+                        <div><span style="color:#94a3b8;">Phone</span><br><b style="color:#e2e8f0; font-family:monospace;">{mask_phone_number(prof['phone'])}</b></div>
+                        <div><span style="color:#94a3b8;">Status</span><br><b style="color:#e2e8f0;">{html.escape(prof['status'] or '')}</b></div>
+                        <div><span style="color:#94a3b8;">LGA / Sector</span><br><b style="color:#e2e8f0;">{html.escape(prof['lga'] or '')}</b></div>
+                        <div><span style="color:#94a3b8;">Area</span><br><b style="color:#e2e8f0;">{html.escape(prof['area'] or '')}</b></div>
+                        <div><span style="color:#94a3b8;">State</span><br><b style="color:#e2e8f0;">{html.escape(prof['state'] or '')}</b></div>
+                        <div><span style="color:#94a3b8;">Grid XP</span><br><b style="color:#fbbf24;">⚡ {prof['xp'] or 0}</b></div>
+                    </div>
+                    <p style="font-size:12px; color:#94a3b8; margin:12px 0 0 0;">Full phone number is hidden until you accept the request.</p>
+                </div>"""
         else:
             profile_card_html = '<div style="color:#f87171; padding:12px;">Profile not found.</div>'
 
@@ -3251,32 +4045,10 @@ async def farmer_feed_portal(
             <div style="color:#64748b; font-size:11px; margin-top:4px;">{s['timestamp']}</div>
         </div>""" for s in recent_shoutouts]) or '<p style="color:var(--text-muted); font-size:13px;">No shout-outs yet. Say hello to your neighbours!</p>'
 
-    status_html = ""
-    for s in status_posts:
-        comments_html = "".join([
-            f'<div style="font-size:13px; margin:4px 0; color:#cbd5e1;"><b style="color:#6ee7b7;">{html.escape(c["author_name"] or "")}</b>: {html.escape(c["text"])}</div>'
-            for c in status_comments_map.get(s["id"], [])
-        ])
-        status_html += f"""
-        <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:14px; margin-bottom:12px;">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <div style="font-weight:700; color:#f1f5f9;">{html.escape(s['author_name'] or '')}</div>
-                <span style="font-size:11px; color:#64748b;">{s['timestamp']}</span>
-            </div>
-            <p style="margin:10px 0; color:#e2e8f0; font-size:15px; line-height:1.4;">{html.escape(s['content'])}</p>
-            <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
-                <form action="/portal/status/like" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{s['id']}"><button type="submit" style="background:none;border:none;color:#60a5fa;cursor:pointer;font-size:13px;">👍 {s['likes']}</button></form>
-                <form action="/portal/status/repost" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{s['id']}"><button type="submit" style="background:none;border:none;color:#34d399;cursor:pointer;font-size:13px;">🔁 Repost</button></form>
-                <form action="/portal/status/hide" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{s['id']}"><button type="submit" style="background:none;border:none;color:#94a3b8;cursor:pointer;font-size:13px;">🙈 Hide</button></form>
-                <form action="/portal/status/report" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{s['id']}"><input type="hidden" name="reason" value="Inappropriate"><button type="submit" style="background:none;border:none;color:#f87171;cursor:pointer;font-size:13px;">🚩 Report</button></form>
-            </div>
-            {comments_html}
-            <form action="/portal/status/comment" method="post" style="display:flex; gap:6px; margin-top:8px;">
-                <input type="hidden" name="status_id" value="{s['id']}">
-                <input type="text" name="text" placeholder="Comment…" maxlength="200" required style="flex:1; padding:8px; font-size:13px; background:#1e293b; border:1px solid #475569; color:#fff; border-radius:8px; margin:0;">
-                <button type="submit" class="btn btn-blue" style="padding:6px 12px; font-size:12px;">Reply</button>
-            </form>
-        </div>"""
+    status_html = "".join(
+        render_status_card(s, status_comments_map.get(s["id"], []))
+        for s in status_posts
+    )
     if not status_html:
         status_html = '<p style="color:var(--text-muted); font-size:13px;">No statuses yet. Be the first to post!</p>'
 
@@ -3301,7 +4073,7 @@ async def farmer_feed_portal(
         nb_approved_parts.append(f"""
         <div style='padding:12px 16px; background:rgba(16,185,129,0.03); border:1px solid rgba(16,185,129,0.15); border-radius:10px; margin-bottom:8px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;'>
             🟢 <div style='flex:1; min-width:120px;'>
-                <span style='font-weight:600; color:#f1f5f9;'>{html.escape(f['name'])}</span>
+                <a href='/portal/feed?active_tab=community&view_profile={html.escape(str(fphone), quote=True)}' style='font-weight:600; color:#f1f5f9; text-decoration:none;'>{html.escape(f['name'] or '')}</a>
                 <span title="Verified & Approved" style="color:#34d399; font-size:14px; margin-left:6px;">✅</span>
             </div>
             {friend_btn}
@@ -3379,17 +4151,17 @@ async def farmer_feed_portal(
         async with aiosqlite.connect(DB_FILE) as conn:
             conn.row_factory = aiosqlite.Row
             peer = None
-            async with conn.execute("SELECT * FROM farmers WHERE phone = ?", (clean_search,)) as cur:
+            async with conn.execute("SELECT * FROM farmers WHERE phone = ? AND COALESCE(is_demo, 0) = 0", (clean_search,)) as cur:
                 peer = await cur.fetchone()
             if not peer and clean_search.startswith("0") and len(clean_search) == 11:
                 alt = "234" + clean_search[1:]
-                async with conn.execute("SELECT * FROM farmers WHERE phone = ?", (alt,)) as cur:
+                async with conn.execute("SELECT * FROM farmers WHERE phone = ? AND COALESCE(is_demo, 0) = 0", (alt,)) as cur:
                     peer = await cur.fetchone()
                 if peer:
                     clean_search = peer["phone"]
             elif not peer and clean_search.startswith("234") and len(clean_search) == 13:
                 alt = "0" + clean_search[3:]
-                async with conn.execute("SELECT * FROM farmers WHERE phone = ?", (alt,)) as cur:
+                async with conn.execute("SELECT * FROM farmers WHERE phone = ? AND COALESCE(is_demo, 0) = 0", (alt,)) as cur:
                     peer = await cur.fetchone()
                 if peer:
                     clean_search = peer["phone"]
@@ -3773,6 +4545,7 @@ async def farmer_feed_portal(
             <div id="tab_community" style="{show_community}">
                 {pending_requests_panel}
                 {profile_card_html}
+                {f'<div class="portal-card" style="margin-bottom:20px;"><div class="card-header">📝 <h3 class="card-title">Statuses & replies</h3></div>{profile_status_html}</div>' if profile_status_html else ''}
                 <div class="portal-grid">
                     <div class="portal-card">
                         <div class="card-header">🌤️ <h3 class="card-title">Live Weather</h3></div>
@@ -3840,6 +4613,16 @@ async def farmer_feed_portal(
                     </div>
 
                     <div class="portal-card"><div class="card-header">👥 <h3 class="card-title">Active Neighbors ({len(approved_neighbors)})</h3></div><div style="flex:1; max-height:220px; overflow-y:auto;">{nb_approved or '<p style="color:var(--text-muted); font-size:13px; margin:0;">No active nodes nearby.</p>'}</div></div>
+                    <div class="portal-card">
+                        <div class="card-header">🛡️ <h3 class="card-title">Trust Groups</h3></div>
+                        <p style="font-size:13px; color:#cbd5e1; margin:0 0 10px;">Create a private group with accepted friends. Travel alerts and every “I'm OK” check-in appear here for all group members. Enable WhatsApp alerts for yourself if you want messages too; {whatsapp_delivery_note} Twilio/WhatsApp messaging charges may apply. Earn +5 XP for your first 3 check-ins per trip; later check-ins still notify the group.</p>
+                        <form action="/portal/trust-groups/create" method="post" style="display:flex; gap:8px; margin-bottom:12px;">
+                            <input type="text" name="name" maxlength="60" placeholder="New group name (e.g. Family)" required style="padding:9px; font-size:14px;">
+                            <button type="submit" class="btn btn-emerald" style="padding:9px 12px; font-size:12px; white-space:nowrap;">Create group</button>
+                        </form>
+                        {trust_groups_html}
+                    </div>
+                    {faith_card_html}
                 </div>
 
                 <!-- Farm Radio Receiver -->
@@ -4138,6 +4921,16 @@ async def farmer_feed_portal(
             </div>
         </div>
         <div id="radar_screen" class="glass-panel" style="max-width: 550px; margin: 60px auto; text-align: center; display: none;"><div class="radar-spinner"></div><span class="badge badge-amber pulse" style="margin-bottom: 16px;">Transmission Channel Engaged</span><h2>Transmitting...</h2></div>
+        <div id="nature_moment" role="status" aria-live="polite" style="display:none; position:fixed; right:16px; bottom:84px; z-index:2100; width:min(340px, calc(100vw - 32px)); box-sizing:border-box; background:#0f172a; border:1px solid rgba(110,231,183,0.25); border-radius:16px; padding:14px 16px; box-shadow:0 12px 32px rgba(0,0,0,0.4);">
+            <div style="display:flex; align-items:flex-start; gap:12px;">
+                <div id="nature_moment_emoji" aria-hidden="true" style="font-size:34px; line-height:1.2;">🐇🥕</div>
+                <div style="flex:1; min-width:0;">
+                    <div id="nature_moment_title" style="font-weight:800; color:#e2e8f0; margin-bottom:4px;">A garden visitor</div>
+                    <div id="nature_moment_text" style="font-size:13px; line-height:1.45; color:#cbd5e1;"></div>
+                </div>
+                <button type="button" onclick="hideNatureMoment()" aria-label="Close nature moment" style="background:transparent; border:0; color:#cbd5e1; font-size:22px; line-height:1; cursor:pointer; padding:0 2px;">×</button>
+            </div>
+        </div>
         <script>
             async function triggerEchoAnimation(e, aId) {{ e.preventDefault(); const btn = document.getElementById('echo_btn_' + aId); btn.disabled = true; btn.innerText = "📡 Relaying..."; try {{ const res = await fetch('/portal/alert/relay', {{ method: 'POST', body: new FormData(e.target) }}); if (res.status === 200) {{ const newXp = await res.text(); document.getElementById('grid_score_display').innerText = "⚡ " + newXp + " Grid XP"; btn.className = "btn"; btn.style.background = "#10b981"; btn.innerText = "✅ Dispatched"; }} }} catch(err) {{ console.error(err); }} }}
             async function executeTransmissionSequence(e) {{
@@ -4274,6 +5067,57 @@ async def farmer_feed_portal(
                     document.getElementById('radio_status').style.color = '#94a3b8';
                 }}
             }});
+
+            // ----- Occasional, gentle nature moments for the community tab -----
+            const natureMomentStories = [
+                {{ emoji: '🐇🥕', title: 'A rabbit found a carrot!', text: 'Hop along for a tiny garden adventure. Can you spot another carrot near the vegetables?' }},
+                {{ emoji: '🦋🌼', title: 'Butterfly garden visit', text: 'A butterfly is looking for a flower. Take a gentle breath and imagine where it will land.' }},
+                {{ emoji: '🌧️⛈️', title: 'A gentle rain is passing', text: 'The clouds are watering the crops. Stay cosy until the rain has passed.' }},
+                {{ emoji: '🐞🍃', title: 'Little garden explorer', text: 'A ladybird is checking the leaves for a sunny place to rest.' }}
+            ];
+            let natureMomentTimer = null;
+            let natureMomentHideTimer = null;
+
+            function hideNatureMoment() {{
+                const box = document.getElementById('nature_moment');
+                if (box) box.style.display = 'none';
+                if (natureMomentHideTimer) clearTimeout(natureMomentHideTimer);
+            }}
+
+            function scheduleNatureMoment(delay) {{
+                if (natureMomentTimer) clearTimeout(natureMomentTimer);
+                natureMomentTimer = setTimeout(showNatureMoment, delay);
+            }}
+
+            function showNatureMoment() {{
+                const community = document.getElementById('tab_community');
+                const box = document.getElementById('nature_moment');
+                if (!community || !box || document.hidden || getComputedStyle(community).display === 'none') {{
+                    scheduleNatureMoment(60000);
+                    return;
+                }}
+                const now = Date.now();
+                let lastShown = 0;
+                try {{ lastShown = Number(sessionStorage.getItem('farmwatch_last_nature_moment') || 0); }}
+                catch (error) {{ console.warn('Could not read nature-moment timing:', error); }}
+                const cooldown = 5 * 60 * 1000;
+                if (now - lastShown < cooldown) {{
+                    scheduleNatureMoment(cooldown - (now - lastShown));
+                    return;
+                }}
+
+                const story = natureMomentStories[Math.floor(Math.random() * natureMomentStories.length)];
+                document.getElementById('nature_moment_emoji').textContent = story.emoji;
+                document.getElementById('nature_moment_title').textContent = story.title;
+                document.getElementById('nature_moment_text').textContent = story.text;
+                box.style.display = 'block';
+                try {{ sessionStorage.setItem('farmwatch_last_nature_moment', String(now)); }}
+                catch (error) {{ console.warn('Could not save nature-moment timing:', error); }}
+                natureMomentHideTimer = setTimeout(hideNatureMoment, 15000);
+                scheduleNatureMoment(5 * 60 * 1000 + Math.floor(Math.random() * 4 * 60 * 1000));
+            }}
+
+            scheduleNatureMoment(60000 + Math.floor(Math.random() * 60000));
 
             // ----- Simple game sounds (Web Audio) -----
             let sfxCtx = null;
@@ -4551,7 +5395,7 @@ async def farmer_feed_portal(
                 if (method !== 'post') return;
                 // Keep authentication flows as full navigations; other portal actions stay on the page.
                 const action = form.action || '';
-                if (action.includes('/portal/auth') || action.includes('/submit-registration') || action.includes('/admin/login') || action.includes('/portal/alert/raise')) {{
+                if (action.includes('/portal/auth') || action.includes('/submit-registration') || action.includes('/admin/login') || action.includes('/portal/alert/raise') || action.includes('/portal/trust-groups/')) {{
                     return; // let normal submit happen
                 }}
                 e.preventDefault();
@@ -4824,7 +5668,7 @@ async def farmer_raise_alert(alert_type: str = Form(...), message: str = Form(..
     override = a_type in ["Critical Disaster", "Armed Attack"]
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
-        q = "SELECT phone FROM farmers WHERE status = 'Approved' AND phone != ?" if override else "SELECT phone FROM farmers WHERE status = 'Approved' AND lga = ? AND phone != ?"
+        q = "SELECT phone FROM farmers WHERE status = 'Approved' AND phone != ? AND COALESCE(is_demo, 0) = 0" if override else "SELECT phone FROM farmers WHERE status = 'Approved' AND lga = ? AND phone != ? AND COALESCE(is_demo, 0) = 0"
         p = (current_user['phone'],) if override else (current_user['lga'], current_user['phone'])
         async with conn.execute(q, p) as cursor: targets = [r["phone"] for r in await cursor.fetchall()]
 
@@ -4852,7 +5696,7 @@ async def farmer_relay_alert(alert_id: int = Form(...), current_user=Depends(get
             await conn.commit()
         async with aiosqlite.connect(DB_FILE) as conn:
             conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT phone FROM farmers WHERE status = 'Approved' AND lga = ? AND phone != ?",
+            async with conn.execute("SELECT phone FROM farmers WHERE status = 'Approved' AND lga = ? AND phone != ? AND COALESCE(is_demo, 0) = 0",
                                     (alert['lga'], current_user['phone'])) as cursor: targets = [r["phone"] for r in
                                                                                                  await cursor.fetchall()]
         relay_text = f"📡 [GRID RELAY] Forwarded by {current_user['name']} | ORIGINAL ALERT [{alert['type'].upper()}] from {alert['sender']}: {alert['message']}"
@@ -4867,7 +5711,7 @@ async def handle_incoming_alert(From: Optional[str] = Form(None), Body: Optional
     sender_number = clean_phone(From.replace("whatsapp:", ""))
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM farmers WHERE phone = ? AND status = 'Approved'",
+        async with conn.execute("SELECT * FROM farmers WHERE phone = ? AND status = 'Approved' AND COALESCE(is_demo, 0) = 0",
                                 (sender_number,)) as cursor: farmer = await cursor.fetchone()
     if not farmer: return Response(content="<Response></Response>", media_type="application/xml")
     alert_type, msg_lower = "General Anomaly", Body.lower()
