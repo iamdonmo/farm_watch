@@ -983,6 +983,57 @@ async def admin_delete_product(product_id: int = Form(...), username: str = Depe
     return RedirectResponse(url="/dashboard", status_code=303)
 
 
+READY_DECOYS = [
+    {"title": "Fresh Cassava Roots — 50kg", "price": "₦12,000", "category": "Crops", "desc": "Clean, freshly harvested cassava. Good for garri or fufu. Available in Osogbo."},
+    {"title": "Yellow Maize — 100kg bag", "price": "₦45,000", "category": "Crops", "desc": "Dry yellow maize, well stored. Ideal for feed or food. Ibadan area."},
+    {"title": "Ripe Tomatoes — Basket", "price": "₦8,500", "category": "Produce", "desc": "Fresh red tomatoes, carefully picked. Perfect for market or home use."},
+    {"title": "White Yam Tubers — Large", "price": "₦15,000", "category": "Crops", "desc": "Big, healthy white yams. Ready for planting or eating. Ile-Ife."},
+    {"title": "Ripe Plantain Bunch", "price": "₦3,500", "category": "Produce", "desc": "Sweet ripe plantains. Good for frying or boiling."},
+    {"title": "White Rice — 50kg", "price": "₦62,000", "category": "Crops", "desc": "Clean local white rice. Well milled and bagged."},
+    {"title": "Fresh Peppers — Mix", "price": "₦6,000", "category": "Produce", "desc": "Red and green peppers, spicy and fresh. Market ready."},
+    {"title": "Onions & Garlic Bundle", "price": "₦4,500", "category": "Produce", "desc": "Fresh onions and garlic. Good quality, dry and firm."},
+    {"title": "White Fulani Cow — Female", "price": "₦450,000", "category": "Livestock", "desc": "Healthy White Fulani cow. Good for dairy or breeding. Vaccinated."},
+    {"title": "Boer Cross Goats — Pair", "price": "₦85,000", "category": "Livestock", "desc": "Two healthy goats. Strong and well fed. Ogbomoso."},
+    {"title": "Layer Chickens — 20 birds", "price": "₦120,000", "category": "Livestock", "desc": "Productive laying hens. Good egg production. Clean pen."},
+    {"title": "Healthy Sheep — Male", "price": "₦65,000", "category": "Livestock", "desc": "Strong ram, good body condition. Ready for sale."},
+    {"title": "Broiler Chickens — 50", "price": "₦180,000", "category": "Livestock", "desc": "Ready-to-market broilers. Healthy and active."},
+    {"title": "Red Bororo Cow — Bull", "price": "₦520,000", "category": "Livestock", "desc": "Strong Red Bororo bull. Excellent for breeding. Kano area."},
+    {"title": "Farm Guard Dog — Male", "price": "₦35,000", "category": "Livestock", "desc": "Alert and healthy farm dog. Good with livestock. Vaccinated."},
+    {"title": "Friendly Farm Dog — Female", "price": "₦28,000", "category": "Livestock", "desc": "Calm, healthy female dog. Suitable for farm work."},
+    {"title": "Groundnuts in Shell — 50kg", "price": "₦38,000", "category": "Crops", "desc": "Dry, clean groundnuts. Good for oil or roasting."},
+    {"title": "Fresh Vegetables Basket", "price": "₦5,500", "category": "Produce", "desc": "Mixed fresh greens and vegetables. Harvested this morning."},
+    {"title": "Local Chicken — 10 birds", "price": "₦45,000", "category": "Livestock", "desc": "Hardy local chickens. Good for free range."},
+    {"title": "Cassava Stems — Planting", "price": "₦7,000", "category": "Seeds", "desc": "Healthy cassava stems for planting. Disease free."},
+]
+
+
+@app.post("/admin/post-ready-decoy")
+async def admin_post_ready_decoy(
+    decoy_index: int = Form(...),
+    username: str = Depends(authenticate_admin),
+):
+    """Post one of the 20 ready-made Nigerian market decoys as an injected farmer. Goes Active immediately."""
+    if decoy_index < 0 or decoy_index >= len(READY_DECOYS):
+        return RedirectResponse(url="/dashboard", status_code=303)
+    decoy = READY_DECOYS[decoy_index]
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        # Pick a random approved (mock) farmer
+        async with conn.execute("SELECT phone, name, lga FROM farmers WHERE status = 'Approved' ORDER BY RANDOM() LIMIT 1") as cur:
+            farmer = await cur.fetchone()
+        if not farmer:
+            return RedirectResponse(url="/dashboard?decoy_err=nofarmer", status_code=303)
+        await conn.execute(
+            """INSERT INTO farm_products
+               (farmer_phone, farmer_name, lga, title, description, price, contact_phone, category, photo_path, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'Active')""",
+            (farmer["phone"], farmer["name"], farmer["lga"],
+             decoy["title"], decoy["desc"], decoy["price"], farmer["phone"], decoy["category"])
+        )
+        await conn.commit()
+    return RedirectResponse(url="/dashboard?decoy_ok=1", status_code=303)
+
+
 @app.post("/admin/post-decoy-product")
 async def admin_post_decoy_product(
     request: Request,
@@ -1181,6 +1232,24 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
     </form>
     '''
 
+    # 20 ready-made Nigerian market decoys — one-click post
+    ready_rows = ""
+    for i, d in enumerate(READY_DECOYS):
+        ready_rows += f"""
+        <tr>
+            <td style="font-weight:600; color:#fff;">{html.escape(d['title'])}</td>
+            <td>{html.escape(d['price'])}</td>
+            <td><span class="badge badge-blue">{html.escape(d['category'])}</span></td>
+            <td style="font-size:13px; max-width:220px;">{html.escape(d['desc'][:70])}</td>
+            <td>
+                <form action="/admin/post-ready-decoy" method="post" style="margin:0;">
+                    <input type="hidden" name="decoy_index" value="{i}">
+                    <button type="submit" class="btn btn-emerald" style="padding:6px 14px; font-size:12px;">Post</button>
+                </form>
+            </td>
+        </tr>"""
+    ready_decoys_table = f'<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Item</th><th>Price</th><th>Category</th><th>Details</th><th></th></tr></thead><tbody>{ready_rows}</tbody></table></div>'
+
     active_table = f'<div style="overflow-x: auto;"><table class="data-table"><thead><tr><th>Node Name</th><th>Phone Address</th><th>Geographic Network Path</th><th>Status</th><th>Management</th></tr></thead><tbody>{active_nodes_html}</tbody></table></div>' if active_nodes_html else '<p style="color: var(--text-muted); font-style: italic; text-align: center;">No active nodes operating on current security grid.</p>'
 
     reports_rows = ""
@@ -1224,6 +1293,7 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
             </div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🏆 Node Reliability Leaderboard</h3><table class="data-table"><thead><tr><th>Rank</th><th>Farmer Deployed Node Name</th><th>Grid Sector Focus</th><th>Network Rating</th></tr></thead><tbody>{leaderboard_html or "<tr><td colspan='4' style='color:var(--text-muted); font-style:italic;'>No XP metrics available.</td></tr>"}</tbody></table></div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3><span style="color: #ef4444;" class="pulse">&bull;</span> Real-Time Emergency Vector Feed</h3><div id="live_threat_feed_target"><p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">Connecting link matrix...</p></div></div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⚡ 20 Ready Nigerian Market Decoys</h3><p style="color:var(--text-muted); font-size:14px; margin:0 0 16px 0;">One click posts the listing as a random injected farmer. Goes <b>Active / online</b> immediately. (Inject Mock Data first.)</p>{ready_decoys_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🧪 Post Decoy Listing (from injected farmers)</h3><p style="color:var(--text-muted); font-size:14px; margin:0 0 16px 0;">Use injected mock farmers to post test items. Listings go <b>Active / online</b> immediately so you can see them in the market.</p>{decoy_form_html}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🛒 Manage Adverts / Products</h3>{pending_products_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⏳ Executive Node Approvals Pending</h3>{pending_table}</div>
@@ -2789,6 +2859,10 @@ async def farmer_feed_portal(
         interest_html = ""
         # "I am interested" button removed — buyers use Call / Message instead.
 
+        # Safe strings for share button (no backslashes in f-string)
+        safe_title = html.escape(p['title'] or '').replace("'", "\\'")
+        safe_price = html.escape(p['price'] or '').replace("'", "\\'")
+
         products_html += f"""
         <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:16px; margin-bottom:14px; {card_opacity}">
             {photo_html}
@@ -2802,7 +2876,9 @@ async def farmer_feed_portal(
             <p style="font-size:15px; color:#cbd5e1; margin:12px 0; line-height:1.5;">{html.escape(p['description'] or '')}</p>
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; font-size:14px;">
                 <span style="color:#94a3b8; min-width:0;">Seller: <b style="color:#e2e8f0;">{html.escape(p['farmer_name'] or '')}</b></span>
-                <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; max-width:100%;">{call_btn}{msg_btn}{actions}</span>
+                <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; max-width:100%;">{call_btn}{msg_btn}{actions}
+                    <button type="button" onclick="shareListing('{safe_title}', '{safe_price}')" style="display:inline-block;padding:8px 12px;background:rgba(167,139,250,0.2);border:1px solid rgba(167,139,250,0.4);color:#c4b5fd;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap;">🔗 Share</button>
+                </span>
             </div>
             {interest_html}
             <div style="margin-top:14px; padding:12px; background:rgba(239,68,68,0.06); border:1px solid rgba(239,68,68,0.2); border-radius:10px;">
@@ -3878,6 +3954,22 @@ async def farmer_feed_portal(
                 if (el) el.innerText = '⚡ ' + balance + ' Grid XP';
                 setTimeout(() => {{ t.style.opacity = '0'; }}, 1800);
                 setTimeout(() => t.remove(), 2500);
+            }}
+
+            // ----- Share listing (professional message) -----
+            function shareListing(title, price) {{
+                const site = "https://olode.com.ng";
+                const priceBit = price ? " for " + price : "";
+                const text = "I just found this on Farm Watch: " + title + priceBit + ".\\n\\nBrowse more farm produce and livestock at " + site + " — connecting Nigerian farmers and protecting our communities.";
+                if (navigator.share) {{
+                    navigator.share({{ title: title, text: text, url: site }}).catch(() => {{}});
+                }} else {{
+                    navigator.clipboard.writeText(text).then(() => {{
+                        showFlash("Share message copied — paste it anywhere");
+                    }}).catch(() => {{
+                        prompt("Copy this message to share:", text);
+                    }});
+                }}
             }}
 
             // General success flash (3 seconds, no page jump)
