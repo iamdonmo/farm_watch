@@ -1580,7 +1580,9 @@ async def submit_game_score(
                 (xp, current_user["phone"])
             )
         await conn.commit()
-    return RedirectResponse(url=f"/portal/feed?active_tab=community&game_xp={xp}", status_code=303)
+        async with conn.execute("SELECT xp FROM farmers WHERE phone = ?", (current_user["phone"],)) as c:
+            new_xp = (await c.fetchone())[0]
+    return {"xp_earned": xp, "balance": new_xp}
 
 
 @app.post("/portal/flag-node")
@@ -2473,7 +2475,7 @@ async def farmer_feed_portal(
     # Compact ticker text for tip / check-in / leaderboard
     top_names = " · ".join([f"{r['name']} ({r['xp']} XP)" for r in list(leaderboard_rows)[:3]]) or "No rankings yet"
     checkin_bit = "Checked in today" if checked_in_today else f"Daily check-in available (+{CHECKIN_XP} XP)"
-    ticker_text = f"💡 Tip: {tip_of_day}   •   ✅ {checkin_bit}   •   🏆 Top: {top_names}"
+    ticker_text = f"🌤️ {weather['temp']} · {weather['desc']} · Humidity {weather['humidity']} · Wind {weather['wind']}   •   💡 Tip: {tip_of_day}   •   ✅ {checkin_bit}   •   🏆 Top: {top_names}"
 
     products_html = ""
     for p in market_products:
@@ -2500,13 +2502,15 @@ async def farmer_feed_portal(
         photo_html = ""
         if p["photo_path"]:
             paths = [x.strip() for x in p["photo_path"].split(",") if x.strip()]
+            def protected_img(path, style):
+                return f'''<div style="position:relative; display:inline-block; {style}" oncontextmenu="return false;">
+                    <img src="/media/{html.escape(path)}" alt="" style="width:100%; height:100%; object-fit:cover; border-radius:12px; pointer-events:none; user-select:none; -webkit-user-drag:none;" draggable="false">
+                    <div style="position:absolute; inset:0; cursor:pointer;" onclick="previewProtected(this.previousElementSibling.src)"></div>
+                </div>'''
             if len(paths) == 1:
-                photo_html = f'<img src="/media/{html.escape(paths[0])}" alt="" style="width:100%; max-height:220px; object-fit:cover; border-radius:12px; margin-bottom:12px;">'
+                photo_html = protected_img(paths[0], "width:100%; max-height:220px; margin-bottom:12px;")
             elif paths:
-                imgs = "".join([
-                    f'<img src="/media/{html.escape(p)}" alt="" style="width:48%; max-height:140px; object-fit:cover; border-radius:8px; margin:1%;">'
-                    for p in paths[:4]
-                ])
+                imgs = "".join([protected_img(pp, "width:48%; max-height:140px; margin:1%;") for pp in paths[:4]])
                 photo_html = f'<div style="display:flex; flex-wrap:wrap; margin-bottom:12px;">{imgs}</div>'
 
         sold_badge = '<span style="background:rgba(245,158,11,0.2); color:#fbbf24; font-size:12px; font-weight:800; padding:4px 10px; border-radius:6px; margin-left:6px;">SOLD</span>' if is_sold else ""
@@ -2516,8 +2520,8 @@ async def farmer_feed_portal(
         call_btn = ""
         msg_btn = ""
         if contact_raw and not is_sold:
-            call_btn = f'<a href="tel:{html.escape(str(contact_raw))}" style="display:inline-block;padding:10px 16px;background:rgba(59,130,246,0.2);border:1px solid rgba(59,130,246,0.4);color:#93c5fd;border-radius:10px;font-size:14px;font-weight:700;text-decoration:none;">📞 Call seller</a>'
-            msg_btn = f'<a href="/portal/chat?with={html.escape(str(p["farmer_phone"] or ""))}" style="display:inline-block;padding:10px 16px;background:rgba(16,185,129,0.2);border:1px solid rgba(16,185,129,0.4);color:#6ee7b7;border-radius:10px;font-size:14px;font-weight:700;text-decoration:none;">💬 Message seller</a>'
+            call_btn = f'<a href="tel:{html.escape(str(contact_raw))}" style="display:inline-block;padding:8px 12px;background:rgba(59,130,246,0.2);border:1px solid rgba(59,130,246,0.4);color:#93c5fd;border-radius:10px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap;">📞 Call</a>'
+            msg_btn = f'<a href="/portal/chat?with={html.escape(str(p["farmer_phone"] or ""))}" style="display:inline-block;padding:8px 12px;background:rgba(16,185,129,0.2);border:1px solid rgba(16,185,129,0.4);color:#6ee7b7;border-radius:10px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap;">💬 Message</a>'
 
         interest_html = ""
         if not is_mine and not is_sold:
@@ -2545,8 +2549,8 @@ async def farmer_feed_portal(
             </div>
             <p style="font-size:15px; color:#cbd5e1; margin:12px 0; line-height:1.5;">{html.escape(p['description'] or '')}</p>
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; font-size:14px;">
-                <span style="color:#94a3b8;">Seller: <b style="color:#e2e8f0;">{html.escape(p['farmer_name'] or '')}</b></span>
-                <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">{call_btn}{msg_btn}{actions}</span>
+                <span style="color:#94a3b8; min-width:0;">Seller: <b style="color:#e2e8f0;">{html.escape(p['farmer_name'] or '')}</b></span>
+                <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; max-width:100%;">{call_btn}{msg_btn}{actions}</span>
             </div>
             {interest_html}
             <div style="margin-top:14px; padding:12px; background:rgba(239,68,68,0.06); border:1px solid rgba(239,68,68,0.2); border-radius:10px;">
@@ -3048,11 +3052,16 @@ async def farmer_feed_portal(
         .card-title {{ font-size: 16px; font-weight: 700; color: #ecfdf5; margin: 0; }}
         .weather-value {{ font-size: 32px; font-weight: 800; color: #6ee7b7; margin: 10px 0 5px 0; font-family: monospace; text-shadow: 0 0 20px rgba(52, 211, 153, 0.35); }}
         .tab-bar {{
-            display:flex; gap:8px; margin-bottom:20px;
+            display:flex; gap:6px; margin-bottom:20px; flex-wrap:wrap;
             background: linear-gradient(90deg, rgba(52, 211, 153, 0.06), rgba(167, 139, 250, 0.06));
             padding:6px; border-radius:14px; border:1px solid rgba(110, 231, 183, 0.12);
+            overflow:hidden;
         }}
-        .tab-btn {{ flex:1; text-align:center; padding:12px 16px; border-radius:10px; font-weight:700; font-size:14px; cursor:pointer; text-decoration:none; transition:all 0.25s; }}
+        .tab-btn {{ flex:1 1 auto; min-width:0; text-align:center; padding:10px 8px; border-radius:10px; font-weight:700; font-size:13px; cursor:pointer; text-decoration:none; transition:all 0.25s; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+        @media (max-width: 640px) {{
+            .tab-bar {{ gap:4px; padding:4px; }}
+            .tab-btn {{ flex:1 1 45%; padding:10px 6px; font-size:12px; }}
+        }}
     </style></head>
     <body>
         <div class="container" style="max-width:1200px; padding:20px 0;">
@@ -3065,6 +3074,14 @@ async def farmer_feed_portal(
                     <a href="/portal/profile/edit" class="btn" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); padding:10px 16px; font-size:13px; border-radius:10px;">✏️ Edit Profile</a>
                     <a href="/portal/logout" class="btn btn-danger" style="padding:10px 20px; font-size:13px; border-radius:10px;">🔌 Disconnect</a></div>
             </div>
+
+            <form action="/portal/feed" method="get" style="margin-bottom:16px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:16px; padding:12px 16px;">
+                <input type="hidden" name="active_tab" value="community">
+                <span style="font-size:16px; font-weight:700; color:#e2e8f0; white-space:nowrap;">🔍 Find a Farmer</span>
+                <input type="text" name="search_phone" placeholder="0803 123 4567" required inputmode="numeric" autocomplete="tel"
+                       style="flex:1; min-width:160px; padding:12px 14px; font-size:16px; background:#0f172a; border:1.5px solid rgba(52,211,153,0.3); color:#f0fdf4; border-radius:10px;">
+                <button type="submit" class="btn btn-emerald" style="padding:12px 20px; font-size:15px; white-space:nowrap;">Search</button>
+            </form>
 
             <div class="tab-bar">
                 <a href="/portal/feed?active_tab=incidents" class="tab-btn" style="{tab_incidents_active}">🛡️ Alerts</a>
@@ -3097,6 +3114,14 @@ async def farmer_feed_portal(
                                 <div><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">Tactical Coordinates</label><input type="text" id="alert_message" name="message" placeholder="State coordinates..." required></div>
                             </div>
                             <div style="margin-bottom:20px;"><label style="display:block; margin-bottom:8px; font-size:12px; color:var(--text-muted); font-weight:700;">📷 Attach Video Clip Evidence (Optional)</label><input type="file" name="video_evidence" accept="video/*" style="background:#090d16; color:white; padding:10px; border-radius:12px; border:1px solid var(--border-glass); width:100%;"></div>
+                            <div style="margin-bottom:16px; background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.4); border-radius:12px; padding:14px;">
+                                <div style="font-size:13px; font-weight:800; color:#fecaca; margin-bottom:8px; text-transform:uppercase; letter-spacing:0.04em;">⚠️ Strict Warning — Fake News</div>
+                                <p style="font-size:14px; color:#fecaca; margin:0 0 12px 0; line-height:1.5;">Broadcasting false or unverified information is a serious offence. Fake alerts can cause panic, harm neighbours, and will lead to account restriction or reporting to authorities.</p>
+                                <label style="display:flex; align-items:flex-start; gap:10px; font-size:15px; color:#fff; cursor:pointer;">
+                                    <input type="checkbox" name="attest_real" required style="margin-top:3px; width:18px; height:18px; accent-color:#ef4444;">
+                                    <span>I attest that this alert is real and not fake. I understand the consequences of broadcasting false information.</span>
+                                </label>
+                            </div>
                             <button type="submit" id="panic_btn" class="btn" style="width:100%; padding:16px; background:#ef4444; color:white; font-size:15px; font-weight:bold; box-shadow: 0 4px 20px rgba(239,68,68,0.25);">📡 Execute Strategic Grid Alarm</button>
                         </form>
                     </div>
@@ -3171,7 +3196,6 @@ async def farmer_feed_portal(
                     </div>
 
                     <div class="portal-card"><div class="card-header">👥 <h3 class="card-title">Active Neighbors ({len(approved_neighbors)})</h3></div><div style="flex:1; max-height:220px; overflow-y:auto;">{nb_approved or '<p style="color:var(--text-muted); font-size:13px; margin:0;">No active nodes nearby.</p>'}</div></div>
-                    <div class="portal-card"><div class="card-header">🤝 <h3 class="card-title">P2P Trust Gate</h3></div><div style="flex:1; max-height:220px; overflow-y:auto;">{nb_pending or '<p style="color:var(--text-muted); font-size:13px; margin:0;">Grid clear.</p>'}</div></div>
                 </div>
 
                 <!-- Farm Radio Receiver -->
@@ -3250,33 +3274,6 @@ async def farmer_feed_portal(
 
                     {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Friend request sent! It will appear under their Requests.</div></div>') if friend_sent else ''}
                     {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Profile updated successfully.</div></div>') if profile_updated else ''}
-                    <div class="portal-card" style="grid-column:1 / -1; background:linear-gradient(145deg, rgba(22,52,38,0.9), rgba(18,40,48,0.85)); border:1px solid rgba(52,211,153,0.2);">
-                        <div class="card-header" style="border-bottom:1px solid rgba(52,211,153,0.15);">
-                            <span style="font-size:22px;">🔍</span>
-                            <h3 class="card-title">Find a Farmer</h3>
-                        </div>
-                        <p style="font-size:14px; color:#a7c4b5; margin:0 0 18px 0; line-height:1.5;">
-                            Search by Nigerian mobile number to connect with someone on the network or invite them to join.
-                        </p>
-                        <form action="/portal/feed" method="get" style="display:flex; gap:12px; flex-wrap:wrap; align-items:stretch;">
-                            <input type="hidden" name="active_tab" value="community">
-                            <div style="flex:1; min-width:200px; position:relative;">
-                                <span style="position:absolute; left:14px; top:50%; transform:translateY(-50%); color:#6ee7b7; font-size:16px; pointer-events:none;">📱</span>
-                                <input type="text" name="search_phone" placeholder="0803 123 4567" required inputmode="numeric" autocomplete="tel"
-                                       style="width:100%; padding:14px 14px 14px 42px; font-size:16px; background:rgba(10,31,20,0.85); border:1.5px solid rgba(52,211,153,0.3); color:#f0fdf4; border-radius:12px; box-sizing:border-box; outline:none;"
-                                       onfocus="this.style.borderColor='#34d399'; this.style.boxShadow='0 0 0 3px rgba(52,211,153,0.15)';"
-                                       onblur="this.style.borderColor='rgba(52,211,153,0.3)'; this.style.boxShadow='none';">
-                            </div>
-                            <button type="submit" class="btn btn-emerald" style="padding:14px 28px; font-size:15px; border-radius:12px; white-space:nowrap;">
-                                Search
-                            </button>
-                        </form>
-                        <div style="display:flex; gap:16px; margin-top:14px; flex-wrap:wrap; font-size:12px; color:#7d9b8c;">
-                            <span>✓ Registered users → send friend request</span>
-                            <span>✓ Not registered → send invite link</span>
-                        </div>
-                        {peer_card_html if search_phone else ""}
-                    </div>
                     <div class="portal-card" style="grid-column:1 / -1;">
                         <div class="card-header">🤝 <h3 class="card-title">Friends & Requests</h3></div>
                         <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
@@ -3584,17 +3581,38 @@ async def farmer_feed_portal(
                 setTimeout(() => playTone(784, 0.2, 'sine', 0.18), 240);
             }}
 
+            // ----- XP toast (no page reload) -----
+            function showXpToast(amount, balance) {{
+                const t = document.createElement('div');
+                t.style.cssText = 'position:fixed; top:80px; right:20px; background:rgba(16,185,129,0.95); color:#fff; padding:12px 18px; border-radius:12px; font-weight:800; font-size:16px; z-index:2000; box-shadow:0 8px 24px rgba(0,0,0,0.3); opacity:1; transition:opacity 0.6s;';
+                t.innerHTML = '+' + amount + ' XP<br><span style="font-size:13px; font-weight:600;">Balance: ' + balance + '</span>';
+                document.body.appendChild(t);
+                const el = document.getElementById('grid_score_display');
+                if (el) el.innerText = '⚡ ' + balance + ' Grid XP';
+                setTimeout(() => {{ t.style.opacity = '0'; }}, 1800);
+                setTimeout(() => t.remove(), 2500);
+            }}
+            async function submitScore(game, score) {{
+                const fd = new FormData();
+                fd.append('game_name', game);
+                fd.append('score', score);
+                const res = await fetch('/portal/games/score', {{ method: 'POST', body: fd }});
+                if (res.ok) {{
+                    const data = await res.json();
+                    if (data.xp_earned > 0) showXpToast(data.xp_earned, data.balance);
+                }}
+            }}
+
             // ----- Rolling Dart -----
             function playDart() {{
                 const score = Math.floor(Math.random() * 100) + 1;
                 document.getElementById('dart_score_display').innerText = score;
-                document.getElementById('dart_score_input').value = score;
                 sfxDart(score);
                 const msg = document.getElementById('dart_msg');
                 if (score >= 50) {{
-                    msg.innerText = 'Great throw! Submitting for XP…';
+                    msg.innerText = 'Great throw! +XP coming…';
                     msg.style.color = '#6ee7b7';
-                    setTimeout(() => document.getElementById('dart_score_form').submit(), 700);
+                    submitScore('dart', score);
                 }} else {{
                     msg.innerText = 'Score ' + score + ' — try again for 50+';
                     msg.style.color = '#fbbf24';
@@ -3630,9 +3648,8 @@ async def farmer_feed_portal(
                                 if (huntFinds >= 3) {{
                                     huntActive = false;
                                     sfxWin();
-                                    document.getElementById('hunt_msg').innerText = 'You found all seeds! Claiming XP…';
-                                    document.getElementById('hunt_score_input').value = 3;
-                                    setTimeout(() => document.getElementById('hunt_score_form').submit(), 800);
+                                    document.getElementById('hunt_msg').innerText = 'All seeds found!';
+                                    submitScore('hunt', 3);
                                 }}
                             }} else {{
                                 el.innerText = '·';
@@ -3664,6 +3681,20 @@ async def farmer_feed_portal(
                 }}
             }}, 20000);
 
+        </script>
+        <div id="photoPreview" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:3000; align-items:center; justify-content:center;" onclick="this.style.display='none'" oncontextmenu="return false;">
+            <img id="photoPreviewImg" style="max-width:90%; max-height:85%; border-radius:12px; pointer-events:none; user-select:none; -webkit-user-drag:none;" draggable="false">
+            <div style="position:absolute; top:16px; right:20px; color:#fff; font-size:28px; cursor:pointer;">✕</div>
+        </div>
+        <script>
+        function previewProtected(src) {{
+            var box = document.getElementById('photoPreview');
+            document.getElementById('photoPreviewImg').src = src;
+            box.style.display = 'flex';
+        }}
+        document.addEventListener('contextmenu', function(e) {{
+            if (e.target.closest('#photoPreview') || e.target.closest('[oncontextmenu]')) e.preventDefault();
+        }});
         </script>
         <div style="position:fixed; bottom:0; left:0; right:0; background:rgba(15,23,42,0.95); border-top:1px solid rgba(52,211,153,0.3); padding:8px 0; z-index:1000; overflow:hidden;">
             <div style="display:flex; align-items:center; gap:12px; padding:0 12px;">
@@ -3697,9 +3728,12 @@ async def farmer_post_comment(alert_id: int = Form(...), comment_text: str = For
 
 @app.post("/portal/alert/raise")
 async def farmer_raise_alert(alert_type: str = Form(...), message: str = Form(...),
+                             attest_real: Optional[str] = Form(None),
                              video_evidence: Optional[UploadFile] = File(None),
                              current_user=Depends(get_current_farmer)):
     if not current_user: raise HTTPException(status_code=401, detail="Unauthorized")
+    if not attest_real:
+        raise HTTPException(status_code=400, detail="You must attest that this alert is real and not fake.")
     v_name = None
 
     if video_evidence and video_evidence.filename:
