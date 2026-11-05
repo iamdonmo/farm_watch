@@ -661,6 +661,32 @@ async def handle_registration(name: str = Form(...), phone: str = Form(...), cit
     if len(password) < 6:
         return RedirectResponse(url="/register?error=short", status_code=303)
 
+    alt = None
+    if clean_p.startswith("0") and len(clean_p) == 11:
+        alt = "234" + clean_p[1:]
+    elif clean_p.startswith("234") and len(clean_p) == 13:
+        alt = "0" + clean_p[3:]
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT phone FROM farmers WHERE phone = ? OR phone = ?",
+            (clean_p, alt or clean_p)
+        ) as cur:
+            existing = await cur.fetchone()
+        if existing:
+            return HTMLResponse(content=f"""
+            <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head>
+            <body><div class="glass-panel" style="max-width: 480px; margin: 60px auto; text-align: center;">
+                <div style="font-size: 48px; margin-bottom: 16px;">⚠️</div>
+                <h2 style="margin: 0 0 12px 0;">Number Already Registered</h2>
+                <p style="color: var(--text-muted); line-height: 1.6; font-size: 15px; margin-bottom: 24px;">
+                    This phone number is already on Farm Watch.<br>
+                    You cannot register the same number twice.
+                </p>
+                <a href="/portal/login" class="btn btn-emerald" style="width: 100%; box-sizing: border-box; margin-bottom:10px;">Sign In Instead</a>
+                <a href="/register" class="btn" style="width: 100%; box-sizing: border-box; background:rgba(255,255,255,0.08); color:#cbd5e1;">Use a Different Number</a>
+            </div></body></html>""", status_code=400)
+
     lookup = city_manual.strip().lower()
     geo = CITY_AUTOFILL_MAP.get(lookup,
                                 {"country": "Nigeria", "state": "Region", "lga": city_manual, "area": "General Hub"})
@@ -668,7 +694,7 @@ async def handle_registration(name: str = Form(...), phone: str = Form(...), cit
     pw_hash = hashlib.sha256(password.encode()).hexdigest()
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("""
-            INSERT OR REPLACE INTO farmers (phone, name, country, state, city, lga, area, token, status, xp, password_hash)
+            INSERT INTO farmers (phone, name, country, state, city, lga, area, token, status, xp, password_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 100, ?)
         """, (clean_p, sanitize(name), geo["country"], geo["state"], sanitize(city_manual), geo["lga"], geo["area"],
               unique_token, pw_hash))
@@ -772,7 +798,7 @@ UPGRADED_CSS = """
     .data-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
     .data-table th { padding: 14px; color: var(--text-muted); font-size: 12px; text-transform: uppercase; border-bottom: 1px solid var(--border-glass); text-align: left; }
     .data-table td { padding: 16px 14px; font-size: 14px; border-bottom: 1px solid rgba(255,255,255,0.03); text-align: left; }
-    input[type="text"], select {
+    input[type="text"], input[type="password"], select {
         width: 100%;
         padding: 16px 18px;
         background: rgba(10, 31, 20, 0.9);
@@ -784,13 +810,13 @@ UPGRADED_CSS = """
         font-weight: 500;
         letter-spacing: 0.02em;
     }
-    input[type="text"]::placeholder, select::placeholder {
+    input[type="text"]::placeholder, input[type="password"]::placeholder, select::placeholder {
         color: #7d9b8c;
         font-size: 16px;
         font-weight: 400;
         opacity: 1;
     }
-    input[type="text"]:focus, select:focus {
+    input[type="text"]:focus, input[type="password"]:focus, select:focus {
         outline: none;
         border-color: #34d399;
         background: rgba(12, 40, 28, 0.95);
@@ -859,13 +885,48 @@ async def admin_live_threat_feed_stream(username: str = Depends(authenticate_adm
 
 @app.post("/admin/simulate-grid")
 async def admin_simulate_grid_data(username: str = Depends(authenticate_admin)):
-    """WARNING: Injects mock data. Disable in production."""
-    if os.getenv("ALLOW_MOCK", "0") != "1":
-        raise HTTPException(status_code=403, detail="Mock data disabled. Set ALLOW_MOCK=1 to enable.")
+    """Injects mock data for testing. Safe to run multiple times (uses INSERT OR REPLACE)."""
     mock_farmers = [
-        ("2348031112221", "Bello Kano", "Kano Municipal", "Kano City Center", 245),
-        ("2348031112225", "Adewale Osogbo", "Osogbo", "Ataoja Sector", 410),
-        ("2348031112226", "Arowolo Ife", "Ile-Ife", "Ife Central Town", 295)
+        ("08031112201", "Bello Kano", "Kano Municipal", "Kano City Center", 245),
+        ("08031112202", "Adewale Osogbo", "Osogbo", "Ataoja Sector", 410),
+        ("08031112203", "Arowolo Ife", "Ile-Ife", "Ife Central Town", 295),
+        ("07051113304", "Chioma Ibadan", "Ibadan", "Ido Farming Grid", 320),
+        ("08161114405", "Musa Ogbomoso", "Ogbomoso", "Ogbomoso South Central", 180),
+        ("09071115506", "Fatima Osogbo", "Osogbo", "Ataoja Sector", 505),
+        ("08081116607", "Tunde Ile-Ife", "Ile-Ife", "Ife Central Town", 275),
+        ("08191117708", "Amina Kano", "Kano Municipal", "Kano City Center", 390),
+        ("07021118809", "Segun Ibadan", "Ibadan", "Ido Farming Grid", 210),
+        ("09031119910", "Ngozi Ogbomoso", "Ogbomoso", "Ogbomoso South Central", 460),
+        ("08041120011", "Ibrahim Kano", "Kano Municipal", "Kano City Center", 330),
+        ("08151121112", "Yetunde Osogbo", "Osogbo", "Ataoja Sector", 280),
+        ("07061122213", "Chinedu Ibadan", "Ibadan", "Ido Farming Grid", 415),
+        ("09081123314", "Hauwa Ile-Ife", "Ile-Ife", "Ife Central Town", 190),
+        ("08091124415", "Kunle Ogbomoso", "Ogbomoso", "Ogbomoso South Central", 355),
+        ("08121125516", "Blessing Kano", "Kano Municipal", "Kano City Center", 270),
+        ("07031126617", "Yusuf Osogbo", "Osogbo", "Ataoja Sector", 440),
+        ("09041127718", "Amaka Ibadan", "Ibadan", "Ido Farming Grid", 305),
+        ("08051128819", "Salihu Ile-Ife", "Ile-Ife", "Ife Central Town", 225),
+        ("08171129920", "Funke Ogbomoso", "Ogbomoso", "Ogbomoso South Central", 380),
+        ("07041130021", "Abubakar Kano", "Kano Municipal", "Kano City Center", 260),
+        ("09051131122", "Kemi Osogbo", "Osogbo", "Ataoja Sector", 490),
+        ("08061132223", "Emeka Ibadan", "Ibadan", "Ido Farming Grid", 340),
+        ("08181133324", "Zainab Ile-Ife", "Ile-Ife", "Ife Central Town", 215),
+        ("07071134425", "Wale Ogbomoso", "Ogbomoso", "Ogbomoso South Central", 370),
+        ("09091135526", "Maryam Kano", "Kano Municipal", "Kano City Center", 295),
+        ("08021136627", "Tope Osogbo", "Osogbo", "Ataoja Sector", 425),
+        ("08131137728", "Chika Ibadan", "Ibadan", "Ido Farming Grid", 250),
+        ("07081138829", "Ismaila Ile-Ife", "Ile-Ife", "Ife Central Town", 360),
+        ("09021139930", "Bukola Ogbomoso", "Ogbomoso", "Ogbomoso South Central", 285),
+        ("08071140031", "Garba Kano", "Kano Municipal", "Kano City Center", 310),
+        ("08141141132", "Sade Osogbo", "Osogbo", "Ataoja Sector", 455),
+        ("07091142233", "Obinna Ibadan", "Ibadan", "Ido Farming Grid", 200),
+        ("09061143334", "Aisha Ile-Ife", "Ile-Ife", "Ife Central Town", 400),
+        ("08031144435", "Femi Ogbomoso", "Ogbomoso", "Ogbomoso South Central", 265),
+        ("08151145536", "Halima Kano", "Kano Municipal", "Kano City Center", 335),
+        ("07021146637", "Dayo Osogbo", "Osogbo", "Ataoja Sector", 475),
+        ("09031147738", "Nneka Ibadan", "Ibadan", "Ido Farming Grid", 290),
+        ("08041148839", "Usman Ile-Ife", "Ile-Ife", "Ife Central Town", 220),
+        ("08161149940", "Ronke Ogbomoso", "Ogbomoso", "Ogbomoso South Central", 350),
     ]
     async with aiosqlite.connect(DB_FILE) as conn:
         for phone, name, lga, area, xp in mock_farmers:
@@ -879,9 +940,7 @@ async def admin_simulate_grid_data(username: str = Depends(authenticate_admin)):
 
 @app.post("/admin/flush-grid")
 async def admin_flush_grid_data(username: str = Depends(authenticate_admin)):
-    """WARNING: Destructive endpoint. Disable or protect heavily in production."""
-    if os.getenv("ALLOW_FLUSH", "0") != "1":
-        raise HTTPException(status_code=403, detail="Flush disabled. Set ALLOW_FLUSH=1 to enable.")
+    """WARNING: Destructive endpoint. Use with care."""
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("DELETE FROM farmers;")
         await conn.execute("DELETE FROM alerts_log;")
@@ -915,6 +974,88 @@ async def admin_reject_product(product_id: int = Form(...), username: str = Depe
     return RedirectResponse(url="/dashboard", status_code=303)
 
 
+@app.post("/admin/delete-product")
+async def admin_delete_product(product_id: int = Form(...), username: str = Depends(authenticate_admin)):
+    """Permanently delete an advert/product listing."""
+    async with aiosqlite.connect(DB_FILE) as conn:
+        await conn.execute("DELETE FROM farm_products WHERE id = ?", (product_id,))
+        await conn.commit()
+    return RedirectResponse(url="/dashboard", status_code=303)
+
+
+@app.post("/admin/post-decoy-product")
+async def admin_post_decoy_product(
+    request: Request,
+    username: str = Depends(authenticate_admin),
+):
+    """Post a decoy/test product listing as an injected (or any) farmer. Goes live immediately. Supports photos."""
+    form = await request.form()
+    farmer_phone = str(form.get("farmer_phone") or "")
+    title = str(form.get("title") or "")
+    description = str(form.get("description") or "")
+    price = str(form.get("price") or "")
+    category = str(form.get("category") or "General")
+
+    clean_phone_num = clean_phone(farmer_phone)
+    title_c = sanitize(title)[:MAX_PRODUCT_TITLE]
+    if not title_c:
+        return RedirectResponse(url="/dashboard", status_code=303)
+    desc_c = sanitize(description)[:MAX_PRODUCT_DESC]
+    price_c = sanitize(price)[:40]
+    cat = sanitize(category)[:30] if category else "General"
+
+    # Handle photo uploads (up to 5)
+    photo_paths = []
+    uploads = form.getlist("photos")
+    for photo in uploads[:5]:
+        if not hasattr(photo, "read"):
+            continue
+        try:
+            raw = await photo.read()
+            if not raw or len(raw) > MAX_UPLOAD_SIZE:
+                continue
+            fname = f"prod_{hashlib.md5(os.urandom(16)).hexdigest()}.jpg"
+            dest = os.path.join(MEDIA_DIR, fname)
+            saved = False
+            try:
+                from PIL import Image
+                import io
+                try:
+                    import pillow_heif
+                    pillow_heif.register_heif_opener()
+                except Exception:
+                    pass
+                img = Image.open(io.BytesIO(raw))
+                img = img.convert("RGB")
+                img.thumbnail((800, 800))
+                img.save(dest, "JPEG", quality=70)
+                saved = True
+            except Exception:
+                with open(dest, "wb") as f:
+                    f.write(raw)
+                saved = True
+            if saved and os.path.exists(dest):
+                photo_paths.append(fname)
+        except Exception:
+            continue
+    photo_path = ",".join(photo_paths) if photo_paths else None
+
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT name, lga, phone FROM farmers WHERE phone = ?", (clean_phone_num,)) as cur:
+            farmer = await cur.fetchone()
+        if not farmer:
+            return RedirectResponse(url="/dashboard?decoy_err=1", status_code=303)
+        await conn.execute(
+            """INSERT INTO farm_products
+               (farmer_phone, farmer_name, lga, title, description, price, contact_phone, category, photo_path, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')""",
+            (farmer["phone"], farmer["name"], farmer["lga"], title_c, desc_c, price_c, farmer["phone"], cat, photo_path)
+        )
+        await conn.commit()
+    return RedirectResponse(url="/dashboard?decoy_ok=1", status_code=303)
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def admin_dashboard(username: str = Depends(authenticate_admin)):
     async with aiosqlite.connect(DB_FILE) as conn:
@@ -930,8 +1071,8 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
             ORDER BY mr.id DESC LIMIT 30
         """) as c3:
             recent_reports = await c3.fetchall()
-        async with conn.execute("SELECT * FROM farm_products WHERE status = 'Pending' ORDER BY id DESC") as c4:
-            pending_products = await c4.fetchall()
+        async with conn.execute("SELECT * FROM farm_products ORDER BY id DESC LIMIT 100") as c4:
+            all_products = await c4.fetchall()
 
     total_nodes = len(all_farmers)
     pending_clearance = sum(1 for f in all_farmers if f["status"] in RESTRICTED_STATUSES)
@@ -978,21 +1119,67 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
 
     pending_table = f'<div style="overflow-x: auto;"><table class="data-table"><thead><tr><th>Node Name</th><th>Phone</th><th>Sector / Status</th><th>Actions</th></tr></thead><tbody>{pending_html}</tbody></table></div>' if pending_clearance > 0 else '<p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">No new registrations or reported nodes awaiting clearance.</p>'
 
-    # Pending products for admin approval
+    # All products for admin management (approve / reject / delete)
     products_rows = ""
-    for prod in pending_products:
+    for prod in all_products:
+        status_badge = f'<span class="badge badge-blue">{html.escape(prod["status"] or "")}</span>'
+        approve_btn = ""
+        if prod["status"] == "Pending":
+            approve_btn = f'''<form action="/admin/approve-product" method="post" style="margin:0;"><input type="hidden" name="product_id" value="{prod['id']}"><button type="submit" class="btn btn-emerald" style="padding:6px 12px; font-size:12px;">Approve</button></form>
+                <form action="/admin/reject-product" method="post" style="margin:0;"><input type="hidden" name="product_id" value="{prod['id']}"><button type="submit" class="btn btn-danger" style="padding:6px 12px; font-size:12px;">Reject</button></form>'''
         products_rows += f"""
         <tr>
             <td style="font-weight:600; color:#fff;">{html.escape(prod['title'] or '')}</td>
             <td>{html.escape(prod['farmer_name'] or '')}</td>
-            <td><span class="badge badge-blue">{html.escape(prod['lga'] or '')}</span></td>
+            <td><span class="badge badge-blue">{html.escape(prod['lga'] or '')}</span> {status_badge}</td>
             <td style="font-size:13px; max-width:200px;">{html.escape((prod['description'] or '')[:60])}</td>
-            <td><div style="display:flex; gap:6px;">
-                <form action="/admin/approve-product" method="post" style="margin:0;"><input type="hidden" name="product_id" value="{prod['id']}"><button type="submit" class="btn btn-emerald" style="padding:6px 12px; font-size:12px;">Approve</button></form>
-                <form action="/admin/reject-product" method="post" style="margin:0;"><input type="hidden" name="product_id" value="{prod['id']}"><button type="submit" class="btn btn-danger" style="padding:6px 12px; font-size:12px;">Reject</button></form>
+            <td><div style="display:flex; gap:6px; flex-wrap:wrap;">
+                {approve_btn}
+                <form action="/admin/delete-product" method="post" style="margin:0;" onsubmit="return confirm('Permanently delete this advert?');"><input type="hidden" name="product_id" value="{prod['id']}"><button type="submit" class="btn btn-danger" style="padding:6px 12px; font-size:12px;">Delete</button></form>
             </div></td>
         </tr>"""
-    pending_products_table = f'<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Title</th><th>Seller</th><th>LGA</th><th>Details</th><th>Actions</th></tr></thead><tbody>{products_rows or "<tr><td colspan=5 style=color:var(--text-muted);font-style:italic;>No products awaiting approval.</td></tr>"}</tbody></table></div>'
+    pending_products_table = f'<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Title</th><th>Seller</th><th>LGA / Status</th><th>Details</th><th>Actions</th></tr></thead><tbody>{products_rows or "<tr><td colspan=5 style=color:var(--text-muted);font-style:italic;>No products found.</td></tr>"}</tbody></table></div>'
+
+    # Farmer dropdown for decoy product posting (injected mock + any approved farmers)
+    farmer_options = ""
+    for f in all_farmers:
+        if f["status"] == "Approved":
+            farmer_options += f'<option value="{f["phone"]}">{html.escape(f["name"] or "")} — {html.escape(f["lga"] or "")} ({f["phone"]})</option>'
+    if not farmer_options:
+        farmer_options = '<option value="">No approved farmers yet — inject mock data first</option>'
+    cat_options = "".join([f'<option value="{c}">{c}</option>' for c in PRODUCT_CATEGORIES])
+    decoy_form_html = f'''
+    <form action="/admin/post-decoy-product" method="post" enctype="multipart/form-data" style="display:grid; gap:12px; max-width:640px;">
+        <div>
+            <label style="font-size:13px; color:var(--text-muted);">Post as farmer</label>
+            <select name="farmer_phone" required style="width:100%; padding:12px; background:#090d16; border:1px solid var(--border-glass); color:#fff; border-radius:10px;">{farmer_options}</select>
+        </div>
+        <div>
+            <label style="font-size:13px; color:var(--text-muted);">Title</label>
+            <input type="text" name="title" required maxlength="80" placeholder="e.g. Fresh cassava 50kg" style="width:100%; padding:12px; background:#090d16; border:1px solid var(--border-glass); color:#fff; border-radius:10px; box-sizing:border-box;">
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+            <div>
+                <label style="font-size:13px; color:var(--text-muted);">Category</label>
+                <select name="category" style="width:100%; padding:12px; background:#090d16; border:1px solid var(--border-glass); color:#fff; border-radius:10px;">{cat_options}</select>
+            </div>
+            <div>
+                <label style="font-size:13px; color:var(--text-muted);">Price</label>
+                <input type="text" name="price" maxlength="40" placeholder="e.g. ₦15,000" style="width:100%; padding:12px; background:#090d16; border:1px solid var(--border-glass); color:#fff; border-radius:10px; box-sizing:border-box;">
+            </div>
+        </div>
+        <div>
+            <label style="font-size:13px; color:var(--text-muted);">Description</label>
+            <input type="text" name="description" maxlength="300" placeholder="Quality, quantity, location notes…" style="width:100%; padding:12px; background:#090d16; border:1px solid var(--border-glass); color:#fff; border-radius:10px; box-sizing:border-box;">
+        </div>
+        <div>
+            <label style="font-size:13px; color:var(--text-muted);">Photos (optional, up to 5)</label>
+            <input type="file" name="photos" accept="image/*" multiple style="width:100%; padding:10px; background:#090d16; border:1px solid var(--border-glass); color:#fff; border-radius:10px; box-sizing:border-box;">
+            <p style="font-size:12px; color:#94a3b8; margin:6px 0 0 0;">iPhone and Android photos are accepted. Images are resized automatically.</p>
+        </div>
+        <button type="submit" class="btn btn-emerald" style="padding:12px 20px;">Post Decoy Listing (goes online immediately)</button>
+    </form>
+    '''
 
     active_table = f'<div style="overflow-x: auto;"><table class="data-table"><thead><tr><th>Node Name</th><th>Phone Address</th><th>Geographic Network Path</th><th>Status</th><th>Management</th></tr></thead><tbody>{active_nodes_html}</tbody></table></div>' if active_nodes_html else '<p style="color: var(--text-muted); font-style: italic; text-align: center;">No active nodes operating on current security grid.</p>'
 
@@ -1037,7 +1224,8 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
             </div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🏆 Node Reliability Leaderboard</h3><table class="data-table"><thead><tr><th>Rank</th><th>Farmer Deployed Node Name</th><th>Grid Sector Focus</th><th>Network Rating</th></tr></thead><tbody>{leaderboard_html or "<tr><td colspan='4' style='color:var(--text-muted); font-style:italic;'>No XP metrics available.</td></tr>"}</tbody></table></div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3><span style="color: #ef4444;" class="pulse">&bull;</span> Real-Time Emergency Vector Feed</h3><div id="live_threat_feed_target"><p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">Connecting link matrix...</p></div></div>
-            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🛒 Products Awaiting Approval</h3>{pending_products_table}</div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🧪 Post Decoy Listing (from injected farmers)</h3><p style="color:var(--text-muted); font-size:14px; margin:0 0 16px 0;">Use injected mock farmers to post test items. Listings go <b>Active / online</b> immediately so you can see them in the market.</p>{decoy_form_html}</div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🛒 Manage Adverts / Products</h3>{pending_products_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⏳ Executive Node Approvals Pending</h3>{pending_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🚩 Recent Message Reports</h3>{reports_table}</div>
             <div class="glass-panel" style="padding: 30px;"><h3>🗂️ Active Grid Infrastructure Map</h3>{active_table}</div>
@@ -2230,7 +2418,7 @@ async def simple_chat_page(
         '    body.value = "";'
         '    var note = document.getElementById("sentMsg");'
         '    note.style.display = "block";'
-        '    setTimeout(function(){ note.style.display = "none"; }, 2000);'
+        '    setTimeout(function(){ note.style.display = "none"; }, 3000);'
         '  }'
         '});'
         '</script></div></body></html>'
@@ -2599,18 +2787,7 @@ async def farmer_feed_portal(
             msg_btn = f'<a href="/portal/chat?with={html.escape(str(p["farmer_phone"] or ""))}" style="display:inline-block;padding:8px 12px;background:rgba(16,185,129,0.2);border:1px solid rgba(16,185,129,0.4);color:#6ee7b7;border-radius:10px;font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap;">💬 Message</a>'
 
         interest_html = ""
-        if not is_mine and not is_sold:
-            interest_html = f"""
-            <div style="margin-top:12px;">
-                <form action="/portal/market/interest" method="post" enctype="multipart/form-data" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-                    <input type="hidden" name="product_id" value="{p['id']}">
-                    <input type="hidden" name="seller_phone" value="{html.escape(str(p['farmer_phone'] or ''))}">
-                    <label style="font-size:13px; color:#94a3b8;">Photo of goods (optional)</label>
-                    <input type="file" name="interest_photo" accept="image/*" capture="environment" style="font-size:13px; color:#cbd5e1;">
-                    <button type="submit" class="btn btn-emerald" style="padding:8px 14px; font-size:13px;">I am interested</button>
-                </form>
-            </div>
-            """
+        # "I am interested" button removed — buyers use Call / Message instead.
 
         products_html += f"""
         <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:16px; margin-bottom:14px; {card_opacity}">
@@ -2620,7 +2797,7 @@ async def farmer_feed_portal(
                     <div style="font-size:13px; color:#94a3b8; font-weight:700;">{html.escape(p['category'] or 'General')} · {html.escape(p['lga'] or '')}{sold_badge}</div>
                     <div style="font-size:18px; font-weight:800; color:#f1f5f9; margin-top:6px; line-height:1.3;">{html.escape(p['title'])}</div>
                 </div>
-                <div style="font-size:18px; font-weight:800; color:{price_color}; white-space:nowrap;">{html.escape(p['price'] or 'Ask price')}</div>
+                <div style="font-size:18px; font-weight:800; color:{price_color}; white-space:nowrap;">{html.escape(p['price']) if p['price'] else ''}</div>
             </div>
             <p style="font-size:15px; color:#cbd5e1; margin:12px 0; line-height:1.5;">{html.escape(p['description'] or '')}</p>
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; font-size:14px;">
@@ -3415,6 +3592,36 @@ async def farmer_feed_portal(
             </div>
 
             <div id="tab_market" style="{show_market}">
+                <div class="portal-card" style="max-width:720px; margin:0 auto;">
+                    <div class="card-header">📦 <h3 class="card-title">Find products</h3></div>
+                    <form action="/portal/feed" method="get" style="margin-bottom:16px;">
+                        <input type="hidden" name="active_tab" value="market">
+                        {hidden_cat}
+                        {hidden_status}
+                        {hidden_mine}
+                        <label style="font-size:14px; font-weight:700; color:#e2e8f0; display:block; margin-bottom:6px;">Search</label>
+                        <input type="text" name="market_q" value="{active_q}" placeholder="Type crop name, seller or town…"
+                               style="width:100%; padding:14px; font-size:17px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:12px; box-sizing:border-box; margin-bottom:12px;">
+                        <label style="font-size:14px; font-weight:700; color:#e2e8f0; display:block; margin-bottom:6px;">Sort by</label>
+                        <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+                            <select name="market_sort" style="flex:1; min-width:140px; padding:14px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:12px;">
+                                {sort_select_opts}
+                            </select>
+                            <button type="submit" class="btn btn-emerald" style="padding:14px 22px; font-size:16px;">Search</button>
+                        </div>
+                    </form>
+                    <div style="font-size:14px; font-weight:700; color:#94a3b8; margin-bottom:8px;">Type of product</div>
+                    <div style="margin-bottom:12px;">{filter_chips}</div>
+                    <div style="font-size:14px; font-weight:700; color:#94a3b8; margin-bottom:8px;">Status</div>
+                    <div style="margin-bottom:12px;">{status_chips}{mine_chip}</div>
+                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:14px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.06);">
+                        <span style="font-size:15px; color:#e2e8f0; font-weight:600;">{result_label}</span>
+                        {clear_filters_btn}
+                    </div>
+                    {products_html}
+                </div>
+            </div>
+
                 <div class="portal-card" style="max-width:720px; margin:0 auto 20px;">
                     <div class="card-header">🛒 <h3 class="card-title">Farm Market</h3></div>
                     {('<div style="background:rgba(245,158,11,0.15); border:1px solid rgba(245,158,11,0.4); border-radius:12px; padding:14px; margin-bottom:14px; color:#fbbf24; font-weight:700;">✅ Listing submitted. An admin must approve it before it goes live.</div>') if posted else ''}
@@ -3482,36 +3689,6 @@ async def farmer_feed_portal(
                         <button type="submit" class="btn btn-emerald" style="width:100%; padding:16px; font-size:17px;">Post to Market</button>
                     </form>
                 </div>
-                <div class="portal-card" style="max-width:720px; margin:0 auto;">
-                    <div class="card-header">📦 <h3 class="card-title">Find products</h3></div>
-                    <form action="/portal/feed" method="get" style="margin-bottom:16px;">
-                        <input type="hidden" name="active_tab" value="market">
-                        {hidden_cat}
-                        {hidden_status}
-                        {hidden_mine}
-                        <label style="font-size:14px; font-weight:700; color:#e2e8f0; display:block; margin-bottom:6px;">Search</label>
-                        <input type="text" name="market_q" value="{active_q}" placeholder="Type crop name, seller or town…"
-                               style="width:100%; padding:14px; font-size:17px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:12px; box-sizing:border-box; margin-bottom:12px;">
-                        <label style="font-size:14px; font-weight:700; color:#e2e8f0; display:block; margin-bottom:6px;">Sort by</label>
-                        <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
-                            <select name="market_sort" style="flex:1; min-width:140px; padding:14px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:12px;">
-                                {sort_select_opts}
-                            </select>
-                            <button type="submit" class="btn btn-emerald" style="padding:14px 22px; font-size:16px;">Search</button>
-                        </div>
-                    </form>
-                    <div style="font-size:14px; font-weight:700; color:#94a3b8; margin-bottom:8px;">Type of product</div>
-                    <div style="margin-bottom:12px;">{filter_chips}</div>
-                    <div style="font-size:14px; font-weight:700; color:#94a3b8; margin-bottom:8px;">Status</div>
-                    <div style="margin-bottom:12px;">{status_chips}{mine_chip}</div>
-                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:14px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.06);">
-                        <span style="font-size:15px; color:#e2e8f0; font-weight:600;">{result_label}</span>
-                        {clear_filters_btn}
-                    </div>
-                    {products_html}
-                </div>
-            </div>
-
             <div id="tab_messages" style="{show_messages}">
                 <div class="portal-card" style="max-width:720px; margin:0 auto; min-height:400px;">
                     <div class="card-header">💬 <h3 class="card-title">Messages</h3></div>
@@ -3702,6 +3879,77 @@ async def farmer_feed_portal(
                 setTimeout(() => {{ t.style.opacity = '0'; }}, 1800);
                 setTimeout(() => t.remove(), 2500);
             }}
+
+            // General success flash (3 seconds, no page jump)
+            function showFlash(message, isError) {{
+                const t = document.createElement('div');
+                const bg = isError ? 'rgba(239,68,68,0.95)' : 'rgba(16,185,129,0.95)';
+                t.style.cssText = 'position:fixed; top:24px; left:50%; transform:translateX(-50%); background:' + bg + '; color:#fff; padding:14px 28px; border-radius:14px; font-weight:800; font-size:16px; z-index:9999; box-shadow:0 10px 30px rgba(0,0,0,0.4); opacity:1; transition:opacity 0.5s, transform 0.3s; text-align:center; max-width:90%;';
+                t.innerHTML = (isError ? '⚠️ ' : '✅ ') + message;
+                document.body.appendChild(t);
+                setTimeout(() => {{ t.style.opacity = '0'; t.style.transform = 'translateX(-50%) translateY(-10px)'; }}, 2700);
+                setTimeout(() => t.remove(), 3300);
+            }}
+
+            // Intercept form submits so actions stay on the page (no jump to top)
+            document.addEventListener('submit', async function(e) {{
+                const form = e.target;
+                if (!form || form.tagName !== 'FORM') return;
+                const method = (form.method || 'get').toLowerCase();
+                if (method !== 'post') return;
+                // Skip forms that must do a full navigation (e.g. login, registration, file-heavy or special)
+                const action = form.action || '';
+                if (action.includes('/portal/auth') || action.includes('/submit-registration') || action.includes('/admin/login') || action.includes('/portal/alert/raise') || action.includes('/portal/market/post')) {{
+                    return; // let normal submit happen
+                }}
+                e.preventDefault();
+                const btn = form.querySelector('button[type="submit"], input[type="submit"]');
+                const originalText = btn ? btn.innerHTML : '';
+                if (btn) {{ btn.disabled = true; btn.style.opacity = '0.6'; }}
+                try {{
+                    const fd = new FormData(form);
+                    const res = await fetch(action, {{ method: 'POST', body: fd, credentials: 'same-origin' }});
+                    // Determine friendly message from the endpoint
+                    let msg = 'Done';
+                    if (action.includes('/friend/request')) msg = 'Your request has been sent';
+                    else if (action.includes('/friend/accept')) msg = 'Friend request accepted';
+                    else if (action.includes('/friend/reject')) msg = 'Request declined';
+                    else if (action.includes('/messages/send')) msg = 'Your message has been sent';
+                    else if (action.includes('/status/like')) msg = 'Liked';
+                    else if (action.includes('/status/comment')) msg = 'Comment posted';
+                    else if (action.includes('/status/repost')) msg = 'Reposted';
+                    else if (action.includes('/status/hide')) msg = 'Post hidden';
+                    else if (action.includes('/status/report')) msg = 'Report submitted';
+                    else if (action.includes('/market/report')) msg = 'Listing reported';
+                    else if (action.includes('/market/review')) msg = 'Review submitted';
+                    else if (action.includes('/market/interest')) msg = 'Your message has been sent';
+                    else if (action.includes('/shoutout')) msg = 'Shout-out posted';
+                    else if (action.includes('/checkin')) msg = 'Checked in';
+                    else if (action.includes('/block-node')) msg = 'Blocked';
+                    else if (action.includes('/unblock-node')) msg = 'Unblocked';
+                    else if (action.includes('/flag-node')) msg = 'Reported';
+                    else if (action.includes('/sensors/submit')) msg = 'Soil reading saved';
+                    else if (res.ok) msg = 'Success';
+                    else msg = 'Something went wrong';
+                    showFlash(msg, !res.ok);
+                    // Light UI updates without reload
+                    if (action.includes('/status/like') && btn) {{
+                        const m = btn.innerText.match(/\\d+/);
+                        const n = m ? parseInt(m[0], 10) + 1 : 1;
+                        btn.innerHTML = '👍 ' + n;
+                    }}
+                    if (action.includes('/friend/request') && btn) {{
+                        btn.outerHTML = '<span style="color:#fbbf24; font-size:12px; font-weight:700;">⏳ Pending</span>';
+                    }}
+                    if (form.querySelector('input[name="body"]') || form.querySelector('input[name="content"]') || form.querySelector('input[name="text"]') || form.querySelector('input[name="message"]')) {{
+                        form.reset();
+                    }}
+                }} catch (err) {{
+                    showFlash('Network error — try again', true);
+                }} finally {{
+                    if (btn && btn.parentNode) {{ btn.disabled = false; btn.style.opacity = '1'; if (originalText) btn.innerHTML = originalText; }}
+                }}
+            }});
             async function submitScore(game, score) {{
                 const fd = new FormData();
                 fd.append('game_name', game);
