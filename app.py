@@ -88,6 +88,9 @@ MAX_SHOUTOUT_LEN = 120
 MAX_PRODUCT_TITLE = 80
 MAX_PRODUCT_DESC = 300
 PRODUCT_CATEGORIES = ("Crops", "Livestock", "Tools", "Seeds", "Produce", "Other")
+LIVESTOCK_TYPES = ("Dog", "Birds", "Cow", "Goats", "Chicken", "Exotic Pets")
+DOG_SEX = ("Male", "Female")
+COW_BREEDS = ("White Fulani", "Red Bororo", "Sokoto Gudali", "Muturu", "Ndama", "Holstein", "Other")
 
 FARMING_TIPS = [
     "Water early morning or late evening to reduce evaporation.",
@@ -1353,6 +1356,11 @@ async def post_farm_product(
     price: str = Form(""),
     category: str = Form("General"),
     contact_phone: str = Form(""),
+    animal_type: str = Form(""),
+    dog_sex: str = Form(""),
+    cow_breed: str = Form(""),
+    breed_custom: str = Form(""),
+    exotic_type: str = Form(""),
     photos: Optional[List[UploadFile]] = File(None),
     current_user=Depends(get_current_farmer)
 ):
@@ -1365,6 +1373,18 @@ async def post_farm_product(
     desc_c = sanitize(description)[:MAX_PRODUCT_DESC]
     price_c = sanitize(price)[:40]
     cat = sanitize(category)[:30] if category else "General"
+    if cat == "Livestock" and animal_type:
+        bits = [sanitize(animal_type)]
+        if animal_type == "Dog" and dog_sex:
+            bits.append(sanitize(dog_sex))
+        if animal_type == "Cow":
+            breed = sanitize(breed_custom) if cow_breed == "Other" and breed_custom else sanitize(cow_breed)
+            if breed:
+                bits.append(breed)
+        if animal_type == "Exotic Pets" and exotic_type:
+            bits.append(sanitize(exotic_type))
+        extra = " · ".join(bits)
+        desc_c = (extra + (" — " + desc_c if desc_c else ""))[:MAX_PRODUCT_DESC]
     contact = normalize_nigerian_mobile(contact_phone) or current_user["phone"]
 
     photo_paths = []
@@ -3350,9 +3370,40 @@ async def farmer_feed_portal(
                         <input type="text" name="title" required maxlength="{MAX_PRODUCT_TITLE}" placeholder="e.g. Fresh cassava, 50kg bags"
                                style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; box-sizing:border-box; margin-bottom:12px;">
                         <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Category</label>
-                        <select name="category" style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; margin-bottom:12px;">
+                        <select name="category" id="prod_category" onchange="toggleLivestock()" style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; margin-bottom:12px;">
                             {category_options}
                         </select>
+                        <div id="livestock_fields" style="display:none; background:rgba(16,185,129,0.06); border:1px solid rgba(16,185,129,0.2); border-radius:12px; padding:12px; margin-bottom:12px;">
+                            <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Animal</label>
+                            <select name="animal_type" id="animal_type" onchange="toggleAnimal()" style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; margin:6px 0 12px;">
+                                <option value="">Select animal</option>
+                                {"".join([f'<option value="{a}">{a}</option>' for a in LIVESTOCK_TYPES])}
+                            </select>
+                            <div id="dog_fields" style="display:none;">
+                                <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Dog sex</label>
+                                <select name="dog_sex" style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; margin:6px 0 12px;">
+                                    <option value="">Optional</option>
+                                    {"".join([f'<option value="{s}">{s}</option>' for s in DOG_SEX])}
+                                </select>
+                            </div>
+                            <div id="cow_fields" style="display:none;">
+                                <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Cow breed</label>
+                                <select name="cow_breed" id="cow_breed" onchange="toggleBreed()" style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; margin:6px 0 12px;">
+                                    <option value="">Select breed</option>
+                                    {"".join([f'<option value="{b}">{b}</option>' for b in COW_BREEDS])}
+                                </select>
+                                <div id="breed_custom_wrap" style="display:none;">
+                                    <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Enter breed (optional)</label>
+                                    <input type="text" name="breed_custom" maxlength="40" placeholder="Type breed name"
+                                           style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; margin:6px 0 12px; box-sizing:border-box;">
+                                </div>
+                            </div>
+                            <div id="exotic_fields" style="display:none;">
+                                <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Exotic pet type (optional)</label>
+                                <input type="text" name="exotic_type" maxlength="40" placeholder="e.g. Parrot, Rabbit, Tortoise"
+                                       style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; margin:6px 0 12px; box-sizing:border-box;">
+                            </div>
+                        </div>
                         <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Price</label>
                         <input type="text" name="price" placeholder="e.g. ₦15,000 per bag" maxlength="40"
                                style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; box-sizing:border-box; margin-bottom:12px;">
@@ -3684,6 +3735,26 @@ async def farmer_feed_portal(
             <div style="position:absolute; top:16px; right:20px; color:#fff; font-size:28px; cursor:pointer;">✕</div>
         </div>
         <script>
+        function toggleLivestock() {{
+            var cat = document.getElementById('prod_category');
+            var box = document.getElementById('livestock_fields');
+            if (cat && box) box.style.display = (cat.value === 'Livestock') ? 'block' : 'none';
+        }}
+        function toggleAnimal() {{
+            var a = document.getElementById('animal_type');
+            var v = a ? a.value : '';
+            var dog = document.getElementById('dog_fields');
+            var cow = document.getElementById('cow_fields');
+            var exo = document.getElementById('exotic_fields');
+            if (dog) dog.style.display = (v === 'Dog') ? 'block' : 'none';
+            if (cow) cow.style.display = (v === 'Cow') ? 'block' : 'none';
+            if (exo) exo.style.display = (v === 'Exotic Pets') ? 'block' : 'none';
+        }}
+        function toggleBreed() {{
+            var b = document.getElementById('cow_breed');
+            var wrap = document.getElementById('breed_custom_wrap');
+            if (b && wrap) wrap.style.display = (b.value === 'Other') ? 'block' : 'none';
+        }}
         function previewProtected(src) {{
             var box = document.getElementById('photoPreview');
             document.getElementById('photoPreviewImg').src = src;
