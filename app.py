@@ -263,6 +263,10 @@ async def lifespan(app: FastAPI):
             );
         """)
         try:
+            await conn.execute("ALTER TABLE farmers ADD COLUMN password_hash TEXT;")
+        except Exception:
+            pass
+        try:
             await conn.execute("ALTER TABLE alerts_log ADD COLUMN video_path TEXT;")
         except Exception:
             pass
@@ -595,44 +599,41 @@ async def get_current_farmer(farmer_session: Optional[str] = Cookie(None)):
 
 
 @app.post("/portal/auth")
-async def farmer_authentication(phone: str = Form(...)):
+async def farmer_authentication(phone: str = Form(...), password: str = Form(...)):
     target = normalize_nigerian_mobile(phone)
     if not target:
         return RedirectResponse(
             url="/portal/login?error=Invalid phone number. Use a valid Nigerian mobile (070/080/081/090/091).",
             status_code=303
         )
+    if len(password) < 6:
+        return RedirectResponse(url="/portal/login?error=Password must be at least 6 characters.", status_code=303)
+    pw_hash = hashlib.sha256(password.encode()).hexdigest()
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         async with conn.execute("SELECT * FROM farmers WHERE phone = ?", (target,)) as cursor:
             farmer = await cursor.fetchone()
-    if farmer:
-        if farmer["status"] == "Pending":
-            return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting verification clearance.",
-                                    status_code=303)
-        if farmer["status"] == STATUS_REPORTED:
-            return RedirectResponse(
-                url="/portal/login?error=Access Restricted. Your node has been reported and is under review.",
-                status_code=303
-            )
-        res = RedirectResponse(url="/portal/feed", status_code=303)
-        signed_token = sign_cookie_value(target)
-        # secure=True in production (HTTPS). Set COOKIE_SECURE=1 env var.
-        cookie_secure = os.getenv("COOKIE_SECURE", "0") == "1"
-        res.set_cookie(
-            key="farmer_session",
-            value=signed_token,
-            max_age=31536000,
-            httponly=True,
-            secure=cookie_secure,
-            samesite="lax"
-        )
-        return res
-    return RedirectResponse(url="/portal/login?error=Phone number not recognized on network scale.", status_code=303)
+        if not farmer:
+            return RedirectResponse(url="/portal/login?error=Phone number not recognized on network scale.", status_code=303)
+        stored = farmer["password_hash"] if "password_hash" in farmer.keys() else None
+        if not stored:
+            await conn.execute("UPDATE farmers SET password_hash = ? WHERE phone = ?", (pw_hash, target))
+            await conn.commit()
+        elif not hmac.compare_digest(stored, pw_hash):
+            return RedirectResponse(url="/portal/login?error=Wrong password. Try again.", status_code=303)
+    if farmer["status"] == "Pending":
+        return RedirectResponse(url="/portal/login?error=Access Restricted. Awaiting verification clearance.", status_code=303)
+    if farmer["status"] == STATUS_REPORTED:
+        return RedirectResponse(url="/portal/login?error=Access Restricted. Your node has been reported and is under review.", status_code=303)
+    res = RedirectResponse(url="/portal/feed", status_code=303)
+    signed_token = sign_cookie_value(target)
+    cookie_secure = os.getenv("COOKIE_SECURE", "0") == "1"
+    res.set_cookie(key="farmer_session", value=signed_token, max_age=31536000, httponly=True, secure=cookie_secure, samesite="lax")
+    return res
 
 
 @app.post("/submit-registration")
-async def handle_registration(name: str = Form(...), phone: str = Form(...), city_manual: str = Form(...)):
+async def handle_registration(name: str = Form(...), phone: str = Form(...), city_manual: str = Form(...), password: str = Form(...)):
     clean_p = normalize_nigerian_mobile(phone)
     if not clean_p:
         return HTMLResponse(content=f"""
@@ -648,17 +649,20 @@ async def handle_registration(name: str = Form(...), phone: str = Form(...), cit
             </p>
             <a href="/register" class="btn btn-emerald" style="width: 100%; box-sizing: border-box;">Try Again</a>
         </div></body></html>""", status_code=400)
+    if len(password) < 6:
+        return RedirectResponse(url="/register?error=short", status_code=303)
 
     lookup = city_manual.strip().lower()
     geo = CITY_AUTOFILL_MAP.get(lookup,
                                 {"country": "Nigeria", "state": "Region", "lga": city_manual, "area": "General Hub"})
     unique_token = hashlib.sha256(os.urandom(24)).hexdigest()[:16]
+    pw_hash = hashlib.sha256(password.encode()).hexdigest()
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("""
-            INSERT OR REPLACE INTO farmers (phone, name, country, state, city, lga, area, token, status, xp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 100)
+            INSERT OR REPLACE INTO farmers (phone, name, country, state, city, lga, area, token, status, xp, password_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 100, ?)
         """, (clean_p, sanitize(name), geo["country"], geo["state"], sanitize(city_manual), geo["lga"], geo["area"],
-              unique_token))
+              unique_token, pw_hash))
         await conn.commit()
     return HTMLResponse(content=f"""
     <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head>
@@ -1114,6 +1118,10 @@ def registration_form():
                     Write the name of your town (e.g. Osogbo, Ibadan, Ile-Ife, Ogbomoso)
                 </p>
 
+                <label>4. Create a Password</label>
+                <input type='password' name='password' placeholder='At least 6 characters' required minlength='6' autocomplete='new-password'>
+                <p class="field-help">This password protects your account from ID theft.</p>
+
                 <br>
                 <button type='submit' class='btn btn-emerald' style='width:100%; font-size:18px; padding:18px; margin-top:8px;'>
                     Register My Farm
@@ -1147,16 +1155,19 @@ def farmer_login_page(error: str = None):
     return f"""<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>{UPGRADED_CSS}</style></head>
     <body><div class='glass-panel' style='max-width:420px; margin:60px auto;'>
         <h2 style="font-size:26px; margin-bottom:8px;">Member Sign In</h2>
-        <p style="color:#94a3b8; font-size:15px; margin-bottom:20px;">Enter your registered phone number</p>
+        <p style="color:#94a3b8; font-size:15px; margin-bottom:20px;">Enter your phone number and password</p>
         {err_msg}
         <form action='/portal/auth' method='post'>
             <label>Phone Number</label>
             <input type='text' name='phone' placeholder='e.g. 0803 123 4567' required inputmode='numeric'>
+            <label style="margin-top:12px; display:block;">Password</label>
+            <input type='password' name='password' placeholder='Your password' required minlength='6'>
             <p style='font-size:14px; color:#cbd5e1; margin:8px 0 18px 0; line-height:1.4;'>
                 Nigerian mobile only — <b style="color:#f8fafc;">070, 080, 081, 090, 091</b>
             </p>
             <button type='submit' class='btn btn-emerald' style='width:100%; font-size:17px; padding:16px;'>Sign In</button>
         </form>
+        <a href='/register' class='btn' style='display:block; width:100%; text-align:center; margin-top:12px; padding:14px; background:rgba(255,255,255,0.06); color:#cbd5e1; text-decoration:none; border-radius:12px; box-sizing:border-box;'>← Go back to Register</a>
     </div></body></html>"""
 
 
@@ -1357,7 +1368,7 @@ async def post_farm_product(
     category: str = Form("General"),
     contact_phone: str = Form(""),
     animal_type: str = Form(""),
-    dog_sex: str = Form(""),
+    animal_sex: str = Form(""),
     cow_breed: str = Form(""),
     breed_custom: str = Form(""),
     exotic_type: str = Form(""),
@@ -1375,8 +1386,8 @@ async def post_farm_product(
     cat = sanitize(category)[:30] if category else "General"
     if cat == "Livestock" and animal_type:
         bits = [sanitize(animal_type)]
-        if animal_type == "Dog" and dog_sex:
-            bits.append(sanitize(dog_sex))
+        if animal_sex:
+            bits.append(sanitize(animal_sex))
         if animal_type == "Cow":
             breed = sanitize(breed_custom) if cow_breed == "Other" and breed_custom else sanitize(cow_breed)
             if breed:
@@ -3098,6 +3109,7 @@ async def farmer_feed_portal(
                        style="flex:1; min-width:160px; padding:12px 14px; font-size:16px; background:#0f172a; border:1.5px solid rgba(52,211,153,0.3); color:#f0fdf4; border-radius:10px;">
                 <button type="submit" class="btn btn-emerald" style="padding:12px 20px; font-size:15px; white-space:nowrap;">Search</button>
             </form>
+            {f'<div style="margin-bottom:16px;">{peer_card_html}</div>' if search_phone and peer_card_html else ''}
 
             <div class="tab-bar">
                 <a href="/portal/feed?active_tab=incidents" class="tab-btn" style="{tab_incidents_active}">🛡️ Alerts</a>
@@ -3379,11 +3391,12 @@ async def farmer_feed_portal(
                                 <option value="">Select animal</option>
                                 {"".join([f'<option value="{a}">{a}</option>' for a in LIVESTOCK_TYPES])}
                             </select>
-                            <div id="dog_fields" style="display:none;">
-                                <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Dog sex</label>
-                                <select name="dog_sex" style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; margin:6px 0 12px;">
+                            <div id="sex_fields" style="display:none;">
+                                <label style="font-size:14px; font-weight:700; color:#e2e8f0;">Sex</label>
+                                <select name="animal_sex" style="width:100%; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px; margin:6px 0 12px;">
                                     <option value="">Optional</option>
-                                    {"".join([f'<option value="{s}">{s}</option>' for s in DOG_SEX])}
+                                    <option value="Male">Male</option>
+                                    <option value="Female">Female</option>
                                 </select>
                             </div>
                             <div id="cow_fields" style="display:none;">
@@ -3743,10 +3756,10 @@ async def farmer_feed_portal(
         function toggleAnimal() {{
             var a = document.getElementById('animal_type');
             var v = a ? a.value : '';
-            var dog = document.getElementById('dog_fields');
+            var sex = document.getElementById('sex_fields');
             var cow = document.getElementById('cow_fields');
             var exo = document.getElementById('exotic_fields');
-            if (dog) dog.style.display = (v === 'Dog') ? 'block' : 'none';
+            if (sex) sex.style.display = v ? 'block' : 'none';
             if (cow) cow.style.display = (v === 'Cow') ? 'block' : 'none';
             if (exo) exo.style.display = (v === 'Exotic Pets') ? 'block' : 'none';
         }}
