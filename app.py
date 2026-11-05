@@ -3619,6 +3619,11 @@ async def farmer_feed_portal(
     show_farm_market = "display:block;" if is_farm_market_tab else "display:none;"
     checked_in_btn = "background:#334155; color:#94a3b8; pointer-events:none;" if checked_in_today else ""
     checked_in_label = "Checked in today ✓" if checked_in_today else f"I'm OK (+{CHECKIN_XP} XP)"
+    pending_request_badge = (
+        f' <span style="background:#f59e0b;color:#111827;border-radius:999px;'
+        f'padding:2px 7px;font-size:11px;font-weight:800;">{pending_request_count}</span>'
+        if pending_request_count else ""
+    )
 
     echo_feed_html = ""
     async with aiosqlite.connect(DB_FILE) as conn:
@@ -3720,7 +3725,7 @@ async def farmer_feed_portal(
 
             <div class="tab-bar">
                 <a href="/portal/feed?active_tab=incidents" class="tab-btn" style="{tab_incidents_active}">🛡️ Alerts</a>
-                <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community{f' <span style=\"background:#f59e0b;color:#111827;border-radius:999px;padding:2px 7px;font-size:11px;font-weight:800;\">{pending_request_count}</span>' if pending_request_count else ''}</a>
+                <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community{pending_request_badge}</a>
                 <a href="/portal/feed?active_tab=market" class="tab-btn" style="{tab_market_active}">🔍 Find Products</a>
                 <a href="/portal/feed?active_tab=farm_market" class="tab-btn" style="{tab_farm_market_active}">🛒 Farm Market</a>
                 <a id="messages-nav-link" href="/portal/messages" class="tab-btn" style="background:transparent; color:var(--text-muted);">💬 Messages{unread_badge}</a>
