@@ -20,7 +20,7 @@ import asyncio
 import aiosqlite
 from typing import Optional, Dict, List
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Form, Response, Depends, HTTPException, status, Cookie, File, UploadFile, Query
+from fastapi import FastAPI, Form, Response, Depends, HTTPException, status, Cookie, File, UploadFile, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -50,7 +50,7 @@ if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
     print("WARNING: Twilio credentials not set. WhatsApp alerts will fail.")
 
 DB_FILE = "farm_watch.db"
-MEDIA_DIR = "static_media"
+MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static_media")
 
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
@@ -72,7 +72,7 @@ RESTRICTED_STATUSES = {STATUS_PENDING, STATUS_REPORTED}
 
 # Messaging safety limits
 MAX_MESSAGE_LENGTH = 350
-MAX_UPLOAD_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_UPLOAD_SIZE = 15 * 1024 * 1024  # 15 MB
 MAX_MESSAGES_PER_HOUR_TO_PEER = 8
 MAX_MESSAGES_PER_DAY = 25
 REPORTS_TO_AUTO_FLAG = 2
@@ -326,6 +326,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Farm Watch Enterprise Node", version="5.2.1", lifespan=lifespan)
 security = HTTPBasic(auto_error=False)
 app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
+
+@app.get("/product-photo/{filename}")
+async def product_photo(filename: str):
+    safe = os.path.basename(filename)
+    path = os.path.join(MEDIA_DIR, safe)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Photo not found")
+    from fastapi.responses import FileResponse
+    return FileResponse(path)
 
 
 def clean_phone(phone: str) -> str:
@@ -1361,28 +1370,23 @@ async def report_status(status_id: int = Form(...), reason: str = Form("Inapprop
 
 
 @app.post("/portal/market/post")
-async def post_farm_product(
-    title: str = Form(...),
-    description: str = Form(""),
-    price: str = Form(""),
-    category: str = Form("General"),
-    contact_phone: str = Form(""),
-    animal_type: str = Form(""),
-    animal_sex: str = Form(""),
-    cow_breed: str = Form(""),
-    breed_custom: str = Form(""),
-    exotic_type: str = Form(""),
-    photos: Optional[List[UploadFile]] = File(None),
-    current_user=Depends(get_current_farmer)
-):
-    """Post a farm product listing (up to 5 photos). Accepts iPhone HEIC and converts to JPEG."""
+async def post_farm_product(request: Request, current_user=Depends(get_current_farmer)):
+    """Post a farm product listing (up to 5 photos). Always saves a browser-readable JPEG."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    title_c = sanitize(title)[:MAX_PRODUCT_TITLE]
+    form = await request.form()
+    title_c = sanitize(str(form.get("title") or ""))[:MAX_PRODUCT_TITLE]
     if not title_c:
         return RedirectResponse(url="/portal/feed?active_tab=market&post_err=title", status_code=303)
-    desc_c = sanitize(description)[:MAX_PRODUCT_DESC]
-    price_c = sanitize(price)[:40]
+    desc_c = sanitize(str(form.get("description") or ""))[:MAX_PRODUCT_DESC]
+    price_c = sanitize(str(form.get("price") or ""))[:40]
+    category = str(form.get("category") or "General")
+    contact_phone = str(form.get("contact_phone") or "")
+    animal_type = str(form.get("animal_type") or "")
+    animal_sex = str(form.get("animal_sex") or "")
+    cow_breed = str(form.get("cow_breed") or "")
+    breed_custom = str(form.get("breed_custom") or "")
+    exotic_type = str(form.get("exotic_type") or "")
     cat = sanitize(category)[:30] if category else "General"
     if cat == "Livestock" and animal_type:
         bits = [sanitize(animal_type)]
@@ -1399,34 +1403,55 @@ async def post_farm_product(
     contact = normalize_nigerian_mobile(contact_phone) or current_user["phone"]
 
     photo_paths = []
-    file_list = photos if isinstance(photos, list) else ([photos] if photos else [])
-    for photo in file_list[:5]:
-        if not photo or not getattr(photo, "filename", None):
+    uploads = form.getlist("photos")
+    print(f"Market post photos received: {len(uploads)}")
+    for photo in uploads[:5]:
+        if not hasattr(photo, "read"):
+            print(f"Skip non-file part: {type(photo)}")
             continue
         try:
             raw = await photo.read()
-            if not raw or len(raw) > MAX_UPLOAD_SIZE:
+            print(f"Photo bytes: {len(raw) if raw else 0} name={getattr(photo, 'filename', '')}")
+            if not raw:
                 continue
-            from PIL import Image
-            import io
-            img = Image.open(io.BytesIO(raw))
-            img = img.convert("RGB")
-            img.thumbnail((1200, 1200))
+            if len(raw) > MAX_UPLOAD_SIZE:
+                print("Photo too large, skipped")
+                continue
             fname = f"prod_{hashlib.md5(os.urandom(16)).hexdigest()}.jpg"
             dest = os.path.join(MEDIA_DIR, fname)
-            img.save(dest, "JPEG", quality=82, optimize=True)
-            photo_paths.append(fname)
+            saved = False
+            try:
+                from PIL import Image
+                import io
+                try:
+                    import pillow_heif
+                    pillow_heif.register_heif_opener()
+                except Exception:
+                    pass
+                img = Image.open(io.BytesIO(raw))
+                img = img.convert("RGB")
+                img.thumbnail((800, 800))
+                img.save(dest, "JPEG", quality=70)
+                saved = True
+            except Exception as conv_err:
+                print(f"Convert failed, saving raw: {conv_err}")
+                with open(dest, "wb") as f:
+                    f.write(raw)
+                saved = True
+            if saved and os.path.exists(dest):
+                photo_paths.append(fname)
+                print(f"Saved photo: {dest}")
         except Exception as e:
-            print(f"Photo convert skip: {e}")
+            print(f"Photo save error: {e}")
             continue
 
     photo_path = ",".join(photo_paths) if photo_paths else None
-
+    print(f"photo_path stored: {photo_path}")
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute(
             """INSERT INTO farm_products
                (farmer_phone, farmer_name, lga, title, description, price, contact_phone, category, photo_path, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending')""",
             (current_user["phone"], current_user["name"], current_user["lga"],
              title_c, desc_c, price_c, contact, cat, photo_path)
         )
@@ -1799,7 +1824,7 @@ async def send_direct_message(
         )
         await conn.commit()
 
-    return RedirectResponse(url=redirect_url, status_code=303)
+    return RedirectResponse(url=redirect_url + "&sent=1", status_code=303)
 
 
 @app.post("/portal/messages/delete")
@@ -2099,6 +2124,7 @@ async def simple_messages_page(current_user=Depends(get_current_farmer)):
 @app.get("/portal/chat", response_class=HTMLResponse)
 async def simple_chat_page(
     with_phone: str = Query(..., alias="with"),
+    sent: Optional[str] = Query(None),
     current_user=Depends(get_current_farmer)
 ):
     """Lightweight one-to-one chat."""
@@ -2179,11 +2205,35 @@ async def simple_chat_page(
         '<div class="header"><a href="/portal/messages" class="back">← Back</a>'
         f'<div class="name">{html.escape(peer_name)} ✅</div><span></span></div>'
         f'<div style="font-size:13px;color:#94a3b8;margin-bottom:12px;font-family:monospace;">{mask_phone_number(peer_phone)}</div>'
-        f'<div class="chat">{messages_html}</div>'
-        '<form action="/portal/messages/send" method="post">'
+        + ('<div style="background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.4);border-radius:10px;padding:12px;margin-bottom:12px;color:#6ee7b7;font-weight:700;">✅ Message sent successfully.</div>' if sent else '')
+        + f'<div class="chat" id="chatBox">{messages_html}</div>'
+        '<div id="sentMsg" style="display:none;background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.4);border-radius:10px;padding:10px;margin-bottom:10px;color:#6ee7b7;font-weight:700;">✅ Message sent successfully.</div>'
+        '<form id="sendForm" action="/portal/messages/send" method="post">'
         f'<input type="hidden" name="receiver_phone" value="{peer_phone}">'
-        '<input type="text" name="body" placeholder="Type a message..." required maxlength="350" autocomplete="off">'
-        '<button type="submit">Send</button></form></div></body></html>'
+        '<input type="text" name="body" id="msgBody" placeholder="Type a message..." required maxlength="350" autocomplete="off">'
+        '<button type="submit">Send</button></form>'
+        '<script>'
+        'document.getElementById("sendForm").addEventListener("submit", async function(e) {'
+        '  e.preventDefault();'
+        '  var body = document.getElementById("msgBody");'
+        '  var text = body.value.trim();'
+        '  if (!text) return;'
+        '  var fd = new FormData(this);'
+        '  var res = await fetch("/portal/messages/send", {method:"POST", body:fd, redirect:"manual"});'
+        '  if (res.ok || res.status === 303 || res.type === "opaqueredirect") {'
+        '    var box = document.getElementById("chatBox");'
+        '    var line = document.createElement("div");'
+        '    line.style.cssText = "text-align:right;margin:8px 0;color:#6ee7b7;";'
+        '    line.textContent = text;'
+        '    box.appendChild(line);'
+        '    box.scrollTop = box.scrollHeight;'
+        '    body.value = "";'
+        '    var note = document.getElementById("sentMsg");'
+        '    note.style.display = "block";'
+        '    setTimeout(function(){ note.style.display = "none"; }, 2000);'
+        '  }'
+        '});'
+        '</script></div></body></html>'
     )
     return HTMLResponse(content=page)
 
@@ -2528,17 +2578,15 @@ async def farmer_feed_portal(
 
         photo_html = ""
         if p["photo_path"]:
-            paths = [x.strip() for x in p["photo_path"].split(",") if x.strip()]
-            def protected_img(path, style):
-                return f'''<div style="position:relative; display:inline-block; {style}" oncontextmenu="return false;">
-                    <img src="/media/{html.escape(path)}" alt="" style="width:100%; height:100%; object-fit:cover; border-radius:12px; pointer-events:none; user-select:none; -webkit-user-drag:none;" draggable="false">
-                    <div style="position:absolute; inset:0; cursor:pointer;" onclick="previewProtected(this.previousElementSibling.src)"></div>
-                </div>'''
-            if len(paths) == 1:
-                photo_html = protected_img(paths[0], "width:100%; max-height:220px; margin-bottom:12px;")
-            elif paths:
-                imgs = "".join([protected_img(pp, "width:48%; max-height:140px; margin:1%;") for pp in paths[:4]])
-                photo_html = f'<div style="display:flex; flex-wrap:wrap; margin-bottom:12px;">{imgs}</div>'
+            paths = [x.strip() for x in str(p["photo_path"]).split(",") if x.strip()]
+            imgs = []
+            for path in paths[:4]:
+                safe = html.escape(os.path.basename(path))
+                imgs.append(
+                    f'<img src="/product-photo/{safe}" alt="product photo" '
+                    f'style="width:100%; max-height:280px; object-fit:cover; border-radius:12px; margin:0 0 12px 0; display:block; background:#1e293b;">'
+                )
+            photo_html = "".join(imgs)
 
         sold_badge = '<span style="background:rgba(245,158,11,0.2); color:#fbbf24; font-size:12px; font-weight:800; padding:4px 10px; border-radius:6px; margin-left:6px;">SOLD</span>' if is_sold else ""
         price_color = "#94a3b8" if is_sold else "#6ee7b7"
@@ -3102,12 +3150,12 @@ async def farmer_feed_portal(
                     <a href="/portal/logout" class="btn btn-danger" style="padding:10px 20px; font-size:13px; border-radius:10px;">🔌 Disconnect</a></div>
             </div>
 
-            <form action="/portal/feed" method="get" style="margin-bottom:16px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:16px; padding:12px 16px;">
+            <form action="/portal/feed" method="get" style="margin-bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:12px; padding:8px 12px;">
                 <input type="hidden" name="active_tab" value="community">
-                <span style="font-size:16px; font-weight:700; color:#e2e8f0; white-space:nowrap;">🔍 Find a Farmer</span>
+                <span style="font-size:13px; font-weight:600; color:#94a3b8; white-space:nowrap;">🔍 Find a Farmer</span>
                 <input type="text" name="search_phone" placeholder="0803 123 4567" required inputmode="numeric" autocomplete="tel"
-                       style="flex:1; min-width:160px; padding:12px 14px; font-size:16px; background:#0f172a; border:1.5px solid rgba(52,211,153,0.3); color:#f0fdf4; border-radius:10px;">
-                <button type="submit" class="btn btn-emerald" style="padding:12px 20px; font-size:15px; white-space:nowrap;">Search</button>
+                       style="flex:1; min-width:140px; padding:8px 10px; font-size:14px; background:#0f172a; border:1px solid rgba(52,211,153,0.25); color:#f0fdf4; border-radius:8px; margin:0;">
+                <button type="submit" class="btn btn-emerald" style="padding:8px 14px; font-size:13px; white-space:nowrap;">Search</button>
             </form>
             {f'<div style="margin-bottom:16px;">{peer_card_html}</div>' if search_phone and peer_card_html else ''}
 
@@ -3369,7 +3417,7 @@ async def farmer_feed_portal(
             <div id="tab_market" style="{show_market}">
                 <div class="portal-card" style="max-width:720px; margin:0 auto 20px;">
                     <div class="card-header">🛒 <h3 class="card-title">Farm Market</h3></div>
-                    {('<div style="background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.4); border-radius:12px; padding:14px; margin-bottom:14px; color:#6ee7b7; font-weight:700;">✅ Your listing was posted successfully and is now visible on the market.</div>') if posted else ''}
+                    {('<div style="background:rgba(245,158,11,0.15); border:1px solid rgba(245,158,11,0.4); border-radius:12px; padding:14px; margin-bottom:14px; color:#fbbf24; font-weight:700;">✅ Listing submitted. An admin must approve it before it goes live.</div>') if posted else ''}
                     <div style="background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.35); border-radius:12px; padding:14px 16px; margin-bottom:16px; font-size:14px; color:#fecaca; line-height:1.5;">
                         <strong>⚠️ Scam Warning:</strong> Never send money before seeing the goods. Meet in a public place. Use the <b>Report</b> button if a listing looks suspicious. Farm Watch does not handle payments.
                     </div>
@@ -3397,6 +3445,7 @@ async def farmer_feed_portal(
                                     <option value="">Optional</option>
                                     <option value="Male">Male</option>
                                     <option value="Female">Female</option>
+                                    <option value="Both">Both</option>
                                 </select>
                             </div>
                             <div id="cow_fields" style="display:none;">
