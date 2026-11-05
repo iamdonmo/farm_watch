@@ -15,13 +15,14 @@ import os
 import hmac
 import hashlib
 import html
+import json
 import httpx
 import asyncio
 import aiosqlite
 from typing import Optional, Dict, List
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Form, Response, Depends, HTTPException, status, Cookie, File, UploadFile, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -272,12 +273,12 @@ async def lifespan(app: FastAPI):
             pass
         try:
             await conn.execute("ALTER TABLE farm_products ADD COLUMN photo_path TEXT;")
-            try:
-                await conn.execute("ALTER TABLE direct_messages ADD COLUMN seen INTEGER DEFAULT 0;")
-            except Exception:
-                pass
         except Exception:
             pass
+        async with conn.execute("PRAGMA table_info(direct_messages)") as cursor:
+            direct_message_columns = {row[1] for row in await cursor.fetchall()}
+        if "seen" not in direct_message_columns:
+            await conn.execute("ALTER TABLE direct_messages ADD COLUMN seen INTEGER DEFAULT 0;")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS friendships (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1172,9 +1173,13 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
     pulse_class = "pulse" if pending_clearance > 0 else ""
 
     # Safe data preparation for JavaScript extraction
-    map_nodes_js = ",".join([f"{{name:'{f['name']}', lga:'{f['lga']}', status:'{f['status']}'}}" for f in all_farmers if
-                             f['status'] == 'Approved'])
-    map_threats_js = ",".join([f"{{type:'{a['type']}', lga:'{a['lga']}'}}" for a in active_alerts])
+    map_nodes_json = html.escape(json.dumps([
+        {"name": f["name"], "lga": f["lga"], "status": f["status"]}
+        for f in all_farmers if f["status"] == "Approved"
+    ]), quote=True)
+    map_threats_json = html.escape(json.dumps([
+        {"type": a["type"], "lga": a["lga"]} for a in active_alerts
+    ]), quote=True)
 
     pending_html = ""
     for f in all_farmers:
@@ -1315,7 +1320,7 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS} .map-container {{ background: #040814; border: 1px solid var(--border-glass); border-radius: 20px; padding: 20px; margin-bottom: 30px; position: relative; overflow: hidden; }} .grid-bg {{ stroke: rgba(59, 130, 246, 0.05); stroke-width: 1; fill: none; }} .map-dot {{ transition: all 0.5s ease; cursor: pointer; }} .map-pulse {{ animation: map-pulse-ring 1.5s infinite ease-out; transform-origin: center; }} @keyframes map-pulse-ring {{ 0% {{ r: 6; opacity: 1; }} 100% {{ r: 25; opacity: 0; }} }}</style></head>
     <body>
-        <div class="container">
+        <div class="container" id="dashboard-content">
             <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-glass); padding-bottom: 24px; flex-wrap: wrap; gap: 15px;">
                 <div><h1>📡 Global Command Control</h1><p style="margin: 4px 0 0 0; color: var(--text-muted); font-size: 14px;">Farm Watch Security Operations Matrix</p></div>
                 <div style="display: flex; gap: 10px; align-items: center;">
@@ -1331,7 +1336,7 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
             </div>
             <div class="map-container">
                 <h3>🗺️ Tactical Sector Infrastructure Map</h3>
-                <svg id="vector_map" width="100%" height="320" style="background:#030712; border-radius:12px; border:1px solid rgba(255,255,255,0.02)"><defs><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M 40 0 L 0 0 0 40" class="grid-bg"/></pattern></defs><rect width="100%" height="100%" fill="url(#grid)" /><g id="map_hardware_layer"></g></svg>
+                <svg id="vector_map" data-nodes="{map_nodes_json}" data-threats="{map_threats_json}" width="100%" height="320" style="background:#030712; border-radius:12px; border:1px solid rgba(255,255,255,0.02)"><defs><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M 40 0 L 0 0 0 40" class="grid-bg"/></pattern></defs><rect width="100%" height="100%" fill="url(#grid)" /><g id="map_hardware_layer"></g></svg>
             </div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🏆 Node Reliability Leaderboard</h3><table class="data-table"><thead><tr><th>Rank</th><th>Farmer Deployed Node Name</th><th>Grid Sector Focus</th><th>Network Rating</th></tr></thead><tbody>{leaderboard_html or "<tr><td colspan='4' style='color:var(--text-muted); font-style:italic;'>No XP metrics available.</td></tr>"}</tbody></table></div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3><span style="color: #ef4444;" class="pulse">&bull;</span> Real-Time Emergency Vector Feed</h3><div id="live_threat_feed_target"><p style="color: var(--text-muted); font-style: italic; margin: 0; font-size: 14px;">Connecting link matrix...</p></div></div>
@@ -1346,13 +1351,14 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
     # Pure raw string for the script layout ensures Python doesn't look at javascript literals like ${p.x}
     html_template_script = """
         <script>
-            const container = document.getElementById('live_threat_feed_target');
             const geographicSectorCoordinates = {"OSOGBO": {x: 150, y: 220}, "ILE-IFE": {x: 280, y: 240}, "IBADAN": {x: 110, y: 140}, "OGBOMOSO": {x: 180, y: 80}, "KANO MUNICIPAL": {x: 620, y: 70}, "FAGGE": {x: 740, y: 90}, "IKEJA": {x: 450, y: 260}, "LEKKI": {x: 520, y: 280}};
             function renderTacticalVectorMap() { 
                 const layer = document.getElementById('map_hardware_layer'); 
                 if(!layer) return; 
                 layer.innerHTML = ""; 
-                const deploymentNodes = [REPLACE_NODES_DATA], operationalThreats = [REPLACE_THREATS_DATA]; 
+                const map = document.getElementById('vector_map');
+                const deploymentNodes = JSON.parse(map.dataset.nodes || '[]');
+                const operationalThreats = JSON.parse(map.dataset.threats || '[]');
                 operationalThreats.forEach(t => { 
                     const p = geographicSectorCoordinates[t.lga.toUpperCase()] || {x: 350, y: 160}; 
                     layer.innerHTML += `<circle cx="${p.x}" cy="${p.y}" r="8" fill="rgba(239, 68, 68, 0.4)" class="map-pulse"/><circle cx="${p.x}" cy="${p.y}" r="5" fill="#ef4444" class="map-dot"/>`; 
@@ -1364,11 +1370,60 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
                     } 
                 }); 
             }
-            async function pullLiveThreatStream() { try { const e = await fetch('/admin/threats/stream'); if (200 === e.status && container) { const t = await e.text(); if (container.innerHTML !== t) { container.innerHTML = t; renderTacticalVectorMap(); } } } catch (err) { console.error(err); } }
+            async function pullLiveThreatStream() { try { const e = await fetch('/admin/threats/stream'); const target = document.getElementById('live_threat_feed_target'); if (200 === e.status && target) { const t = await e.text(); if (target.innerHTML !== t) { target.innerHTML = t; renderTacticalVectorMap(); } } } catch (err) { console.error(err); } }
+            function showAdminFlash(message, isError) {
+                const toast = document.createElement('div');
+                toast.textContent = (isError ? '⚠️ ' : '✅ ') + message;
+                toast.style.cssText = 'position:fixed;top:24px;left:50%;transform:translateX(-50%);background:' + (isError ? 'rgba(239,68,68,.95)' : 'rgba(16,185,129,.95)') + ';color:#fff;padding:14px 28px;border-radius:14px;font-weight:800;font-size:16px;z-index:9999;box-shadow:0 10px 30px rgba(0,0,0,.4);max-width:90%;text-align:center;';
+                document.body.appendChild(toast);
+                setTimeout(() => toast.remove(), 3500);
+            }
+            document.addEventListener('submit', async function(event) {
+                const form = event.target;
+                if (!form || form.tagName !== 'FORM' || event.defaultPrevented || form.method.toLowerCase() !== 'post') return;
+                const action = new URL(form.action, window.location.href);
+                if (action.origin !== window.location.origin ||
+                    !(action.pathname.startsWith('/admin/') || action.pathname === '/delete-farmer' || action.pathname === '/resolve-alert')) return;
+                event.preventDefault();
+                const button = form.querySelector('button[type="submit"], input[type="submit"]');
+                if (button) button.disabled = true;
+                try {
+                    const response = await fetch(action, {method: 'POST', body: new FormData(form), credentials: 'same-origin'});
+                    const finalUrl = new URL(response.url);
+                    if (!response.ok || finalUrl.searchParams.has('decoy_err')) throw new Error('Action failed. Please try again.');
+                    const html = await response.text();
+                    const updatedPage = new DOMParser().parseFromString(html, 'text/html');
+                    const updatedDashboard = updatedPage.getElementById('dashboard-content');
+                    const dashboard = document.getElementById('dashboard-content');
+                    if (!updatedDashboard || !dashboard) throw new Error('Could not refresh dashboard data.');
+                    const scrollPosition = window.scrollY;
+                    dashboard.innerHTML = updatedDashboard.innerHTML;
+                    window.scrollTo(0, scrollPosition);
+                    renderTacticalVectorMap();
+                    await pullLiveThreatStream();
+                    const messages = {
+                        '/admin/approve-farmer': 'Farmer approved',
+                        '/delete-farmer': 'Farmer removed',
+                        '/resolve-alert': 'Alert cleared',
+                        '/admin/simulate-grid': 'Mock farmer data added',
+                        '/admin/flush-grid': 'Grid records cleared',
+                        '/admin/approve-product': 'Product approved',
+                        '/admin/reject-product': 'Product rejected',
+                        '/admin/delete-product': 'Product deleted',
+                        '/admin/post-decoy-product': 'Test listing posted',
+                        '/admin/post-ready-decoy': 'Market listing posted'
+                    };
+                    showAdminFlash(messages[action.pathname] || 'Action completed', false);
+                } catch (error) {
+                    showAdminFlash(error.message || 'Action failed. Please try again.', true);
+                } finally {
+                    if (button && button.isConnected) button.disabled = false;
+                }
+            });
             setInterval(pullLiveThreatStream, 2000); window.onload = () => { pullLiveThreatStream(); renderTacticalVectorMap(); };
         </script>
     </body></html>
-    """.replace("REPLACE_NODES_DATA", map_nodes_js).replace("REPLACE_THREATS_DATA", map_threats_js)
+    """
 
     return HTMLResponse(content=html_template_head + html_template_script)
 
@@ -1437,10 +1492,11 @@ def registration_form():
                 </button>
             </form>
 
-            <p style="text-align:center; margin-top:28px; font-size:15px; color:#94a3b8;">
-                Already registered?
-                <a href="/portal/login" style="color:#6ee7b7; font-weight:700; text-decoration:none;"> Sign in here</a>
-            </p>
+            <div style="display:grid; gap:10px; margin-top:24px;">
+                <a href="/portal/login" class="btn btn-emerald" style="display:block; text-align:center; padding:14px; text-decoration:none; box-sizing:border-box;">Already registered? Sign in</a>
+                <a href="/#admin-login" class="btn" style="display:block; text-align:center; padding:14px; background:rgba(245,158,11,0.12); color:#fbbf24; text-decoration:none; border:1px solid rgba(245,158,11,0.35); border-radius:12px; box-sizing:border-box;">Admin Login</a>
+                <a href="/" class="btn" style="display:block; text-align:center; padding:14px; background:rgba(255,255,255,0.06); color:#cbd5e1; text-decoration:none; border:1px solid rgba(255,255,255,0.12); border-radius:12px; box-sizing:border-box;">← Back to Main Page</a>
+            </div>
         </div>
     </body>
     </html>"""
@@ -1677,7 +1733,7 @@ async def post_farm_product(request: Request, current_user=Depends(get_current_f
     form = await request.form()
     title_c = sanitize(str(form.get("title") or ""))[:MAX_PRODUCT_TITLE]
     if not title_c:
-        return RedirectResponse(url="/portal/feed?active_tab=market&post_err=title", status_code=303)
+        return RedirectResponse(url="/portal/feed?active_tab=farm_market&post_err=title", status_code=303)
     desc_c = sanitize(str(form.get("description") or ""))[:MAX_PRODUCT_DESC]
     price_c = sanitize(str(form.get("price") or ""))[:40]
     category = str(form.get("category") or "General")
@@ -1760,7 +1816,86 @@ async def post_farm_product(request: Request, current_user=Depends(get_current_f
             (PRODUCT_POST_XP, current_user["phone"])
         )
         await conn.commit()
-    return RedirectResponse(url="/portal/feed?active_tab=market&posted=1", status_code=303)
+    return RedirectResponse(url="/portal/feed?active_tab=farm_market&posted=1", status_code=303)
+
+
+@app.post("/portal/market/edit")
+async def edit_farm_product(request: Request, current_user=Depends(get_current_farmer)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    form = await request.form()
+    try:
+        product_id = int(str(form.get("product_id") or ""))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid listing")
+
+    title = sanitize(str(form.get("title") or ""))[:MAX_PRODUCT_TITLE]
+    if not title:
+        return JSONResponse({"detail": "Please enter a product title."}, status_code=400)
+    description = sanitize(str(form.get("description") or ""))[:MAX_PRODUCT_DESC]
+    price = sanitize(str(form.get("price") or ""))[:40]
+    category = sanitize(str(form.get("category") or "General"))[:30]
+    if category not in PRODUCT_CATEGORIES and category != "General":
+        return JSONResponse({"detail": "Please choose a valid category."}, status_code=400)
+    contact = normalize_nigerian_mobile(str(form.get("contact_phone") or "")) or current_user["phone"]
+
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT photo_path FROM farm_products WHERE id = ? AND farmer_phone = ?",
+            (product_id, current_user["phone"])
+        ) as cursor:
+            product = await cursor.fetchone()
+        if not product:
+            raise HTTPException(status_code=404, detail="Listing not found or you do not own it.")
+
+        photo_path = product["photo_path"]
+        if str(form.get("remove_photos") or "") == "1":
+            photo_path = None
+        else:
+            new_photos = []
+            for photo in form.getlist("photos")[:5]:
+                if not hasattr(photo, "read") or not getattr(photo, "filename", ""):
+                    continue
+                raw = await photo.read()
+                if not raw:
+                    continue
+                if len(raw) > MAX_UPLOAD_SIZE:
+                    return JSONResponse({"detail": "Each photo must be within the upload size limit."}, status_code=400)
+                fname = f"prod_{hashlib.md5(os.urandom(16)).hexdigest()}.jpg"
+                dest = os.path.join(MEDIA_DIR, fname)
+                try:
+                    from PIL import Image
+                    import io
+                    try:
+                        import pillow_heif
+                        pillow_heif.register_heif_opener()
+                    except ImportError:
+                        pass
+                    with Image.open(io.BytesIO(raw)) as image:
+                        converted = image.convert("RGB")
+                        converted.thumbnail((800, 800))
+                        converted.save(dest, "JPEG", quality=70)
+                except Exception:
+                    with open(dest, "wb") as image_file:
+                        image_file.write(raw)
+                new_photos.append(fname)
+            if new_photos:
+                photo_path = ",".join(new_photos)
+
+        await conn.execute(
+            """UPDATE farm_products
+               SET title = ?, description = ?, price = ?, contact_phone = ?,
+                   category = ?, photo_path = ?, status = 'Pending'
+               WHERE id = ? AND farmer_phone = ?""",
+            (title, description, price, contact, category, photo_path, product_id, current_user["phone"])
+        )
+        await conn.commit()
+    return JSONResponse({
+        "product_id": product_id,
+        "message": "Listing updated and sent for admin approval."
+    })
 
 
 @app.post("/portal/market/interest")
@@ -2420,6 +2555,42 @@ async def simple_messages_page(current_user=Depends(get_current_farmer)):
     return HTMLResponse(content=page)
 
 
+@app.get("/portal/messages/notifications")
+async def message_notifications(current_user=Depends(get_current_farmer)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT COUNT(*) AS unread_count FROM direct_messages WHERE receiver_phone = ? AND seen = 0",
+            (current_user["phone"],)
+        ) as cursor:
+            unread_count = (await cursor.fetchone())["unread_count"]
+        async with conn.execute("""
+            SELECT dm.id, dm.sender_phone, dm.body, dm.timestamp, f.name AS sender_name
+            FROM direct_messages dm
+            LEFT JOIN farmers f ON f.phone = dm.sender_phone
+            WHERE dm.receiver_phone = ? AND dm.seen = 0
+            ORDER BY dm.id DESC
+            LIMIT 10
+        """, (current_user["phone"],)) as cursor:
+            unread_messages = await cursor.fetchall()
+    return {
+        "unread_count": unread_count,
+        "messages": [
+            {
+                "id": message["id"],
+                "sender_phone": message["sender_phone"],
+                "sender_name": message["sender_name"] or "A farmer",
+                "body": message["body"] or "",
+                "timestamp": message["timestamp"],
+                "kind": "marketplace" if (message["body"] or "").startswith("I am interested in your listing:") else "message",
+            }
+            for message in unread_messages
+        ],
+    }
+
+
 
 @app.get("/portal/chat", response_class=HTMLResponse)
 async def simple_chat_page(
@@ -2617,6 +2788,7 @@ async def farmer_feed_portal(
     friend_name: Optional[str] = Query(None),
     soil_saved: Optional[str] = Query(None),
     posted: Optional[str] = Query(None),
+    post_err: Optional[str] = Query(None),
 ):
     if not current_user: return RedirectResponse(url="/portal/login?error=Session required.", status_code=303)
     # Always define tip_of_day early so it is never unbound
@@ -2632,7 +2804,7 @@ async def farmer_feed_portal(
                 unread_count = (await cur.fetchone())[0]
     except Exception:
         unread_count = 0
-    unread_badge = f'<span style="background:#ef4444; color:white; font-size:11px; font-weight:800; padding:2px 7px; border-radius:10px; margin-left:6px;">{unread_count}</span>' if unread_count else ""
+    unread_badge = f'<span id="unread-message-badge" style="display:{"inline-block" if unread_count else "none"}; background:#ef4444; color:white; font-size:11px; font-weight:800; padding:2px 7px; border-radius:10px; margin-left:6px;">{unread_count}</span>'
     if current_user.get("status") in RESTRICTED_STATUSES:
         return HTMLResponse(content=f"""
         <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head>
@@ -2737,12 +2909,16 @@ async def farmer_feed_portal(
             my_spotify_links = await c_sp.fetchall()
         # Market filter: category + status + search + sort
         status_filter = market_status if market_status in ("Active", "Sold", "All") else "Active"
+        show_mine_only = (market_mine or "").lower() in ("1", "yes", "true")
         cat_filter = market_cat if market_cat in PRODUCT_CATEGORIES else None
         search_q = (market_q or "").strip()[:80]
         sort_key = market_sort if market_sort in ("newest", "oldest", "title_az", "title_za") else "newest"
         if status_filter == "All":
             sql = "SELECT * FROM farm_products WHERE status IN ('Active','Sold')"
             params: list = []
+        elif show_mine_only and status_filter == "Active":
+            sql = "SELECT * FROM farm_products WHERE status IN ('Active','Pending')"
+            params = []
         else:
             sql = "SELECT * FROM farm_products WHERE status = ?"
             params = [status_filter]
@@ -2753,7 +2929,6 @@ async def farmer_feed_portal(
             sql += " AND (title LIKE ? OR description LIKE ? OR farmer_name LIKE ? OR lga LIKE ?)"
             like = f"%{search_q}%"
             params.extend([like, like, like, like])
-        show_mine_only = (market_mine or "").lower() in ("1", "yes", "true")
         if show_mine_only:
             sql += " AND farmer_phone = ?"
             params.append(current_user["phone"])
@@ -2784,22 +2959,32 @@ async def farmer_feed_portal(
     pending_html = ""
     for r in pending_requests:
         pending_html += f"""
-        <div style="background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:10px; padding:12px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
-            <span style="font-weight:600; color:#f1f5f9;">{html.escape(r['requester_name'])}</span>
+        <div id="friend-request-{html.escape(r['requester_phone'])}" style="background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:10px; padding:12px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span style="font-weight:600; color:#f1f5f9;">{html.escape(r['requester_name'] or '')}</span>
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
-                <a href="/portal/feed?active_tab=community&view_profile={r['requester_phone']}" style="background:rgba(59,130,246,0.2); border:1px solid rgba(59,130,246,0.4); color:#93c5fd; font-size:12px; font-weight:700; padding:6px 12px; border-radius:8px; text-decoration:none;">👤 View Profile</a>
+                <a href="/portal/feed?active_tab=community&view_profile={html.escape(r['requester_phone'], quote=True)}" style="background:rgba(59,130,246,0.2); border:1px solid rgba(59,130,246,0.4); color:#93c5fd; font-size:12px; font-weight:700; padding:6px 12px; border-radius:8px; text-decoration:none;">👤 View Profile</a>
                 <form action="/portal/friend/accept" method="post" style="margin:0;">
-                    <input type="hidden" name="requester_phone" value="{r['requester_phone']}">
+                    <input type="hidden" name="requester_phone" value="{html.escape(r['requester_phone'], quote=True)}">
                     <button type="submit" class="btn btn-emerald" style="padding:6px 12px; font-size:12px;">Accept</button>
                 </form>
                 <form action="/portal/friend/reject" method="post" style="margin:0;">
-                    <input type="hidden" name="requester_phone" value="{r['requester_phone']}">
+                    <input type="hidden" name="requester_phone" value="{html.escape(r['requester_phone'], quote=True)}">
                     <button type="submit" class="btn btn-danger" style="padding:6px 12px; font-size:12px;">Reject</button>
                 </form>
             </div>
         </div>"""
+    pending_request_count = len(pending_requests)
     if not pending_html:
-        pending_html = '<p style="color:var(--text-muted); font-size:13px;">No pending requests.</p>'
+        pending_html = '<p style="color:var(--text-muted); font-size:13px; margin:0;">No new friend requests right now.</p>'
+    pending_requests_panel = f"""
+    <div id="friend-requests-panel" class="portal-card" style="margin-bottom:20px; border:1px solid rgba(245,158,11,0.35);">
+        <div class="card-header" style="justify-content:space-between;">
+            <h3 class="card-title" style="color:#fbbf24;">👋 Friend Requests</h3>
+            <span style="background:rgba(245,158,11,0.2); color:#fbbf24; border-radius:999px; padding:4px 10px; font-weight:800;">{pending_request_count}</span>
+        </div>
+        <p style="font-size:13px; color:#cbd5e1; margin:0 0 12px;">Requests from other farmers appear here. Accept to add them to your friends.</p>
+        {pending_html}
+    </div>"""
 
     friends_html = ""
     for fr in my_friends:
@@ -2872,8 +3057,21 @@ async def farmer_feed_portal(
         is_mine = p["farmer_phone"] == current_user["phone"]
         is_sold = p["status"] == "Sold"
         actions = ""
+        edit_button = ""
+        if is_mine:
+            edit_button = f"""
+            <button type="button" class="edit-product-btn"
+                    data-product-id="{p['id']}"
+                    data-title="{html.escape(p['title'] or '', quote=True)}"
+                    data-category="{html.escape(p['category'] or 'General', quote=True)}"
+                    data-price="{html.escape(p['price'] or '', quote=True)}"
+                    data-description="{html.escape(p['description'] or '', quote=True)}"
+                    data-contact="{html.escape(p['contact_phone'] or '', quote=True)}"
+                    onclick="openProductEdit(this)"
+                    style="background:rgba(59,130,246,0.18); border:1px solid rgba(59,130,246,0.35); color:#93c5fd; font-size:12px; cursor:pointer; padding:6px 10px; border-radius:6px;">Edit</button>"""
         if is_mine and not is_sold:
             actions = f"""
+            {edit_button}
             <form action="/portal/market/sold" method="post" style="display:inline; margin:0;">
                 <input type="hidden" name="product_id" value="{p['id']}">
                 <button type="submit" style="background:rgba(245,158,11,0.15); border:1px solid rgba(245,158,11,0.3); color:#fbbf24; font-size:12px; cursor:pointer; padding:4px 10px; border-radius:6px;">Mark sold</button>
@@ -2884,6 +3082,7 @@ async def farmer_feed_portal(
             </form>"""
         elif is_mine:
             actions = f"""
+            {edit_button}
             <form action="/portal/market/remove" method="post" style="display:inline; margin:0;">
                 <input type="hidden" name="product_id" value="{p['id']}">
                 <button type="submit" style="background:none;border:none;color:#f87171;font-size:12px;cursor:pointer;padding:4px 8px;">Remove</button>
@@ -2913,6 +3112,7 @@ async def farmer_feed_portal(
                 photo_html = f'<div class="photo-wrap" data-count="{len(paths)}" style="width:100%;"><div style="width:100%; height:180px; overflow:hidden; border-radius:12px;">{"".join(imgs)}</div>{nav}</div>'
 
         sold_badge = '<span style="background:rgba(245,158,11,0.2); color:#fbbf24; font-size:12px; font-weight:800; padding:4px 10px; border-radius:6px; margin-left:6px;">SOLD</span>' if is_sold else ""
+        pending_badge = '<span style="background:rgba(59,130,246,0.2); color:#93c5fd; font-size:12px; font-weight:800; padding:4px 10px; border-radius:6px; margin-left:6px;">PENDING APPROVAL</span>' if p["status"] == "Pending" else ""
         price_color = "#94a3b8" if is_sold else "#6ee7b7"
         card_opacity = "opacity:0.75;" if is_sold else ""
         contact_raw = p["contact_phone"] or p["farmer_phone"] or ""
@@ -2930,11 +3130,11 @@ async def farmer_feed_portal(
         safe_price = html.escape(p['price'] or '').replace("'", "\\'")
 
         products_html += f"""
-        <div class="product-card" data-card="{p['id']}" style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; {card_opacity} width:100%; box-sizing:border-box; min-width:0;">
+        <div class="product-card" id="product-card-{p['id']}" data-card="{p['id']}" style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; {card_opacity} width:100%; box-sizing:border-box; min-width:0;">
             {photo_html}
             <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap; margin-top:12px;">
                 <div style="flex:1; min-width:140px;">
-                    <div style="font-size:13px; color:#94a3b8; font-weight:700;">{html.escape(p['category'] or 'General')} · {html.escape(p['lga'] or '')}{sold_badge}</div>
+                    <div style="font-size:13px; color:#94a3b8; font-weight:700;">{html.escape(p['category'] or 'General')} · {html.escape(p['lga'] or '')}{sold_badge}{pending_badge}</div>
                     <div class="prod-title" style="font-size:18px; font-weight:800; color:#f1f5f9; margin-top:6px; line-height:1.3;">{html.escape(p['title'])}</div>
                 </div>
                 <div style="font-size:18px; font-weight:800; color:{price_color}; white-space:nowrap;">{html.escape(p['price']) if p['price'] else ''}</div>
@@ -2986,7 +3186,7 @@ async def farmer_feed_portal(
             <a href="/portal/feed?active_tab=market" class="btn btn-emerald" style="display:inline-block; padding:12px 20px; text-decoration:none;">Show all products</a>
         </div>'''
 
-    category_options = "".join([f'<option value="{c}">{c}</option>' for c in PRODUCT_CATEGORIES])
+    category_options = "".join([f'<option value="{c}">{c}</option>' for c in PRODUCT_CATEGORIES]) + '<option value="General">General</option>'
     # Filter chips (preserve search + sort + mine)
     active_cat = market_cat if market_cat in PRODUCT_CATEGORIES else ""
     active_status = market_status if market_status in ("Active", "Sold", "All") else "Active"
@@ -3405,15 +3605,18 @@ async def farmer_feed_portal(
     is_messages_tab = tab == "messages"
     is_community_tab = tab == "community"
     is_market_tab = tab == "market"
-    is_incidents_tab = tab not in ("messages", "community", "market")
+    is_farm_market_tab = tab == "farm_market"
+    is_incidents_tab = tab not in ("messages", "community", "market", "farm_market")
     tab_incidents_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_incidents_tab else "background:transparent; color:var(--text-muted);"
     tab_messages_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_messages_tab else "background:transparent; color:var(--text-muted);"
     tab_community_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_community_tab else "background:transparent; color:var(--text-muted);"
     tab_market_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_market_tab else "background:transparent; color:var(--text-muted);"
+    tab_farm_market_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_farm_market_tab else "background:transparent; color:var(--text-muted);"
     show_incidents = "display:block;" if is_incidents_tab else "display:none;"
     show_messages = "display:block;" if is_messages_tab else "display:none;"
     show_community = "display:block;" if is_community_tab else "display:none;"
     show_market = "display:block;" if is_market_tab else "display:none;"
+    show_farm_market = "display:block;" if is_farm_market_tab else "display:none;"
     checked_in_btn = "background:#334155; color:#94a3b8; pointer-events:none;" if checked_in_today else ""
     checked_in_label = "Checked in today ✓" if checked_in_today else f"I'm OK (+{CHECKIN_XP} XP)"
 
@@ -3517,9 +3720,11 @@ async def farmer_feed_portal(
 
             <div class="tab-bar">
                 <a href="/portal/feed?active_tab=incidents" class="tab-btn" style="{tab_incidents_active}">🛡️ Alerts</a>
-                <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community</a>
-                <a href="/portal/feed?active_tab=market" class="tab-btn" style="{tab_market_active}">🛒 Market</a>
-                <a href="/portal/messages" class="tab-btn" style="background:transparent; color:var(--text-muted);">💬 Messages{unread_badge}</a>
+                <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community{f' <span style=\"background:#f59e0b;color:#111827;border-radius:999px;padding:2px 7px;font-size:11px;font-weight:800;\">{pending_request_count}</span>' if pending_request_count else ''}</a>
+                <a href="/portal/feed?active_tab=market" class="tab-btn" style="{tab_market_active}">🔍 Find Products</a>
+                <a href="/portal/feed?active_tab=farm_market" class="tab-btn" style="{tab_farm_market_active}">🛒 Farm Market</a>
+                <a id="messages-nav-link" href="/portal/messages" class="tab-btn" style="background:transparent; color:var(--text-muted);">💬 Messages{unread_badge}</a>
+                <button type="button" onclick="enableMessageNotifications()" class="tab-btn" style="background:transparent; color:var(--text-muted); border:0; cursor:pointer;">🔔 Enable alerts</button>
             </div>
 
             <div id="tab_incidents" style="{show_incidents}">
@@ -3561,6 +3766,8 @@ async def farmer_feed_portal(
             </div>
 
             <div id="tab_community" style="{show_community}">
+                {pending_requests_panel}
+                {profile_card_html}
                 <div class="portal-grid">
                     <div class="portal-card">
                         <div class="card-header">🌤️ <h3 class="card-title">Live Weather</h3></div>
@@ -3710,9 +3917,8 @@ async def farmer_feed_portal(
                         <div class="card-header">🤝 <h3 class="card-title">Friends & Requests</h3></div>
                         <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
                             <div>
-                                <div style="font-size:13px; font-weight:700; color:#fbbf24; margin-bottom:8px;">Pending Requests</div>
-                                {profile_card_html}
-                                {pending_html}
+                                <div style="font-size:13px; font-weight:700; color:#6ee7b7; margin-bottom:8px;">Friend Requests</div>
+                                <a href="#friend-requests-panel" style="color:#93c5fd; font-size:13px;">View requests at the top of Community{f' ({pending_request_count} new)' if pending_request_count else ''}</a>
                             </div>
                             <div>
                                 <div style="font-size:13px; font-weight:700; color:#6ee7b7; margin-bottom:8px;">My Friends</div>
@@ -3800,6 +4006,35 @@ async def farmer_feed_portal(
                     <div class="products-grid" style="display:grid; grid-template-columns:repeat(3, 1fr); gap:16px; width:100%;">
                         {products_html}
                     </div>
+                    <div id="productEditModal" style="display:none; position:fixed; inset:0; z-index:2500; background:rgba(2,6,23,0.88); padding:20px; overflow-y:auto;" onclick="if(event.target===this) closeProductEdit()">
+                        <form id="productEditForm" action="/portal/market/edit" method="post" enctype="multipart/form-data" style="max-width:620px; margin:5vh auto; padding:22px; background:#0f172a; border:1px solid rgba(148,163,184,0.25); border-radius:16px; box-sizing:border-box;">
+                            <input type="hidden" name="product_id">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px;">
+                                <h3 style="margin:0; color:#f8fafc;">Edit your listing</h3>
+                                <button type="button" onclick="closeProductEdit()" aria-label="Close" style="background:none; border:0; color:#cbd5e1; font-size:24px; cursor:pointer;">✕</button>
+                            </div>
+                            <label style="display:block; color:#e2e8f0; margin:12px 0 6px;">Product title</label>
+                            <input name="title" required maxlength="{MAX_PRODUCT_TITLE}" style="width:100%; box-sizing:border-box; padding:12px; background:#1e293b; border:1px solid #475569; color:#fff; border-radius:8px;">
+                            <label style="display:block; color:#e2e8f0; margin:12px 0 6px;">Category</label>
+                            <select name="category" style="width:100%; box-sizing:border-box; padding:12px; background:#1e293b; border:1px solid #475569; color:#fff; border-radius:8px;">{category_options}</select>
+                            <label style="display:block; color:#e2e8f0; margin:12px 0 6px;">Price</label>
+                            <input name="price" maxlength="40" style="width:100%; box-sizing:border-box; padding:12px; background:#1e293b; border:1px solid #475569; color:#fff; border-radius:8px;">
+                            <label style="display:block; color:#e2e8f0; margin:12px 0 6px;">Details</label>
+                            <textarea name="description" maxlength="{MAX_PRODUCT_DESC}" rows="4" style="width:100%; box-sizing:border-box; padding:12px; background:#1e293b; border:1px solid #475569; color:#fff; border-radius:8px;"></textarea>
+                            <label style="display:block; color:#e2e8f0; margin:12px 0 6px;">Contact phone</label>
+                            <input name="contact_phone" inputmode="numeric" style="width:100%; box-sizing:border-box; padding:12px; background:#1e293b; border:1px solid #475569; color:#fff; border-radius:8px;">
+                            <label style="display:block; color:#e2e8f0; margin:12px 0 6px;">Replace photos (optional, up to 5)</label>
+                            <input type="file" name="photos" accept="image/*" multiple style="width:100%; color:#cbd5e1;">
+                            <label style="display:flex; align-items:center; gap:8px; color:#cbd5e1; font-size:13px; margin:12px 0;">
+                                <input type="checkbox" name="remove_photos" value="1"> Remove current photos
+                            </label>
+                            <p style="font-size:12px; color:#fbbf24; line-height:1.5;">Edited listings are sent back for admin approval before appearing in the market.</p>
+                            <div style="display:flex; gap:10px;">
+                                <button type="submit" class="btn btn-emerald" style="flex:1; padding:12px;">Save changes</button>
+                                <button type="button" onclick="closeProductEdit()" style="padding:12px 18px; border-radius:8px; background:#334155; color:#fff; border:0; cursor:pointer;">Cancel</button>
+                            </div>
+                        </form>
+                    </div>
                     {pagination_html}
                     <style>
                         @media (max-width: 900px) {{ .products-grid {{ grid-template-columns: repeat(2, 1fr) !important; }} }}
@@ -3808,9 +4043,11 @@ async def farmer_feed_portal(
                 </div>
             </div>
 
+            <div id="tab_farm_market" style="{show_farm_market}">
                 <div class="portal-card" style="max-width:720px; margin:0 auto 20px;">
                     <div class="card-header">🛒 <h3 class="card-title">Farm Market</h3></div>
                     {('<div style="background:rgba(245,158,11,0.15); border:1px solid rgba(245,158,11,0.4); border-radius:12px; padding:14px; margin-bottom:14px; color:#fbbf24; font-weight:700;">✅ Listing submitted. An admin must approve it before it goes live.</div>') if posted else ''}
+                    {('<div style="background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.4); border-radius:12px; padding:14px; margin-bottom:14px; color:#fecaca; font-weight:700;">Please enter a product title before posting.</div>') if post_err == "title" else ''}
                     <div style="background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.35); border-radius:12px; padding:14px 16px; margin-bottom:16px; font-size:14px; color:#fecaca; line-height:1.5;">
                         <strong>⚠️ Scam Warning:</strong> Never send money before seeing the goods. Meet in a public place. Use the <b>Report</b> button if a listing looks suspicious. Farm Watch does not handle payments.
                     </div>
@@ -3818,6 +4055,7 @@ async def farmer_feed_portal(
                         Promote your crops, livestock, tools or produce. Neighbours can contact you directly.
                         Posting earns <b style="color:#6ee7b7;">+{PRODUCT_POST_XP} XP</b>.
                     </p>
+                    <a href="/portal/feed?active_tab=market&market_mine=1" class="btn btn-emerald" style="display:inline-block; padding:10px 16px; margin-bottom:14px; text-decoration:none;">Manage my listings</a>
                     <form action="/portal/market/post" method="post" enctype="multipart/form-data" style="background:rgba(0,0,0,0.2); padding:16px; border-radius:14px; margin-bottom:8px;">
                         <label style="font-size:14px; font-weight:700; color:#e2e8f0;">What are you selling?</label>
                         <input type="text" name="title" required maxlength="{MAX_PRODUCT_TITLE}" placeholder="e.g. Fresh cassava, 50kg bags"
@@ -3875,6 +4113,7 @@ async def farmer_feed_portal(
                         <button type="submit" class="btn btn-emerald" style="width:100%; padding:16px; font-size:17px;">Post to Market</button>
                     </form>
                 </div>
+            </div>
             <div id="tab_messages" style="{show_messages}">
                 <div class="portal-card" style="max-width:720px; margin:0 auto; min-height:400px;">
                     <div class="card-header">💬 <h3 class="card-title">Messages</h3></div>
@@ -3896,7 +4135,25 @@ async def farmer_feed_portal(
         <div id="radar_screen" class="glass-panel" style="max-width: 550px; margin: 60px auto; text-align: center; display: none;"><div class="radar-spinner"></div><span class="badge badge-amber pulse" style="margin-bottom: 16px;">Transmission Channel Engaged</span><h2>Transmitting...</h2></div>
         <script>
             async function triggerEchoAnimation(e, aId) {{ e.preventDefault(); const btn = document.getElementById('echo_btn_' + aId); btn.disabled = true; btn.innerText = "📡 Relaying..."; try {{ const res = await fetch('/portal/alert/relay', {{ method: 'POST', body: new FormData(e.target) }}); if (res.status === 200) {{ const newXp = await res.text(); document.getElementById('grid_score_display').innerText = "⚡ " + newXp + " Grid XP"; btn.className = "btn"; btn.style.background = "#10b981"; btn.innerText = "✅ Dispatched"; }} }} catch(err) {{ console.error(err); }} }}
-            function executeTransmissionSequence(e) {{ e.preventDefault(); const termCard = document.getElementById('container'), radarScreen = document.getElementById('radar_screen'); if(termCard) termCard.style.display = 'none'; radarScreen.style.display = 'block'; const form = document.getElementById('emergency_form'), formData = new FormData(form); fetch(form.action, {{ method: form.method, body: formData }}).then(() => {{ window.location.href = '/portal/feed'; }}).catch(() => {{ window.location.href = '/portal/feed'; }}); }}
+            async function executeTransmissionSequence(e) {{
+                e.preventDefault();
+                const form = e.currentTarget;
+                const radarScreen = document.getElementById('radar_screen');
+                const submitButton = form.querySelector('button[type="submit"]');
+                if (submitButton) submitButton.disabled = true;
+                if (radarScreen) radarScreen.style.display = 'block';
+                try {{
+                    const res = await fetch(form.action, {{ method: form.method, body: new FormData(form), credentials: 'same-origin' }});
+                    if (!res.ok) throw new Error('Alert could not be sent. Please check the form and try again.');
+                    form.reset();
+                    showFlash('Alert sent successfully', false);
+                }} catch (err) {{
+                    showFlash(err.message || 'Alert could not be sent. Please try again.', true);
+                }} finally {{
+                    if (radarScreen) radarScreen.style.display = 'none';
+                    if (submitButton) submitButton.disabled = false;
+                }}
+            }}
 
             // ----- Farm Radio with Bass / Mid / High EQ -----
             let radioCtx = null, radioSource = null, bassFilter = null, midFilter = null, highFilter = null, radioGain = null;
@@ -4202,15 +4459,94 @@ async def farmer_feed_portal(
                 setTimeout(() => t.remove(), 3300);
             }}
 
+            function enableMessageNotifications() {{
+                if (!('Notification' in window)) {{
+                    showFlash('This browser does not support desktop notifications', true);
+                    return;
+                }}
+                Notification.requestPermission().then(permission => {{
+                    showFlash(permission === 'granted'
+                        ? 'Message alerts enabled'
+                        : 'Allow notifications in your browser settings to receive desktop alerts',
+                        permission !== 'granted');
+                }});
+            }}
+
+            function showIncomingMessageNotification(message, totalNew) {{
+                const title = message.kind === 'marketplace' ? 'Marketplace message' : 'New friend message';
+                const toast = document.createElement('a');
+                toast.href = '/portal/chat?with=' + encodeURIComponent(message.sender_phone);
+                toast.style.cssText = 'position:fixed;top:24px;right:20px;z-index:10000;display:block;width:min(360px,calc(100vw - 40px));padding:16px;background:#0f172a;color:#f8fafc;border:1px solid rgba(52,211,153,.5);border-radius:14px;box-shadow:0 12px 36px rgba(0,0,0,.45);text-decoration:none;';
+                const heading = document.createElement('strong');
+                heading.textContent = title + ' from ' + message.sender_name;
+                const preview = document.createElement('div');
+                preview.textContent = message.body;
+                preview.style.cssText = 'margin-top:7px;color:#cbd5e1;font-size:14px;line-height:1.4;overflow-wrap:anywhere;';
+                const count = document.createElement('div');
+                count.textContent = totalNew > 1 ? totalNew + ' unread messages — tap to open' : 'Tap to open message';
+                count.style.cssText = 'margin-top:8px;color:#6ee7b7;font-size:12px;font-weight:700;';
+                toast.append(heading, preview, count);
+                document.body.appendChild(toast);
+                setTimeout(() => toast.remove(), 9000);
+                if ('Notification' in window && Notification.permission === 'granted') {{
+                    const notification = new Notification(title, {{
+                        body: message.sender_name + ': ' + message.body.slice(0, 120),
+                        tag: 'farmwatch-message-' + message.id
+                    }});
+                    notification.onclick = () => {{
+                        window.focus();
+                        window.location.href = toast.href;
+                    }};
+                }}
+            }}
+
+            let notifiedMessageIds = new Set();
+            try {{
+                const storedMessageIds = JSON.parse(sessionStorage.getItem('farmwatch_notified_messages') || '[]');
+                if (Array.isArray(storedMessageIds)) notifiedMessageIds = new Set(storedMessageIds.map(String));
+            }} catch (error) {{
+                console.warn('Could not restore message notification state:', error);
+            }}
+
+            async function pollMessageNotifications() {{
+                const badge = document.getElementById('unread-message-badge');
+                if (!badge) return;
+                try {{
+                    const response = await fetch('/portal/messages/notifications', {{
+                        credentials: 'same-origin',
+                        cache: 'no-store'
+                    }});
+                    if (!response.ok) return;
+                    const data = await response.json();
+                    const count = Number(data.unread_count) || 0;
+                    badge.textContent = count;
+                    badge.style.display = count ? 'inline-block' : 'none';
+                    const newMessages = (data.messages || []).filter(message => !notifiedMessageIds.has(String(message.id)));
+                    for (const message of newMessages) notifiedMessageIds.add(String(message.id));
+                    try {{
+                        sessionStorage.setItem('farmwatch_notified_messages', JSON.stringify([...notifiedMessageIds].slice(-100)));
+                    }} catch (error) {{
+                        console.warn('Could not save message notification state:', error);
+                    }}
+                    if (newMessages.length) {{
+                        showIncomingMessageNotification(newMessages[0], count);
+                    }}
+                }} catch (error) {{
+                    console.error('Could not check for new messages:', error);
+                }}
+            }}
+            pollMessageNotifications();
+            setInterval(pollMessageNotifications, 15000);
+
             // Intercept form submits so actions stay on the page (no jump to top)
             document.addEventListener('submit', async function(e) {{
                 const form = e.target;
                 if (!form || form.tagName !== 'FORM') return;
                 const method = (form.method || 'get').toLowerCase();
                 if (method !== 'post') return;
-                // Skip forms that must do a full navigation (e.g. login, registration, file-heavy or special)
+                // Keep authentication flows as full navigations; other portal actions stay on the page.
                 const action = form.action || '';
-                if (action.includes('/portal/auth') || action.includes('/submit-registration') || action.includes('/admin/login') || action.includes('/portal/alert/raise') || action.includes('/portal/market/post')) {{
+                if (action.includes('/portal/auth') || action.includes('/submit-registration') || action.includes('/admin/login') || action.includes('/portal/alert/raise')) {{
                     return; // let normal submit happen
                 }}
                 e.preventDefault();
@@ -4220,9 +4556,21 @@ async def farmer_feed_portal(
                 try {{
                     const fd = new FormData(form);
                     const res = await fetch(action, {{ method: 'POST', body: fd, credentials: 'same-origin' }});
+                    const redirectedToLogin = res.redirected && new URL(res.url).pathname === '/portal/login';
+                    if (action.includes('/portal/market/edit')) {{
+                        const result = await res.json();
+                        if (!res.ok) throw new Error(result.detail || 'Could not update listing.');
+                        closeProductEdit();
+                        const editedCard = document.getElementById('product-card-' + result.product_id);
+                        if (editedCard) editedCard.remove();
+                        showFlash(result.message, false);
+                        return;
+                    }}
+                    const succeeded = res.ok && !redirectedToLogin;
                     // Determine friendly message from the endpoint
                     let msg = 'Done';
-                    if (action.includes('/friend/request')) msg = 'Your request has been sent';
+                    if (action.includes('/portal/market/post')) msg = 'Listing submitted; awaiting admin approval';
+                    else if (action.includes('/friend/request')) msg = 'Your request has been sent';
                     else if (action.includes('/friend/accept')) msg = 'Friend request accepted';
                     else if (action.includes('/friend/reject')) msg = 'Request declined';
                     else if (action.includes('/messages/send')) msg = 'Your message has been sent';
@@ -4240,23 +4588,25 @@ async def farmer_feed_portal(
                     else if (action.includes('/unblock-node')) msg = 'Unblocked';
                     else if (action.includes('/flag-node')) msg = 'Reported';
                     else if (action.includes('/sensors/submit')) msg = 'Soil reading saved';
-                    else if (res.ok) msg = 'Success';
+                    else if (succeeded) msg = 'Success';
                     else msg = 'Something went wrong';
-                    showFlash(msg, !res.ok);
+                    showFlash(msg, !succeeded);
                     // Light UI updates without reload
-                    if (action.includes('/status/like') && btn) {{
+                    if (succeeded && action.includes('/status/like') && btn) {{
                         const m = btn.innerText.match(/\\d+/);
                         const n = m ? parseInt(m[0], 10) + 1 : 1;
                         btn.innerHTML = '👍 ' + n;
                     }}
-                    if (action.includes('/friend/request') && btn) {{
+                    if (succeeded && action.includes('/friend/request') && btn) {{
                         btn.outerHTML = '<span style="color:#fbbf24; font-size:12px; font-weight:700;">⏳ Pending</span>';
                     }}
-                    if (form.querySelector('input[name="body"]') || form.querySelector('input[name="content"]') || form.querySelector('input[name="text"]') || form.querySelector('input[name="message"]')) {{
+                    if (succeeded && action.includes('/portal/market/post')) {{
+                        form.reset();
+                    }} else if (succeeded && (form.querySelector('input[name="body"]') || form.querySelector('input[name="content"]') || form.querySelector('input[name="text"]') || form.querySelector('input[name="message"]'))) {{
                         form.reset();
                     }}
                 }} catch (err) {{
-                    showFlash('Network error — try again', true);
+                    showFlash(err.message || 'Network error — try again', true);
                 }} finally {{
                     if (btn && btn.parentNode) {{ btn.disabled = false; btn.style.opacity = '1'; if (originalText) btn.innerHTML = originalText; }}
                 }}
@@ -4356,6 +4706,22 @@ async def farmer_feed_portal(
             <div style="position:absolute; top:16px; right:20px; color:#fff; font-size:28px; cursor:pointer;">✕</div>
         </div>
         <script>
+        function openProductEdit(button) {{
+            const form = document.getElementById('productEditForm');
+            form.elements.namedItem('product_id').value = button.dataset.productId;
+            form.elements.namedItem('title').value = button.dataset.title || '';
+            form.elements.namedItem('category').value = button.dataset.category || 'General';
+            form.elements.namedItem('price').value = button.dataset.price || '';
+            form.elements.namedItem('description').value = button.dataset.description || '';
+            form.elements.namedItem('contact_phone').value = button.dataset.contact || '';
+            form.elements.namedItem('photos').value = '';
+            form.elements.namedItem('remove_photos').checked = false;
+            document.getElementById('productEditModal').style.display = 'block';
+            form.elements.namedItem('title').focus();
+        }}
+        function closeProductEdit() {{
+            document.getElementById('productEditModal').style.display = 'none';
+        }}
         function toggleLivestock() {{
             var cat = document.getElementById('prod_category');
             var box = document.getElementById('livestock_fields');
@@ -4593,7 +4959,7 @@ def community_homepage(admin_error: Optional[str] = None):
                 <a href="/portal/login" class="btn action-link" style="background: rgba(59,130,246,0.15); border: 2px solid rgba(59,130,246,0.4); color: #93c5fd;">
                     I Already Have an Account — Sign In
                 </a>
-                <details class="admin-toggle" style="margin-top:0;">
+                <details id="admin-login" class="admin-toggle" style="margin-top:0;">
                     <summary class="btn action-link" style="background:rgba(245,158,11,0.12); color:#fbbf24; border:2px solid rgba(245,158,11,0.4); width:100%; box-sizing:border-box;">
                         Admin Command Center Login
                     </summary>
@@ -4611,5 +4977,14 @@ def community_homepage(admin_error: Optional[str] = None):
                 </details>
             </div>
         </div>
+        <script>
+            if (window.location.hash === "#admin-login") {{
+                const adminLogin = document.getElementById("admin-login");
+                if (adminLogin) {{
+                    adminLogin.open = true;
+                    adminLogin.scrollIntoView();
+                }}
+            }}
+        </script>
     </body>
     </html>"""
