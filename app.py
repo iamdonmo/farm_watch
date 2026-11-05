@@ -1009,16 +1009,57 @@ READY_DECOYS = [
 
 @app.post("/admin/post-ready-decoy")
 async def admin_post_ready_decoy(
-    decoy_index: int = Form(...),
+    request: Request,
     username: str = Depends(authenticate_admin),
 ):
-    """Post one of the 20 ready-made Nigerian market decoys as an injected farmer. Goes Active immediately."""
+    """Post one of the 20 ready-made Nigerian market decoys as an injected farmer. Goes Active immediately. Supports photos."""
+    form = await request.form()
+    try:
+        decoy_index = int(form.get("decoy_index") or -1)
+    except ValueError:
+        decoy_index = -1
     if decoy_index < 0 or decoy_index >= len(READY_DECOYS):
         return RedirectResponse(url="/dashboard", status_code=303)
     decoy = READY_DECOYS[decoy_index]
+
+    # Handle optional photos (up to 5)
+    photo_paths = []
+    uploads = form.getlist("photos")
+    for photo in uploads[:5]:
+        if not hasattr(photo, "read"):
+            continue
+        try:
+            raw = await photo.read()
+            if not raw or len(raw) > MAX_UPLOAD_SIZE:
+                continue
+            fname = f"prod_{hashlib.md5(os.urandom(16)).hexdigest()}.jpg"
+            dest = os.path.join(MEDIA_DIR, fname)
+            saved = False
+            try:
+                from PIL import Image
+                import io
+                try:
+                    import pillow_heif
+                    pillow_heif.register_heif_opener()
+                except Exception:
+                    pass
+                img = Image.open(io.BytesIO(raw))
+                img = img.convert("RGB")
+                img.thumbnail((800, 800))
+                img.save(dest, "JPEG", quality=70)
+                saved = True
+            except Exception:
+                with open(dest, "wb") as f:
+                    f.write(raw)
+                saved = True
+            if saved and os.path.exists(dest):
+                photo_paths.append(fname)
+        except Exception:
+            continue
+    photo_path = ",".join(photo_paths) if photo_paths else None
+
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
-        # Pick a random approved (mock) farmer
         async with conn.execute("SELECT phone, name, lga FROM farmers WHERE status = 'Approved' ORDER BY RANDOM() LIMIT 1") as cur:
             farmer = await cur.fetchone()
         if not farmer:
@@ -1026,9 +1067,9 @@ async def admin_post_ready_decoy(
         await conn.execute(
             """INSERT INTO farm_products
                (farmer_phone, farmer_name, lga, title, description, price, contact_phone, category, photo_path, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'Active')""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')""",
             (farmer["phone"], farmer["name"], farmer["lga"],
-             decoy["title"], decoy["desc"], decoy["price"], farmer["phone"], decoy["category"])
+             decoy["title"], decoy["desc"], decoy["price"], farmer["phone"], decoy["category"], photo_path)
         )
         await conn.commit()
     return RedirectResponse(url="/dashboard?decoy_ok=1", status_code=303)
@@ -1240,15 +1281,16 @@ async def admin_dashboard(username: str = Depends(authenticate_admin)):
             <td style="font-weight:600; color:#fff;">{html.escape(d['title'])}</td>
             <td>{html.escape(d['price'])}</td>
             <td><span class="badge badge-blue">{html.escape(d['category'])}</span></td>
-            <td style="font-size:13px; max-width:220px;">{html.escape(d['desc'][:70])}</td>
+            <td style="font-size:13px; max-width:180px;">{html.escape(d['desc'][:60])}</td>
             <td>
-                <form action="/admin/post-ready-decoy" method="post" style="margin:0;">
+                <form action="/admin/post-ready-decoy" method="post" enctype="multipart/form-data" style="margin:0; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                     <input type="hidden" name="decoy_index" value="{i}">
+                    <input type="file" name="photos" accept="image/*" multiple style="font-size:12px; color:#cbd5e1; max-width:160px;">
                     <button type="submit" class="btn btn-emerald" style="padding:6px 14px; font-size:12px;">Post</button>
                 </form>
             </td>
         </tr>"""
-    ready_decoys_table = f'<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Item</th><th>Price</th><th>Category</th><th>Details</th><th></th></tr></thead><tbody>{ready_rows}</tbody></table></div>'
+    ready_decoys_table = f'<div style="overflow-x:auto;"><table class="data-table"><thead><tr><th>Item</th><th>Price</th><th>Category</th><th>Details</th><th>Photos + Post</th></tr></thead><tbody>{ready_rows}</tbody></table></div>'
 
     active_table = f'<div style="overflow-x: auto;"><table class="data-table"><thead><tr><th>Node Name</th><th>Phone Address</th><th>Geographic Network Path</th><th>Status</th><th>Management</th></tr></thead><tbody>{active_nodes_html}</tbody></table></div>' if active_nodes_html else '<p style="color: var(--text-muted); font-style: italic; text-align: center;">No active nodes operating on current security grid.</p>'
 
@@ -2567,6 +2609,7 @@ async def farmer_feed_portal(
     market_q: Optional[str] = Query(None),
     market_sort: Optional[str] = Query(None),
     market_mine: Optional[str] = Query(None),
+    market_page: Optional[int] = Query(1),
     friend_sent: Optional[str] = Query(None),
     profile_updated: Optional[str] = Query(None),
     invite_sent: Optional[str] = Query(None),
@@ -2720,10 +2763,22 @@ async def farmer_feed_portal(
             "title_az": "title COLLATE NOCASE ASC",
             "title_za": "title COLLATE NOCASE DESC",
         }
-        sql += f" ORDER BY {order_map[sort_key]} LIMIT 50"
+        # Count total for pagination
+        count_sql = sql.replace("SELECT *", "SELECT COUNT(*)", 1)
+        async with conn.execute(count_sql, params) as ccount:
+            total_products = (await ccount.fetchone())[0]
+        page = max(1, int(market_page or 1))
+        per_page = 9
+        total_pages = max(1, (total_products + per_page - 1) // per_page)
+        if page > total_pages:
+            page = total_pages
+        offset = (page - 1) * per_page
+        sql += f" ORDER BY {order_map[sort_key]} LIMIT {per_page} OFFSET {offset}"
         async with conn.execute(sql, params) as c8:
             market_products = await c8.fetchall()
-        market_result_count = len(market_products)
+        market_result_count = total_products
+        market_page_num = page
+        market_total_pages = total_pages
 
     # Friends panel HTML
     pending_html = ""
@@ -2837,14 +2892,25 @@ async def farmer_feed_portal(
         photo_html = ""
         if p["photo_path"]:
             paths = [x.strip() for x in str(p["photo_path"]).split(",") if x.strip()]
-            imgs = []
-            for path in paths[:4]:
-                safe = html.escape(os.path.basename(path))
-                imgs.append(
-                    f'<img src="/product-photo/{safe}" alt="product photo" '
-                    f'style="width:100%; max-height:280px; object-fit:cover; border-radius:12px; margin:0 0 12px 0; display:block; background:#1e293b;">'
-                )
-            photo_html = "".join(imgs)
+            if paths:
+                imgs = []
+                for i, path in enumerate(paths[:5]):
+                    safe = html.escape(os.path.basename(path))
+                    display = "block" if i == 0 else "none"
+                    imgs.append(
+                        f'<img src="/product-photo/{safe}" alt="product photo" class="prod-photo" data-idx="{i}" '
+                        f'style="width:100%; height:180px; object-fit:cover; border-radius:12px; margin:0; display:{display}; background:#1e293b; cursor:pointer;" '
+                        f'onclick="openPhoto(this.src)">'
+                    )
+                nav = ""
+                if len(paths) > 1:
+                    nav = f'''
+                    <div style="display:flex; justify-content:center; gap:10px; margin-top:8px;">
+                        <button type="button" onclick="photoPrev(this)" style="padding:6px 12px; background:#334155; color:#fff; border:none; border-radius:8px; cursor:pointer;">← Photo</button>
+                        <span class="photo-counter" style="align-self:center; color:#94a3b8; font-size:13px;">1 / {len(paths)}</span>
+                        <button type="button" onclick="photoNext(this)" style="padding:6px 12px; background:#334155; color:#fff; border:none; border-radius:8px; cursor:pointer;">Photo →</button>
+                    </div>'''
+                photo_html = f'<div class="photo-wrap" data-count="{len(paths)}" style="width:100%;"><div style="width:100%; height:180px; overflow:hidden; border-radius:12px;">{"".join(imgs)}</div>{nav}</div>'
 
         sold_badge = '<span style="background:rgba(245,158,11,0.2); color:#fbbf24; font-size:12px; font-weight:800; padding:4px 10px; border-radius:6px; margin-left:6px;">SOLD</span>' if is_sold else ""
         price_color = "#94a3b8" if is_sold else "#6ee7b7"
@@ -2864,12 +2930,12 @@ async def farmer_feed_portal(
         safe_price = html.escape(p['price'] or '').replace("'", "\\'")
 
         products_html += f"""
-        <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:16px; margin-bottom:14px; {card_opacity}">
+        <div class="product-card" data-card="{p['id']}" style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; {card_opacity} width:100%; box-sizing:border-box; min-width:0;">
             {photo_html}
-            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap; margin-top:12px;">
                 <div style="flex:1; min-width:140px;">
                     <div style="font-size:13px; color:#94a3b8; font-weight:700;">{html.escape(p['category'] or 'General')} · {html.escape(p['lga'] or '')}{sold_badge}</div>
-                    <div style="font-size:18px; font-weight:800; color:#f1f5f9; margin-top:6px; line-height:1.3;">{html.escape(p['title'])}</div>
+                    <div class="prod-title" style="font-size:18px; font-weight:800; color:#f1f5f9; margin-top:6px; line-height:1.3;">{html.escape(p['title'])}</div>
                 </div>
                 <div style="font-size:18px; font-weight:800; color:{price_color}; white-space:nowrap;">{html.escape(p['price']) if p['price'] else ''}</div>
             </div>
@@ -2909,6 +2975,7 @@ async def farmer_feed_portal(
                     </form>
                 </details>
             </div>
+        </div>
         </div>"""
     if not products_html:
         products_html = '''
@@ -2956,7 +3023,19 @@ async def farmer_feed_portal(
     hidden_status = f'<input type="hidden" name="market_status" value="{active_status}">' if active_status != "Active" else ""
     hidden_mine = '<input type="hidden" name="market_mine" value="1">' if show_mine_only else ""
     has_filters = bool(active_cat or (market_q or "").strip() or show_mine_only or active_status != "Active" or active_sort != "newest")
-    result_label = f'{market_result_count} product{"s" if market_result_count != 1 else ""} found'
+    result_label = f'{market_result_count} product{"s" if market_result_count != 1 else ""} found · Page {market_page_num} of {market_total_pages}'
+    # Build pagination links that preserve current filters
+    def page_url(p):
+        qs = f"/portal/feed?active_tab=market&market_page={p}"
+        if active_cat: qs += f"&market_cat={active_cat}"
+        if market_status: qs += f"&market_status={market_status}"
+        if active_q: qs += f"&market_q={active_q}"
+        if market_sort: qs += f"&market_sort={market_sort}"
+        if show_mine_only: qs += "&market_mine=1"
+        return qs
+    prev_btn = f'<a href="{page_url(market_page_num-1)}" class="btn btn-emerald" style="padding:10px 16px; text-decoration:none;">← Previous</a>' if market_page_num > 1 else '<span style="padding:10px 16px; color:#64748b;">← Previous</span>'
+    next_btn = f'<a href="{page_url(market_page_num+1)}" class="btn btn-emerald" style="padding:10px 16px; text-decoration:none;">Next →</a>' if market_page_num < market_total_pages else '<span style="padding:10px 16px; color:#64748b;">Next →</span>'
+    pagination_html = f'<div style="display:flex; justify-content:center; align-items:center; gap:16px; margin:20px 0; flex-wrap:wrap;">{prev_btn}<span style="color:#e2e8f0; font-weight:700;">Page {market_page_num} of {market_total_pages}</span>{next_btn}</div>'
     clear_filters_btn = f'<a href="/portal/feed?active_tab=market" style="font-size:14px;color:#f87171;font-weight:700;text-decoration:none;">Clear all filters</a>' if has_filters else ""
 
     checkins_html = "".join([f"""
@@ -3367,6 +3446,30 @@ async def farmer_feed_portal(
     <style>
         {UPGRADED_CSS}
         .portal-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; margin-top: 24px; }}
+        .products-grid {{
+            display: grid !important;
+            grid-template-columns: repeat(3, 1fr) !important;
+            gap: 16px !important;
+            width: 100% !important;
+        }}
+        .product-card {{
+            width: 100% !important;
+            min-width: 0 !important;
+            box-sizing: border-box !important;
+        }}
+        .product-card img, .prod-photo {{
+            width: 100% !important;
+            height: 180px !important;
+            max-height: 180px !important;
+            min-height: 180px !important;
+            object-fit: cover !important;
+        }}
+        @media (max-width: 900px) {{
+            .products-grid {{ grid-template-columns: repeat(2, 1fr) !important; }}
+        }}
+        @media (max-width: 600px) {{
+            .products-grid {{ grid-template-columns: 1fr !important; }}
+        }}
         .portal-card {{
             background: linear-gradient(155deg, rgba(22, 52, 38, 0.88) 0%, rgba(18, 40, 48, 0.82) 100%);
             border: 1px solid rgba(110, 231, 183, 0.14);
@@ -3392,7 +3495,7 @@ async def farmer_feed_portal(
         }}
     </style></head>
     <body>
-        <div class="container" style="max-width:1200px; padding:20px 0;">
+        <div class="container" style="max-width:1400px; width:100%; padding:20px 16px; margin:0 auto;">
             <div style="background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:24px; padding:24px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px; margin-bottom:24px;">
                 <div style="display:flex; align-items:center; gap:16px;">
                     <div style="font-size:40px;">👨‍🌾</div>
@@ -3668,7 +3771,7 @@ async def farmer_feed_portal(
             </div>
 
             <div id="tab_market" style="{show_market}">
-                <div class="portal-card" style="max-width:720px; margin:0 auto;">
+                <div class="portal-card" style="width:100%; max-width:none; margin:0;">
                     <div class="card-header">📦 <h3 class="card-title">Find products</h3></div>
                     <form action="/portal/feed" method="get" style="margin-bottom:16px;">
                         <input type="hidden" name="active_tab" value="market">
@@ -3694,7 +3797,14 @@ async def farmer_feed_portal(
                         <span style="font-size:15px; color:#e2e8f0; font-weight:600;">{result_label}</span>
                         {clear_filters_btn}
                     </div>
-                    {products_html}
+                    <div class="products-grid" style="display:grid; grid-template-columns:repeat(3, 1fr); gap:16px; width:100%;">
+                        {products_html}
+                    </div>
+                    {pagination_html}
+                    <style>
+                        @media (max-width: 900px) {{ .products-grid {{ grid-template-columns: repeat(2, 1fr) !important; }} }}
+                        @media (max-width: 600px) {{ .products-grid {{ grid-template-columns: 1fr !important; }} }}
+                    </style>
                 </div>
             </div>
 
@@ -3955,6 +4065,115 @@ async def farmer_feed_portal(
                 setTimeout(() => {{ t.style.opacity = '0'; }}, 1800);
                 setTimeout(() => t.remove(), 2500);
             }}
+
+            // ----- Market one-at-a-time viewer -----
+            let marketCards = [];
+            let marketIndex = 0;
+            function initMarketViewer() {{
+                const wrap = document.getElementById('market-cards');
+                if (!wrap) return;
+                marketCards = Array.from(wrap.children).filter(el => el.classList && el.classList.contains('product-card'));
+                if (marketCards.length === 0) return;
+                marketCards.forEach((c, i) => {{
+                    c.style.display = i === 0 ? 'block' : 'none';
+                }});
+                updateMarketCounter();
+                const listInner = document.getElementById('market-list-inner');
+                if (listInner) {{
+                    marketCards.forEach((card, i) => {{
+                        const titleEl = card.querySelector('.prod-title');
+                        const title = titleEl ? titleEl.textContent.trim() : 'Listing';
+                        const btn = document.createElement('button');
+                        btn.type = 'button';
+                        btn.style.cssText = 'text-align:left; padding:12px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:12px; color:#e2e8f0; cursor:pointer; font-weight:600;';
+                        btn.textContent = (i + 1) + '. ' + title.slice(0, 70);
+                        btn.onclick = () => {{ showMarketSingle(); marketGo(i); }};
+                        listInner.appendChild(btn);
+                    }});
+                }}
+            }}
+            function updateMarketCounter() {{
+                const el = document.getElementById('market-counter');
+                if (el && marketCards.length) el.textContent = (marketIndex + 1) + ' / ' + marketCards.length;
+            }}
+            function marketGo(i) {{
+                if (!marketCards.length) return;
+                marketIndex = Math.max(0, Math.min(i, marketCards.length - 1));
+                marketCards.forEach((c, idx) => c.style.display = idx === marketIndex ? 'block' : 'none');
+                updateMarketCounter();
+            }}
+            function marketPrev() {{ marketGo(marketIndex - 1); }}
+            function marketNext() {{ marketGo(marketIndex + 1); }}
+            function showMarketList() {{
+                const s = document.getElementById('market-single');
+                const l = document.getElementById('market-list');
+                if (s) s.style.display = 'none';
+                if (l) l.style.display = 'block';
+            }}
+            function showMarketSingle() {{
+                const s = document.getElementById('market-single');
+                const l = document.getElementById('market-list');
+                if (l) l.style.display = 'none';
+                if (s) s.style.display = 'block';
+            }}
+            // Photo pager inside a listing
+            function photoPrev(btn) {{
+                const wrap = btn.closest('.photo-wrap');
+                if (!wrap) return;
+                const imgs = wrap.querySelectorAll('.prod-photo');
+                let cur = 0;
+                imgs.forEach((img, i) => {{ if (img.style.display !== 'none') cur = i; }});
+                const next = (cur - 1 + imgs.length) % imgs.length;
+                imgs.forEach((img, i) => img.style.display = i === next ? 'block' : 'none');
+                const counter = wrap.querySelector('.photo-counter');
+                if (counter) counter.textContent = (next + 1) + ' / ' + imgs.length;
+            }}
+            function photoNext(btn) {{
+                const wrap = btn.closest('.photo-wrap');
+                if (!wrap) return;
+                const imgs = wrap.querySelectorAll('.prod-photo');
+                let cur = 0;
+                imgs.forEach((img, i) => {{ if (img.style.display !== 'none') cur = i; }});
+                const next = (cur + 1) % imgs.length;
+                imgs.forEach((img, i) => img.style.display = i === next ? 'block' : 'none');
+                const counter = wrap.querySelector('.photo-counter');
+                if (counter) counter.textContent = (next + 1) + ' / ' + imgs.length;
+            }}
+            // Full-screen photo expand
+            function openPhoto(src) {{
+                let overlay = document.getElementById('photo-overlay');
+                if (!overlay) {{
+                    overlay = document.createElement('div');
+                    overlay.id = 'photo-overlay';
+                    overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.92); z-index:99999; display:flex; align-items:center; justify-content:center; flex-direction:column;';
+                    overlay.innerHTML = '<img id="photo-overlay-img" style="max-width:92%; max-height:80vh; border-radius:12px;"><button type="button" onclick="closePhoto()" style="margin-top:16px; padding:10px 20px; background:#10b981; color:#fff; border:none; border-radius:10px; font-weight:700; cursor:pointer;">Close</button>';
+                    overlay.onclick = (e) => {{ if (e.target === overlay) closePhoto(); }};
+                    document.body.appendChild(overlay);
+                }}
+                document.getElementById('photo-overlay-img').src = src;
+                overlay.style.display = 'flex';
+            }}
+            function closePhoto() {{
+                const o = document.getElementById('photo-overlay');
+                if (o) o.style.display = 'none';
+            }}
+            document.addEventListener('DOMContentLoaded', initMarketViewer);
+            // Keyboard left/right
+            document.addEventListener('keydown', (e) => {{
+                if (document.getElementById('market-single') && document.getElementById('market-single').style.display !== 'none') {{
+                    if (e.key === 'ArrowLeft') marketPrev();
+                    if (e.key === 'ArrowRight') marketNext();
+                }}
+            }});
+            // Simple swipe
+            let touchStartX = 0;
+            document.addEventListener('touchstart', (e) => {{ touchStartX = e.changedTouches[0].screenX; }}, {{passive:true}});
+            document.addEventListener('touchend', (e) => {{
+                if (!document.getElementById('market-single') || document.getElementById('market-single').style.display === 'none') return;
+                const dx = e.changedTouches[0].screenX - touchStartX;
+                if (dx > 50) marketPrev();
+                if (dx < -50) marketNext();
+            }}, {{passive:true}});
 
             // ----- Share listing (professional message) -----
             function shareListing(title, price) {{
