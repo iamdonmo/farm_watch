@@ -1,5 +1,5 @@
 """
-Farm Watch Enterprise Node
+Farm Watch Enterprise Node 
 --------------------------
 Community farm security platform with real-time alerts, peer verification,
 direct messaging, and administrative oversight.
