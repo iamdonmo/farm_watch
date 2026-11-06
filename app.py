@@ -92,6 +92,9 @@ RESTRICTED_STATUSES = {STATUS_PENDING, STATUS_REPORTED}
 # Messaging safety limits
 MAX_MESSAGE_LENGTH = 350
 MAX_UPLOAD_SIZE = 15 * 1024 * 1024  # 15 MB
+MAX_SOCIAL_IMAGE_UPLOAD_SIZE = 8 * 1024 * 1024
+MAX_SOCIAL_IMAGE_PIXELS = 25_000_000
+MAX_SOCIAL_IMAGE_STORAGE_SIZE = 650 * 1024
 MAX_MESSAGES_PER_HOUR_TO_PEER = 8
 MAX_MESSAGES_PER_DAY = 25
 REPORTS_TO_AUTO_FLAG = 2
@@ -128,7 +131,9 @@ SHOUTOUT_TEMPLATES = {
 MAX_PRODUCT_TITLE = 80
 MAX_PRODUCT_DESC = 300
 PRODUCT_CATEGORIES = ("Crops", "Livestock", "Tools", "Seeds", "Produce", "Other")
-FAITH_PREFERENCES = ("Christian", "Muslim", "Traditionalist", "Atheist", "Private")
+FAITH_PREFERENCES = (
+    "Christian", "Muslim", "Traditionalist", "Atheist", "Spiritualist", "Private"
+)
 LIVESTOCK_TYPES = ("Dog", "Birds", "Cow", "Goats", "Chicken", "Exotic Pets")
 DOG_SEX = ("Male", "Female")
 COW_BREEDS = ("White Fulani", "Red Bororo", "Sokoto Gudali", "Muturu", "Ndama", "Holstein", "Other")
@@ -166,7 +171,8 @@ async def lifespan(app: FastAPI):
                 phone TEXT PRIMARY KEY, name TEXT, country TEXT, state TEXT, 
                 city TEXT, lga TEXT, area TEXT, token TEXT, status TEXT, xp INTEGER DEFAULT 100,
                 faith_preference TEXT NOT NULL DEFAULT 'Private',
-                is_demo INTEGER NOT NULL DEFAULT 0
+                is_demo INTEGER NOT NULL DEFAULT 0,
+                avatar_path TEXT
             );
         """)
         async with conn.execute("PRAGMA table_info(farmers)") as cursor:
@@ -179,6 +185,8 @@ async def lifespan(app: FastAPI):
             await conn.execute(
                 "ALTER TABLE farmers ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0"
             )
+        if "avatar_path" not in farmer_columns:
+            await conn.execute("ALTER TABLE farmers ADD COLUMN avatar_path TEXT")
         await conn.execute("""
             UPDATE farmers
             SET is_demo = 1,
@@ -272,9 +280,14 @@ async def lifespan(app: FastAPI):
                 author_name TEXT,
                 content TEXT NOT NULL,
                 original_id INTEGER,
+                image_path TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        async with conn.execute("PRAGMA table_info(statuses)") as cursor:
+            status_columns = {row[1] for row in await cursor.fetchall()}
+        if "image_path" not in status_columns:
+            await conn.execute("ALTER TABLE statuses ADD COLUMN image_path TEXT")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS status_likes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -575,6 +588,19 @@ def render_status_card(status, comments, highlighted=False) -> str:
     author_phone = html.escape(str(status["author_phone"]), quote=True)
     author_name = html.escape(status["author_name"] or "")
     highlight_style = "outline:2px solid #34d399;" if highlighted else ""
+    avatar_path = os.path.basename(str(status["avatar_path"] or "")) if "avatar_path" in status.keys() else ""
+    avatar_html = (
+        f'<img src="/media/{html.escape(avatar_path, quote=True)}" alt="" '
+        'style="width:36px;height:36px;border-radius:50%;object-fit:cover;margin-right:9px;">'
+        if avatar_path else ""
+    )
+    image_path = os.path.basename(str(status["image_path"] or "")) if "image_path" in status.keys() else ""
+    image_html = (
+        f'<img src="/media/{html.escape(image_path, quote=True)}" alt="Status photo" '
+        'loading="lazy" style="display:block;width:100%;max-height:420px;object-fit:contain;'
+        'border-radius:10px;margin:10px 0;background:#0f172a;">'
+        if image_path else ""
+    )
     author_link = (
         f'<a href="/portal/feed?active_tab=community&view_profile={author_phone}" '
         f'style="color:#f1f5f9; text-decoration:none;">{author_name}</a>'
@@ -589,10 +615,11 @@ def render_status_card(status, comments, highlighted=False) -> str:
     return f"""
     <div id="status-{status['id']}" style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:14px; margin-bottom:12px; {highlight_style}">
         <div style="display:flex; justify-content:space-between; align-items:center;">
-            <div style="font-weight:700;">{author_link}</div>
+            <div style="font-weight:700;display:flex;align-items:center;">{avatar_html}{author_link}</div>
             <span style="font-size:11px; color:#64748b;">{html.escape(str(status['timestamp']))}</span>
         </div>
         <p style="margin:10px 0; color:#e2e8f0; font-size:15px; line-height:1.4;">{html.escape(status['content'])}</p>
+        {image_html}
         <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
             <form action="/portal/status/like" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{status['id']}"><button type="submit" style="background:none;border:none;color:#60a5fa;cursor:pointer;font-size:13px;">👍 {status['likes']}</button></form>
             <form action="/portal/status/repost" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{status['id']}"><button type="submit" style="background:none;border:none;color:#34d399;cursor:pointer;font-size:13px;">🔁 Repost</button></form>
@@ -606,6 +633,69 @@ def render_status_card(status, comments, highlighted=False) -> str:
             <button type="submit" class="btn btn-blue" style="padding:6px 12px; font-size:12px;">Reply</button>
         </form>
     </div>"""
+
+
+async def optimize_social_image(upload: UploadFile, kind: str) -> bytes:
+    """Validate and compress an uploaded profile or status photo to a bounded JPEG."""
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    raw = await upload.read(MAX_SOCIAL_IMAGE_UPLOAD_SIZE + 1)
+    if not raw:
+        raise HTTPException(status_code=422, detail="Choose a photo to upload")
+    if len(raw) > MAX_SOCIAL_IMAGE_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="Photo must be 8 MB or smaller")
+
+    try:
+        with Image.open(io.BytesIO(raw)) as opened:
+            if opened.format not in {"JPEG", "PNG", "WEBP"}:
+                raise HTTPException(
+                    status_code=415, detail="Use a JPEG, PNG, or WebP photo"
+                )
+            if opened.width * opened.height > MAX_SOCIAL_IMAGE_PIXELS:
+                raise HTTPException(
+                    status_code=413, detail="Photo dimensions are too large"
+                )
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise HTTPException(status_code=422, detail="The selected photo is invalid") from exc
+
+    if kind == "avatar":
+        image = ImageOps.fit(image, (320, 320), method=Image.Resampling.LANCZOS)
+    else:
+        image.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+
+    while True:
+        for quality in (82, 72, 62):
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=quality, optimize=True)
+            if output.tell() <= MAX_SOCIAL_IMAGE_STORAGE_SIZE:
+                return output.getvalue()
+        if image.width <= 320 or image.height <= 320:
+            raise HTTPException(status_code=422, detail="Photo could not be compressed")
+        image = image.resize(
+            (max(1, int(image.width * 0.8)), max(1, int(image.height * 0.8))),
+            Image.Resampling.LANCZOS,
+        )
+
+
+def save_social_image(image_data: bytes, kind: str) -> str:
+    filename = f"{kind}_{secrets.token_hex(16)}.jpg"
+    destination = os.path.join(MEDIA_DIR, filename)
+    with open(destination, "wb") as image_file:
+        image_file.write(image_data)
+    return filename
+
+
+def remove_social_image(filename: Optional[str]) -> None:
+    if not filename:
+        return
+    safe_filename = os.path.basename(filename)
+    if safe_filename == filename:
+        path = os.path.join(MEDIA_DIR, safe_filename)
+        if os.path.isfile(path):
+            os.remove(path)
 
 
 def render_shoutout_card(
@@ -925,6 +1015,30 @@ async def render_faith_card(preference: str, city: str) -> str:
         content["Muslim"] = (
             "Optional Qur'an reading: Al-Hujurat 49:13, on knowing and respecting "
             "one another. " + text
+        )
+    if preference == "Spiritualist":
+        links = (
+            ("Miracle of Mind", "https://isha.sadhguru.org/global/en/miracle-of-mind"),
+            ("Yoga & meditation", "https://isha.sadhguru.org/yoga-meditation/global/en"),
+            ("Sadhguru wisdom & talks", "https://isha.sadhguru.org/en/wisdom"),
+            (
+                "Isha Foundation — search for chants",
+                "https://www.youtube.com/@IshaFoundation/search?query=chants",
+            ),
+        )
+        link_html = "".join(
+            f'<a href="{url}" target="_blank" rel="noopener noreferrer" '
+            'style="display:block;color:#a7f3d0;margin:8px 0;">'
+            f'{html.escape(label)} ↗</a>'
+            for label, url in links
+        )
+        return (
+            '<div class="portal-card" style="margin-top:16px;">'
+            '<div class="card-header">🧘 <h3 class="card-title">Your optional spiritual wellbeing space</h3></div>'
+            '<p style="font-size:13px;color:#cbd5e1;line-height:1.6;">Explore meditation, yoga, talks, and chants through these official Isha Foundation resources. They open on their original sites; content availability and language may vary.</p>'
+            f'{link_html}'
+            '<p style="font-size:11px;color:#94a3b8;margin:10px 0 0;">Visible only to you. Choose Private in Edit Profile to remove this space.</p>'
+            '</div>'
         )
     text = content.get(preference, content["Private"])
     station = audio_stations.get(preference)
@@ -2123,6 +2237,7 @@ def registration_form():
                     <option value="Muslim">Muslim</option>
                     <option value="Traditionalist">Traditionalist</option>
                     <option value="Atheist">Atheist / secular</option>
+                    <option value="Spiritualist">Spiritualist</option>
                 </select>
                 <p class="field-help">
                     This is voluntary and private. It is used only to tailor your daily content,
@@ -2361,20 +2476,33 @@ async def remove_shoutout_photo(
 
 
 @app.post("/portal/status/post")
-async def post_status(content: str = Form(...), current_user=Depends(get_current_farmer)):
+async def post_status(
+    content: str = Form(""),
+    photo: Optional[UploadFile] = File(None),
+    current_user=Depends(get_current_farmer),
+):
     """Post a normal status update."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     text = sanitize(content)[:280]
-    if not text:
+    has_photo = bool(photo and photo.filename)
+    if not text and not has_photo:
         return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
-    async with aiosqlite.connect(DB_FILE) as conn:
-        cursor = await conn.execute(
-            "INSERT INTO statuses (author_phone, author_name, content) VALUES (?, ?, ?)",
-            (current_user["phone"], current_user["name"], text)
-        )
-        status_id = cursor.lastrowid
-        await conn.commit()
+    photo_path = None
+    if has_photo:
+        photo_path = save_social_image(await optimize_social_image(photo, "status"), "status")
+    try:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            cursor = await conn.execute(
+                """INSERT INTO statuses (author_phone, author_name, content, image_path)
+                   VALUES (?, ?, ?, ?)""",
+                (current_user["phone"], current_user["name"], text, photo_path)
+            )
+            status_id = cursor.lastrowid
+            await conn.commit()
+    except Exception:
+        remove_social_image(photo_path)
+        raise
     return RedirectResponse(
         url=f"/portal/feed?active_tab=community&status_posted={status_id}#status-{status_id}",
         status_code=303,
@@ -3411,13 +3539,40 @@ async def finish_trust_group_trip(trip_id: int = Form(...), current_user=Depends
 
 
 @app.get("/portal/profile/edit", response_class=HTMLResponse)
-async def edit_profile_form(current_user=Depends(get_current_farmer)):
+async def edit_profile_form(
+    photo_updated: Optional[str] = Query(None),
+    photo_removed: Optional[str] = Query(None),
+    current_user=Depends(get_current_farmer),
+):
     if not current_user:
         return RedirectResponse(url="/portal/login?error=Session required.", status_code=303)
+    avatar_path = os.path.basename(str(current_user.get("avatar_path") or ""))
+    avatar_html = (
+        f'<img src="/media/{html.escape(avatar_path, quote=True)}" alt="Your profile photo" '
+        'style="width:96px;height:96px;border-radius:50%;object-fit:cover;display:block;margin-bottom:12px;">'
+        if avatar_path else ""
+    )
+    photo_notice = (
+        '<p role="status" style="color:#6ee7b7;">Profile picture updated.</p>'
+        if photo_updated else
+        '<p role="status" style="color:#6ee7b7;">Profile picture removed.</p>'
+        if photo_removed else ""
+    )
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>{UPGRADED_CSS}</style></head>
     <body><div class="glass-panel" style="max-width:480px; margin:40px auto;">
         <h2 style="margin:0 0 8px 0;">Edit Profile</h2>
+        {photo_notice}
         <p style="color:var(--text-muted); font-size:14px; margin-bottom:20px;">Update your name, town, and optional private content preference. Your phone number cannot be changed.</p>
+        <section style="margin:0 0 20px;padding:14px;background:rgba(255,255,255,.04);border-radius:12px;">
+            {avatar_html}
+            <form action="/portal/profile/photo" method="post" enctype="multipart/form-data">
+                <label>Profile picture</label>
+                <input type="file" name="photo" accept="image/jpeg,image/png,image/webp" required>
+                <p style="font-size:12px;color:#94a3b8;">JPEG, PNG, or WebP; up to 8 MB. Photos are resized and compressed before saving.</p>
+                <button type="submit" class="btn btn-emerald" style="width:100%;">Upload Profile Picture</button>
+            </form>
+            {f'<form action="/portal/profile/photo/remove" method="post" style="margin-top:8px;"><button type="submit" class="btn" style="width:100%;">Remove Profile Picture</button></form>' if avatar_path else ''}
+        </section>
         <form action="/portal/profile/update" method="post">
             <label>Full Name</label>
             <input type="text" name="name" value="{html.escape(current_user.get('name') or '')}" required maxlength="80">
@@ -3440,6 +3595,60 @@ async def edit_profile_form(current_user=Depends(get_current_farmer)):
             <button type="submit" class="btn btn-danger" style="width:100%; padding:12px;">Delete My Account</button>
         </form>
     </div></body></html>"""
+
+
+@app.post("/portal/profile/photo")
+async def update_profile_photo(
+    photo: UploadFile = File(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    image_path = save_social_image(await optimize_social_image(photo, "avatar"), "avatar")
+    old_image_path = None
+    try:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(
+                "SELECT avatar_path FROM farmers WHERE phone = ?",
+                (current_user["phone"],),
+            ) as cursor:
+                farmer = await cursor.fetchone()
+            if not farmer:
+                raise HTTPException(status_code=404, detail="Profile not found")
+            old_image_path = farmer["avatar_path"]
+            await conn.execute(
+                "UPDATE farmers SET avatar_path = ? WHERE phone = ?",
+                (image_path, current_user["phone"]),
+            )
+            await conn.commit()
+    except Exception:
+        remove_social_image(image_path)
+        raise
+    remove_social_image(old_image_path)
+    return RedirectResponse(url="/portal/profile/edit?photo_updated=1", status_code=303)
+
+
+@app.post("/portal/profile/photo/remove")
+async def remove_profile_photo(current_user=Depends(get_current_farmer)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT avatar_path FROM farmers WHERE phone = ?",
+            (current_user["phone"],),
+        ) as cursor:
+            farmer = await cursor.fetchone()
+        if not farmer:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        await conn.execute(
+            "UPDATE farmers SET avatar_path = NULL WHERE phone = ?",
+            (current_user["phone"],),
+        )
+        await conn.commit()
+    remove_social_image(farmer["avatar_path"])
+    return RedirectResponse(url="/portal/profile/edit?photo_removed=1", status_code=303)
 
 
 @app.post("/portal/profile/update")
@@ -4179,9 +4388,11 @@ async def farmer_feed_portal(
         placeholders = ",".join("?" * len(friend_phones))
         async with conn.execute(f"""
             SELECT s.id, s.author_phone, s.author_name, s.content, s.timestamp,
+                   s.image_path, f.avatar_path,
                    (SELECT COUNT(*) FROM status_likes WHERE status_id = s.id) as likes,
                    (SELECT COUNT(*) FROM status_comments WHERE status_id = s.id) as comments
             FROM statuses s
+            JOIN farmers f ON f.phone = s.author_phone
             WHERE s.author_phone IN ({placeholders})
               AND s.id NOT IN (SELECT status_id FROM status_hides WHERE user_phone = ?)
             ORDER BY s.id DESC LIMIT 30
@@ -4534,9 +4745,11 @@ async def farmer_feed_portal(
             if prof and can_view_profile and (is_accepted_friend or prof["phone"] == current_user["phone"]) and prof["status"] == STATUS_APPROVED:
                 async with conn.execute("""
                     SELECT s.id, s.author_phone, s.author_name, s.content, s.timestamp,
+                           s.image_path, f.avatar_path,
                            (SELECT COUNT(*) FROM status_likes WHERE status_id = s.id) as likes,
                            (SELECT COUNT(*) FROM status_comments WHERE status_id = s.id) as comments
                     FROM statuses s
+                    JOIN farmers f ON f.phone = s.author_phone
                     WHERE s.author_phone = ?
                       AND s.id NOT IN (SELECT status_id FROM status_hides WHERE user_phone = ?)
                     ORDER BY s.id DESC LIMIT 50
@@ -4579,10 +4792,16 @@ async def farmer_feed_portal(
             if not can_view_profile:
                 profile_card_html = '<div style="color:#fbbf24; padding:12px;">You can view this profile after they accept your friend request.</div>'
             else:
+                profile_avatar_path = os.path.basename(str(prof["avatar_path"] or ""))
+                profile_avatar_html = (
+                    f'<img src="/media/{html.escape(profile_avatar_path, quote=True)}" alt="" '
+                    'style="width:72px;height:72px;border-radius:50%;object-fit:cover;margin-right:12px;">'
+                    if profile_avatar_path else ""
+                )
                 profile_card_html = f"""
                 <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.25); border-radius:14px; padding:18px; margin-bottom:16px;">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                        <div style="font-weight:800; font-size:18px; color:#fff;">{html.escape(prof['name'] or '')} {'✅' if prof['status']=='Approved' else ''}</div>
+                        <div style="display:flex;align-items:center;font-weight:800;font-size:18px;color:#fff;">{profile_avatar_html}{html.escape(prof['name'] or '')} {'✅' if prof['status']=='Approved' else ''}</div>
                         <a href="/portal/feed?active_tab=community" style="color:#94a3b8; font-size:12px; text-decoration:none;">✕ Close</a>
                     </div>
                     <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; font-size:14px;">
@@ -5638,11 +5857,13 @@ async def farmer_feed_portal(
                     <div class="portal-card" style="grid-column:1 / -1;">
                         <div id="status-feed" class="card-header">📝 <h3 class="card-title">Status Feed</h3></div>
                         <p style="font-size:13px; color:#94a3b8; margin:0 0 12px 0;">Post an update. Friends can like, comment, or repost to grow the network.</p>
-                        <form action="/portal/status/post" method="post" style="display:flex; gap:10px; margin-bottom:16px;">
-                            <input type="text" name="content" maxlength="280" required placeholder="What's happening on the farm…"
-                                   style="flex:1; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px;">
+                        <form action="/portal/status/post" method="post" enctype="multipart/form-data" style="display:grid;grid-template-columns:1fr auto;gap:10px;margin-bottom:16px;">
+                            <input type="text" name="content" maxlength="280" placeholder="What's happening on the farm…"
+                                   style="grid-column:1/-1;padding:12px;font-size:16px;background:#1e293b;border:2px solid #475569;color:#f8fafc;border-radius:10px;">
+                            <input type="file" name="photo" accept="image/jpeg,image/png,image/webp" style="min-width:0;font-size:13px;color:#cbd5e1;">
                             <button type="submit" class="btn btn-emerald" style="padding:12px 18px;">Post</button>
                         </form>
+                        <p style="font-size:12px;color:#94a3b8;margin:-8px 0 12px;">Add a photo or text. Photos are automatically resized and compressed (up to 8 MB before upload).</p>
                         <div style="max-height:480px; overflow-y:auto;">{status_html}</div>
                     </div>
 
