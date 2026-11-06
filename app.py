@@ -22,6 +22,9 @@ import httpx
 import asyncio
 import aiosqlite
 import shutil
+import io
+import qrcode
+from urllib.parse import quote
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, List
@@ -364,6 +367,36 @@ async def lifespan(app: FastAPI):
                 whatsapp_enabled INTEGER NOT NULL DEFAULT 0,
                 membership_status TEXT NOT NULL DEFAULT 'accepted',
                 PRIMARY KEY (group_id, farmer_phone)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS family_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                lga TEXT NOT NULL,
+                town TEXT NOT NULL,
+                owner_phone TEXT NOT NULL,
+                invite_code TEXT NOT NULL UNIQUE,
+                meeting_room TEXT NOT NULL UNIQUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS family_group_members (
+                group_id INTEGER NOT NULL,
+                farmer_phone TEXT NOT NULL,
+                joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (group_id, farmer_phone)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS family_meeting_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                author_phone TEXT NOT NULL,
+                author_name TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         """)
         async with conn.execute("PRAGMA table_info(trust_group_members)") as cursor:
@@ -3546,6 +3579,214 @@ async def soil_history(current_user=Depends(get_current_farmer)):
     return HTMLResponse(content=page)
 
 
+@app.post("/portal/family/create")
+async def create_family_group(
+    family_name: str = Form(...),
+    lga: str = Form(...),
+    town: str = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Sign in to create a family meeting")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can create family meetings")
+    clean_name = family_name.strip()[:80]
+    clean_lga = lga.strip()[:80]
+    clean_town = town.strip()[:80]
+    if not clean_name or not clean_lga or not clean_town:
+        raise HTTPException(status_code=400, detail="Family name, LGA, and town are required")
+
+    invite_code = secrets.token_hex(8).upper()
+    meeting_room = secrets.token_hex(20)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute(
+            """INSERT INTO family_groups
+               (name, lga, town, owner_phone, invite_code, meeting_room)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (clean_name, clean_lga, clean_town, current_user["phone"], invite_code, meeting_room),
+        ) as cursor:
+            group_id = cursor.lastrowid
+        await conn.execute(
+            "INSERT INTO family_group_members (group_id, farmer_phone) VALUES (?, ?)",
+            (group_id, current_user["phone"]),
+        )
+        await conn.commit()
+    return RedirectResponse("/portal/feed?active_tab=family", status_code=303)
+
+
+@app.post("/portal/family/join")
+async def join_family_group(
+    invite_code: str = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Sign in to join a family meeting")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can join family meetings")
+    code = invite_code.strip().upper()
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute(
+            "SELECT id FROM family_groups WHERE invite_code = ?",
+            (code,),
+        ) as cursor:
+            group = await cursor.fetchone()
+        if not group:
+            raise HTTPException(status_code=404, detail="Family invite code not found")
+        await conn.execute(
+            "INSERT OR IGNORE INTO family_group_members (group_id, farmer_phone) VALUES (?, ?)",
+            (group[0], current_user["phone"]),
+        )
+        await conn.commit()
+    return RedirectResponse("/portal/feed?active_tab=family", status_code=303)
+
+
+@app.post("/portal/family/rotate-code")
+async def rotate_family_invite_code(
+    group_id: int = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can manage family meeting invites")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute(
+            "SELECT owner_phone FROM family_groups WHERE id = ?",
+            (group_id,),
+        ) as cursor:
+            group = await cursor.fetchone()
+        if not group or group[0] != current_user["phone"]:
+            raise HTTPException(status_code=403, detail="Only the family meeting creator can renew its invite")
+        new_code = secrets.token_hex(8).upper()
+        await conn.execute(
+            "UPDATE family_groups SET invite_code = ? WHERE id = ?",
+            (new_code, group_id),
+        )
+        await conn.commit()
+    return RedirectResponse("/portal/feed?active_tab=family", status_code=303)
+
+
+@app.post("/portal/family/message")
+async def post_family_message(
+    group_id: int = Form(...),
+    body: str = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can post family messages")
+    message = body.strip()
+    if not message or len(message) > 500:
+        raise HTTPException(status_code=400, detail="Family messages must be between 1 and 500 characters")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute(
+            "SELECT 1 FROM family_group_members WHERE group_id = ? AND farmer_phone = ?",
+            (group_id, current_user["phone"]),
+        ) as cursor:
+            membership = await cursor.fetchone()
+        if not membership:
+            raise HTTPException(status_code=403, detail="Join this family meeting before posting")
+        await conn.execute(
+            """INSERT INTO family_meeting_messages
+               (group_id, author_phone, author_name, body) VALUES (?, ?, ?, ?)""",
+            (group_id, current_user["phone"], current_user["name"], message),
+        )
+        await conn.commit()
+    return RedirectResponse("/portal/feed?active_tab=family", status_code=303)
+
+
+@app.get("/portal/family/qr/{invite_code}")
+async def family_invite_qr(
+    invite_code: str,
+    request: Request,
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Sign in to view this family invite QR code")
+    if current_user.get("status") != STATUS_APPROVED:
+        raise HTTPException(status_code=403, detail="Only approved farmers can view family meeting invites")
+    code = invite_code.upper()
+    if len(code) != 16 or not all(char in "0123456789ABCDEF" for char in code):
+        raise HTTPException(status_code=404, detail="Family invite not found")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute(
+            """SELECT 1 FROM family_groups fg
+               JOIN family_group_members fgm ON fgm.group_id = fg.id
+               WHERE fg.invite_code = ? AND fgm.farmer_phone = ?""",
+            (code, current_user["phone"]),
+        ) as cursor:
+            membership = await cursor.fetchone()
+    if not membership:
+        raise HTTPException(status_code=404, detail="Family invite not found")
+    invite_url = f"{str(request.base_url).rstrip('/')}/family/invite/{code}"
+    qr_image = qrcode.make(invite_url)
+    image_buffer = io.BytesIO()
+    qr_image.save(image_buffer, format="PNG")
+    return Response(
+        content=image_buffer.getvalue(),
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/family/invite/{invite_code}", response_class=HTMLResponse)
+async def family_invite_page(
+    invite_code: str,
+    current_user=Depends(get_current_farmer),
+):
+    code = invite_code.upper()
+    if len(code) != 16 or not all(char in "0123456789ABCDEF" for char in code):
+        raise HTTPException(status_code=404, detail="Family invite not found")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT name, lga, town FROM family_groups WHERE invite_code = ?",
+            (code,),
+        ) as cursor:
+            family = await cursor.fetchone()
+        is_member = False
+        if family and current_user and current_user.get("status") == STATUS_APPROVED:
+            async with conn.execute(
+                """SELECT 1 FROM family_groups fg
+                   JOIN family_group_members fgm ON fgm.group_id = fg.id
+                   WHERE fg.invite_code = ? AND fgm.farmer_phone = ?""",
+                (code, current_user["phone"]),
+            ) as cursor:
+                is_member = await cursor.fetchone() is not None
+    if not family:
+        raise HTTPException(status_code=404, detail="Family invite not found")
+
+    invite_url = f"/family/invite/{code}"
+    if current_user and is_member:
+        action_html = '<a class="btn btn-emerald" href="/portal/feed?active_tab=family">Open Family Meetings</a>'
+    elif current_user and current_user.get("status") == STATUS_APPROVED:
+        action_html = f"""
+            <form action="/portal/family/join" method="post">
+                <input type="hidden" name="invite_code" value="{code}">
+                <button class="btn btn-emerald" type="submit">Join this family meeting</button>
+            </form>"""
+    elif current_user:
+        action_html = '<p style="color:#fbbf24;">Approved farmer accounts can join family meetings.</p>'
+    else:
+        login_url = f"/portal/login?next_page={quote(invite_url, safe='/')}"
+        action_html = f"""
+            <a class="btn btn-emerald" href="{html.escape(login_url, quote=True)}">Sign in to join</a>
+            <p style="margin-top:12px;color:#cbd5e1;">New to Olode.com.ng? <a href="/register" style="color:#6ee7b7;">Register as a farmer</a>, then enter this invite code: <b>{code}</b></p>"""
+
+    return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Family invitation | Olode.com.ng</title><style>{UPGRADED_CSS}</style></head>
+        <body><main class="glass-panel" style="max-width:560px;margin:48px auto;">
+            <div style="font-size:38px;">👨‍👩‍👧‍👦</div>
+            <h1 style="color:#fff;">Family meeting invitation</h1>
+            <p style="color:#cbd5e1;">You are invited to <b style="color:#6ee7b7;">{html.escape(family['name'])}</b>.</p>
+            <p style="color:#cbd5e1;">📍 {html.escape(family['town'])}, {html.escape(family['lga'])}</p>
+            <p style="color:#94a3b8;">Invite code: <b style="color:#e2e8f0;">{code}</b></p>
+            {action_html}
+            <p style="margin-top:24px;color:#94a3b8;font-size:13px;">Olode.com.ng · Family connections for farming communities</p>
+        </main></body></html>"""
+
+
 @app.post("/portal/account/delete")
 async def delete_account(current_user=Depends(get_current_farmer)):
     """Permanently delete the current user's account and data."""
@@ -3575,6 +3816,18 @@ async def delete_account(current_user=Depends(get_current_farmer)):
             )
         """, (phone, phone))
         await conn.execute("DELETE FROM trust_groups WHERE owner_phone = ?", (phone,))
+        await conn.execute("""
+            DELETE FROM family_meeting_messages
+            WHERE group_id IN (SELECT id FROM family_groups WHERE owner_phone = ?)
+               OR author_phone = ?
+        """, (phone, phone))
+        await conn.execute("""
+            DELETE FROM family_group_members
+            WHERE farmer_phone = ? OR group_id IN (
+                SELECT id FROM family_groups WHERE owner_phone = ?
+            )
+        """, (phone, phone))
+        await conn.execute("DELETE FROM family_groups WHERE owner_phone = ?", (phone,))
         await conn.execute("DELETE FROM direct_messages WHERE sender_phone = ? OR receiver_phone = ?", (phone, phone))
         await conn.execute("DELETE FROM friendships WHERE requester_phone = ? OR receiver_phone = ?", (phone, phone))
         await conn.execute("DELETE FROM farm_products WHERE farmer_phone = ?", (phone,))
@@ -4657,7 +4910,8 @@ async def farmer_feed_portal(
     is_community_tab = tab == "community"
     is_market_tab = tab == "market"
     is_farm_market_tab = tab == "farm_market"
-    is_incidents_tab = tab not in ("messages", "community", "market", "farm_market")
+    is_family_tab = tab == "family"
+    is_incidents_tab = tab not in ("messages", "community", "market", "farm_market", "family")
     tab_incidents_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_incidents_tab else "background:transparent; color:var(--text-muted);"
     tab_messages_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_messages_tab else "background:transparent; color:var(--text-muted);"
     tab_community_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_community_tab else "background:transparent; color:var(--text-muted);"
@@ -4668,6 +4922,7 @@ async def farmer_feed_portal(
     show_community = "display:block;" if is_community_tab else "display:none;"
     show_market = "display:block;" if is_market_tab else "display:none;"
     show_farm_market = "display:block;" if is_farm_market_tab else "display:none;"
+    show_family = "display:block;" if is_family_tab else "display:none;"
     checked_in_btn = "background:#334155; color:#94a3b8; pointer-events:none;" if checked_in_today else ""
     checked_in_label = "Checked in today ✓" if checked_in_today else f"I'm OK (+{CHECKIN_XP} XP)"
     pending_request_badge = (
@@ -4701,6 +4956,108 @@ async def farmer_feed_portal(
                     <form action="/portal/alert/comment" method="post" style="margin-top:10px; display:flex; gap:8px;"><input type="hidden" name="alert_id" value="{a['id']}"><input type="text" name="comment_text" placeholder="Add verification update details..." required style="padding:10px; font-size:13px;"><button type="submit" class="btn btn-emerald" style="padding:0 16px; border-radius:12px; font-size:13px; white-space:nowrap;">Send</button></form>
                 </div>
             </div>"""
+
+    family_group_cards = []
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("""
+            SELECT fg.*,
+                   (SELECT COUNT(*) FROM family_group_members members
+                    WHERE members.group_id = fg.id) AS member_count
+            FROM family_groups fg
+            JOIN family_group_members mine ON mine.group_id = fg.id
+            WHERE mine.farmer_phone = ? AND ? = ?
+            ORDER BY fg.created_at DESC
+        """, (current_user["phone"], current_user.get("status"), STATUS_APPROVED)) as cursor:
+            family_groups = await cursor.fetchall()
+        for family in family_groups:
+            async with conn.execute("""
+                SELECT f.name FROM family_group_members members
+                JOIN farmers f ON f.phone = members.farmer_phone
+                WHERE members.group_id = ? AND COALESCE(f.is_demo, 0) = 0
+                ORDER BY f.name COLLATE NOCASE LIMIT 30
+            """, (family["id"],)) as cursor:
+                family_members = await cursor.fetchall()
+            async with conn.execute("""
+                SELECT author_name, body, created_at FROM family_meeting_messages
+                WHERE group_id = ? ORDER BY id DESC LIMIT 50
+            """, (family["id"],)) as cursor:
+                family_messages = await cursor.fetchall()
+
+            message_rows = "".join(
+                f'<div style="padding:9px 11px;margin:6px 0;background:rgba(255,255,255,0.04);border-radius:9px;">'
+                f'<strong style="color:#6ee7b7;">{html.escape(message["author_name"])}</strong>'
+                f'<span style="font-size:11px;color:#94a3b8;margin-left:8px;">{html.escape(message["created_at"] or "")}</span>'
+                f'<div style="color:#e2e8f0;white-space:pre-wrap;overflow-wrap:anywhere;">{html.escape(message["body"])}</div></div>'
+                for message in reversed(family_messages)
+            ) or '<p style="color:#94a3b8;text-align:center;">No family messages yet. Send a greeting.</p>'
+            member_names = ", ".join(html.escape(member["name"] or "Farmer") for member in family_members)
+            code = html.escape(family["invite_code"])
+            invite_url = f"/family/invite/{code}"
+            name = html.escape(family["name"])
+            town = html.escape(family["town"])
+            lga = html.escape(family["lga"])
+            room_url = f"https://meet.jit.si/OlodeFamily-{family['meeting_room']}"
+            rotate_form = ""
+            if family["owner_phone"] == current_user["phone"]:
+                rotate_form = f"""
+                    <form action="/portal/family/rotate-code" method="post" style="margin:0;">
+                        <input type="hidden" name="group_id" value="{family['id']}">
+                        <button class="btn" type="submit" style="padding:8px 11px;background:rgba(245,158,11,.12);color:#fbbf24;border:1px solid rgba(245,158,11,.3);">Renew invite code</button>
+                    </form>"""
+            family_group_cards.append(f"""
+                <article class="portal-card" style="grid-column:1/-1;">
+                    <div class="card-header">👨‍👩‍👧‍👦 <h3 class="card-title">{name}</h3></div>
+                    <p style="color:#cbd5e1;margin-top:0;">📍 {town}, {lga} · {family['member_count']} member(s)</p>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:18px;">
+                        <div>
+                            <h4 style="color:#c4b5fd;margin:4px 0 8px;">Invite family</h4>
+                            <p style="color:#cbd5e1;margin:4px 0;">Invite code: <strong style="color:#fff;font-size:18px;letter-spacing:.08em;">{code}</strong></p>
+                            <div style="display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;">
+                                <button class="btn btn-emerald" type="button" data-family-name="{html.escape(family['name'], quote=True)}" data-invite-url="{html.escape(invite_url, quote=True)}" onclick="shareFamilyInvite(this)">Share invite</button>
+                                <button class="btn" type="button" data-family-name="{html.escape(family['name'], quote=True)}" data-invite-url="{html.escape(invite_url, quote=True)}" onclick="shareFamilyOnSocial('whatsapp', this)" style="padding:8px 11px;background:rgba(16,185,129,.12);color:#6ee7b7;">WhatsApp</button>
+                                <button class="btn" type="button" data-family-name="{html.escape(family['name'], quote=True)}" data-invite-url="{html.escape(invite_url, quote=True)}" onclick="shareFamilyOnSocial('facebook', this)" style="padding:8px 11px;background:rgba(59,130,246,.12);color:#93c5fd;">Facebook</button>
+                                <button class="btn" type="button" data-family-name="{html.escape(family['name'], quote=True)}" data-invite-url="{html.escape(invite_url, quote=True)}" onclick="shareFamilyOnSocial('x', this)" style="padding:8px 11px;background:rgba(255,255,255,.08);color:#e2e8f0;">X</button>
+                                {rotate_form}
+                            </div>
+                            <img src="/portal/family/qr/{code}" alt="QR code for the {name} family invitation" width="172" height="172" loading="lazy" style="background:#fff;padding:8px;border-radius:10px;">
+                            <p style="font-size:12px;color:#94a3b8;">Scan the QR code or share the invitation link. Only approved farmers can join.</p>
+                        </div>
+                        <div>
+                            <a class="btn btn-emerald" href="{room_url}" target="_blank" rel="noopener noreferrer" style="display:inline-block;text-decoration:none;">🎥 Open family video meeting</a>
+                            <p style="font-size:12px;color:#fbbf24;line-height:1.5;">Video meetings open on Jitsi, an external service. Anyone with the meeting link may enter, so share it only with family members.</p>
+                            <h4 style="color:#c4b5fd;margin:16px 0 6px;">Family members</h4>
+                            <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px;">{member_names or 'No members yet'}</p>
+                            <h4 style="color:#c4b5fd;margin:0 0 6px;">Family notes and messages</h4>
+                            <div style="max-height:230px;overflow:auto;padding:8px;background:rgba(0,0,0,.2);border-radius:10px;">{message_rows}</div>
+                            <form action="/portal/family/message" method="post" style="display:flex;gap:8px;margin-top:10px;">
+                                <input type="hidden" name="group_id" value="{family['id']}">
+                                <input type="text" name="body" required maxlength="500" placeholder="Leave a family message..." style="flex:1;min-width:0;">
+                                <button class="btn btn-emerald" type="submit">Send</button>
+                            </form>
+                        </div>
+                    </div>
+                </article>""")
+
+    family_cards_html = "".join(family_group_cards) or (
+        '<div class="portal-card" style="grid-column:1/-1;color:#cbd5e1;">'
+        'You have not joined a family meeting yet. Create one or enter an invitation code below.</div>'
+    )
+    family_create_html = ""
+    if current_user.get("status") == STATUS_APPROVED:
+        family_create_html = f"""
+            <form action="/portal/family/create" method="post" style="display:grid;gap:10px;">
+                <label for="family_name" style="color:#e2e8f0;font-weight:700;">Family name</label>
+                <input id="family_name" name="family_name" required maxlength="80" placeholder="e.g. Adeyemi Family">
+                <label for="family_lga" style="color:#e2e8f0;font-weight:700;">LGA</label>
+                <input id="family_lga" name="lga" required maxlength="80" value="{html.escape(current_user.get('lga') or '', quote=True)}">
+                <label for="family_town" style="color:#e2e8f0;font-weight:700;">Town</label>
+                <input id="family_town" name="town" required maxlength="80" value="{html.escape(current_user.get('city') or '', quote=True)}">
+                <button class="btn btn-emerald" type="submit">Create family meeting</button>
+            </form>"""
+    else:
+        family_create_html = '<p style="color:#fbbf24;">Approved farmer accounts can create family meetings.</p>'
+
     return f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         {UPGRADED_CSS}
@@ -4762,7 +5119,8 @@ async def farmer_feed_portal(
                 </div>
                 <div style="display:flex; gap:12px; align-items:center;"><span id="grid_score_display" class="badge badge-amber" style="font-weight:800; padding:8px 16px; font-size:13px;">⚡ {current_user['xp']} Grid XP</span>
                     {admin_dashboard_link}
-                    <a href="/portal/profile/edit" class="btn" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); padding:10px 16px; font-size:13px; border-radius:10px;">✏️ Edit Profile</a>
+                        <button class="btn" type="button" onclick="shareOlodeSite()" style="background:rgba(167,139,250,.12);color:#c4b5fd;border:1px solid rgba(167,139,250,.3);padding:10px 14px;font-size:13px;border-radius:10px;">Share Olode.com.ng</button>
+                        <a href="/portal/profile/edit" class="btn" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); padding:10px 16px; font-size:13px; border-radius:10px;">✏️ Edit Profile</a>
                     <a href="/portal/logout" class="btn btn-danger" style="padding:10px 20px; font-size:13px; border-radius:10px;">🔌 Disconnect</a></div>
             </div>
 
@@ -4780,6 +5138,7 @@ async def farmer_feed_portal(
                 <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community{pending_request_badge}</a>
                 <a href="/portal/feed?active_tab=market" class="tab-btn" style="{tab_market_active}">🔍 Find Products</a>
                 <a href="/portal/feed?active_tab=farm_market" class="tab-btn" style="{tab_farm_market_active}">🛒 Farm Market{product_notification_badge}</a>
+                <a href="/portal/feed?active_tab=family" class="tab-btn" style="{'background:rgba(16,185,129,0.2); color:#10b981;' if is_family_tab else 'background:transparent; color:var(--text-muted);'}">👨‍👩‍👧‍👦 Family Meeting</a>
                 <a id="messages-nav-link" href="/portal/messages" class="tab-btn" style="background:transparent; color:var(--text-muted);">💬 Messages{unread_badge}</a>
                 <button type="button" onclick="enableMessageNotifications()" class="tab-btn" style="background:transparent; color:var(--text-muted); border:0; cursor:pointer;">🔔 Enable alerts</button>
             </div>
@@ -4978,6 +5337,12 @@ async def farmer_feed_portal(
                         </div>
                     </div>
                     <p id="radio_status" style="font-size:13px; color:#94a3b8; margin:8px 0 0 0;">Stopped — choose a station and press Play</p>
+                    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;align-items:center;">
+                        <span style="font-size:12px;color:#cbd5e1;font-weight:700;">Share this station via</span>
+                        <button class="btn" type="button" onclick="shareRadioStation('whatsapp')" style="padding:7px 10px;background:rgba(16,185,129,.12);color:#6ee7b7;">WhatsApp</button>
+                        <button class="btn" type="button" onclick="shareRadioStation('facebook')" style="padding:7px 10px;background:rgba(59,130,246,.12);color:#93c5fd;">Facebook</button>
+                        <button class="btn" type="button" onclick="shareRadioStation('x')" style="padding:7px 10px;background:rgba(255,255,255,.08);color:#e2e8f0;">X</button>
+                    </div>
                     <audio id="radio_audio" crossorigin="anonymous" preload="none" style="display:none;"></audio>
 
                     {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Friend request sent! It will appear under their Requests.</div></div>') if friend_sent else ''}
@@ -5200,6 +5565,28 @@ async def farmer_feed_portal(
                     </form>
                 </div>
             </div>
+            <div id="tab_family" style="{show_family}">
+                <div class="portal-card" style="margin-bottom:20px;border-color:rgba(167,139,250,.25);">
+                    <div class="card-header" style="border-color:rgba(167,139,250,.2);">👨‍👩‍👧‍👦 <h3 class="card-title" style="color:#c4b5fd;">Family & Descendants Meetings</h3></div>
+                    <p style="color:#cbd5e1;line-height:1.55;">Create a family circle, invite relatives with a code or QR scan, leave messages, and open a video call together. Meetings are limited to signed-in, approved farmer members.</p>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px;">
+                        <div style="background:rgba(0,0,0,.2);padding:16px;border-radius:12px;">
+                            <h4 style="color:#6ee7b7;margin-top:0;">Start a family meeting</h4>
+                            {family_create_html}
+                        </div>
+                        <div style="background:rgba(0,0,0,.2);padding:16px;border-radius:12px;">
+                            <h4 style="color:#c4b5fd;margin-top:0;">Join with an invite code</h4>
+                            <form action="/portal/family/join" method="post" style="display:grid;gap:10px;">
+                                <label for="family_invite_code" style="color:#e2e8f0;">Enter the 16-character code</label>
+                                <input id="family_invite_code" name="invite_code" required minlength="16" maxlength="16" pattern="[A-Fa-f0-9]{{16}}" placeholder="e.g. 8F3A10B7C24D9901" style="text-transform:uppercase;">
+                                <button class="btn btn-emerald" type="submit">Join family</button>
+                            </form>
+                            <p style="font-size:12px;color:#94a3b8;">Or open the invitation link / scan its QR code and sign in to join.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="portal-grid">{family_cards_html}</div>
+            </div>
         </div>
         <div id="radar_screen" class="glass-panel" style="max-width: 550px; margin: 60px auto; text-align: center; display: none;"><div class="radar-spinner"></div><span class="badge badge-amber pulse" style="margin-bottom: 16px;">Transmission Channel Engaged</span><h2>Transmitting...</h2></div>
         <div id="nature_moment" role="status" aria-live="polite" style="display:none; position:fixed; right:16px; bottom:84px; z-index:2100; width:min(340px, calc(100vw - 32px)); box-sizing:border-box; background:#0f172a; border:1px solid rgba(110,231,183,0.25); border-radius:16px; padding:14px 16px; box-shadow:0 12px 32px rgba(0,0,0,0.4);">
@@ -5257,6 +5644,74 @@ async def farmer_feed_portal(
             // ----- Farm Radio with Bass / Mid / High EQ -----
             let radioCtx = null, radioSource = null, bassFilter = null, midFilter = null, highFilter = null, radioGain = null;
             let radioPlaying = false;
+
+            function openSocialShare(platform, text, url) {{
+                const encodedUrl = encodeURIComponent(url);
+                const encodedText = encodeURIComponent(text);
+                let target;
+                if (platform === 'facebook') {{
+                    target = 'https://www.facebook.com/sharer/sharer.php?u=' + encodedUrl + '&quote=' + encodedText;
+                }} else if (platform === 'x') {{
+                    target = 'https://twitter.com/intent/tweet?text=' + encodedText + '&url=' + encodedUrl;
+                }} else {{
+                    target = 'https://wa.me/?text=' + encodeURIComponent(text + ' ' + url);
+                }}
+                window.open(target, '_blank', 'noopener,noreferrer');
+            }}
+
+            async function shareOlodeSite() {{
+                const url = window.location.origin;
+                const title = 'Olode.com.ng';
+                const text = 'Join Olode.com.ng — a farming community for connection, safety, and shared knowledge.';
+                if (navigator.share) {{
+                    try {{
+                        await navigator.share({{ title, text, url }});
+                        return;
+                    }} catch (error) {{
+                        if (error.name === 'AbortError') return;
+                        console.error('Could not open the share sheet:', error);
+                    }}
+                }}
+                openSocialShare('whatsapp', text, url);
+            }}
+
+            function shareRadioStation(platform) {{
+                const stationSelect = document.getElementById('radio_station');
+                const station = stationSelect && stationSelect.value;
+                if (!station) {{
+                    const status = document.getElementById('radio_status');
+                    status.innerText = 'Choose a station before sharing it.';
+                    status.style.color = '#fbbf24';
+                    return;
+                }}
+                const stationName = stationSelect.selectedOptions[0].text;
+                const text = 'Listen to ' + stationName + ' (' + station + ') with Farm Radio on Olode.com.ng.';
+                openSocialShare(platform, text, window.location.origin);
+            }}
+
+            async function shareFamilyInvite(button) {{
+                const familyName = button.dataset.familyName || 'our family';
+                const url = window.location.origin + button.dataset.inviteUrl;
+                const title = familyName + ' family meeting | Olode.com.ng';
+                const text = 'You are invited to join ' + familyName + ' on Olode.com.ng. Sign in as an approved farmer to join.';
+                if (navigator.share) {{
+                    try {{
+                        await navigator.share({{ title, text, url }});
+                        return;
+                    }} catch (error) {{
+                        if (error.name === 'AbortError') return;
+                        console.error('Could not open the share sheet:', error);
+                    }}
+                }}
+                openSocialShare('whatsapp', text, url);
+            }}
+
+            function shareFamilyOnSocial(platform, button) {{
+                const familyName = button.dataset.familyName || 'our family';
+                const url = window.location.origin + button.dataset.inviteUrl;
+                const text = 'Join ' + familyName + ' for family meetings on Olode.com.ng.';
+                openSocialShare(platform, text, url);
+            }}
 
             function initRadioAudio() {{
                 if (radioCtx) return;
@@ -5451,7 +5906,8 @@ async def farmer_feed_portal(
                 messages: document.getElementById('tab_messages'),
                 community: document.getElementById('tab_community'),
                 market: document.getElementById('tab_market'),
-                farm_market: document.getElementById('tab_farm_market')
+                farm_market: document.getElementById('tab_farm_market'),
+                family: document.getElementById('tab_family')
             }};
             function showPortalTab(tab, updateHistory, targetUrl) {{
                 if (!portalTabPanels[tab]) return;
