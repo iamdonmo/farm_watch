@@ -5212,6 +5212,17 @@ async def farmer_feed_portal(
                 <button type="button" onclick="hideNatureMoment()" aria-label="Close nature moment" style="background:transparent; border:0; color:#cbd5e1; font-size:22px; line-height:1; cursor:pointer; padding:0 2px;">×</button>
             </div>
         </div>
+        <div id="radio_mini_player" role="region" aria-label="Farm Radio controls" style="display:none; position:fixed; top:12px; right:12px; z-index:2200; width:min(380px, calc(100vw - 24px)); box-sizing:border-box; background:#0f172a; border:1px solid rgba(167,139,250,0.4); border-radius:12px; padding:10px 12px; box-shadow:0 8px 24px rgba(0,0,0,0.35);">
+            <div style="display:flex; align-items:center; gap:10px;">
+                <div style="flex:1; min-width:0;">
+                    <div style="font-size:12px; color:#c4b5fd; font-weight:800;">📻 Farm Radio</div>
+                    <div id="radio_mini_station" style="font-size:13px; color:#e2e8f0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">No station selected</div>
+                    <div id="radio_mini_status" aria-live="polite" style="font-size:11px; color:#94a3b8;">Stopped</div>
+                </div>
+                <button id="radio_mini_toggle" type="button" onclick="toggleRadioPlayback()" class="btn" aria-label="Pause radio" style="padding:8px 10px; background:rgba(16,185,129,0.15); color:#6ee7b7; border:1px solid rgba(16,185,129,0.35);">Pause</button>
+                <button type="button" onclick="stopRadio()" class="btn" aria-label="Stop radio" style="padding:8px 10px; background:rgba(239,68,68,0.12); color:#fecaca; border:1px solid rgba(239,68,68,0.3);">Stop</button>
+            </div>
+        </div>
         <script>
             async function triggerEchoAnimation(e, aId) {{ e.preventDefault(); const btn = document.getElementById('echo_btn_' + aId); btn.disabled = true; btn.innerText = "📡 Relaying..."; try {{ const res = await fetch('/portal/alert/relay', {{ method: 'POST', body: new FormData(e.target) }}); if (res.status === 200) {{ const newXp = await res.text(); document.getElementById('grid_score_display').innerText = "⚡ " + newXp + " Grid XP"; btn.className = "btn"; btn.style.background = "#10b981"; btn.innerText = "✅ Dispatched"; }} }} catch(err) {{ console.error(err); }} }}
             async function executeTransmissionSequence(e) {{
@@ -5302,6 +5313,22 @@ async def farmer_feed_portal(
                 if (audio) audio.volume = v;
             }}
 
+            function updateRadioMiniPlayer() {{
+                const audio = document.getElementById('radio_audio');
+                const mini = document.getElementById('radio_mini_player');
+                const stationSelect = document.getElementById('radio_station');
+                const miniStation = document.getElementById('radio_mini_station');
+                const miniStatus = document.getElementById('radio_mini_status');
+                const miniToggle = document.getElementById('radio_mini_toggle');
+                if (!audio || !mini || !stationSelect || !miniStation || !miniStatus || !miniToggle) return;
+                const hasStation = Boolean(audio.currentSrc || audio.src);
+                mini.style.display = hasStation ? 'block' : 'none';
+                miniStation.textContent = stationSelect.selectedOptions[0]?.text || 'Farm Radio';
+                miniStatus.textContent = radioPlaying ? 'Playing' : 'Paused';
+                miniToggle.textContent = radioPlaying ? 'Pause' : 'Resume';
+                miniToggle.setAttribute('aria-label', radioPlaying ? 'Pause radio' : 'Resume radio');
+            }}
+
             async function toggleRadio() {{
                 const audio = document.getElementById('radio_audio');
                 const station = document.getElementById('radio_station').value;
@@ -5332,31 +5359,141 @@ async def farmer_feed_portal(
                         }}
                         await audio.play();
                         radioPlaying = true;
-                        btn.innerText = 'Stop';
+                        btn.innerText = 'Pause';
                         const name = document.getElementById('radio_station').selectedOptions[0].text;
                         status.innerText = 'Playing: ' + name;
                         status.style.color = '#6ee7b7';
                     }}
+                    updateRadioMiniPlayer();
                 }} catch (err) {{
                     status.innerText = 'Could not play this station. Try another one.';
                     status.style.color = '#f87171';
                     radioPlaying = false;
                     btn.innerText = 'Play';
+                    updateRadioMiniPlayer();
                     console.error(err);
                 }}
+            }}
+
+            async function toggleRadioPlayback() {{
+                const audio = document.getElementById('radio_audio');
+                const btn = document.getElementById('radio_play_btn');
+                const status = document.getElementById('radio_status');
+                if (!audio || !audio.src) return;
+                try {{
+                    if (radioPlaying) {{
+                        audio.pause();
+                        radioPlaying = false;
+                        if (btn) btn.innerText = 'Play';
+                        if (status) {{
+                            status.innerText = 'Paused';
+                            status.style.color = '#94a3b8';
+                        }}
+                    }} else {{
+                        if (radioCtx && radioCtx.state === 'suspended') await radioCtx.resume();
+                        await audio.play();
+                        radioPlaying = true;
+                        if (btn) btn.innerText = 'Pause';
+                        const name = document.getElementById('radio_station').selectedOptions[0].text;
+                        if (status) {{
+                            status.innerText = 'Playing: ' + name;
+                            status.style.color = '#6ee7b7';
+                        }}
+                    }}
+                }} catch (err) {{
+                    radioPlaying = false;
+                    if (btn) btn.innerText = 'Play';
+                    if (status) {{
+                        status.innerText = 'Could not resume this station. Try selecting it again.';
+                        status.style.color = '#f87171';
+                    }}
+                    console.error(err);
+                }}
+                updateRadioMiniPlayer();
+            }}
+
+            function stopRadio() {{
+                const audio = document.getElementById('radio_audio');
+                const btn = document.getElementById('radio_play_btn');
+                const status = document.getElementById('radio_status');
+                if (audio) {{
+                    audio.pause();
+                    audio.removeAttribute('src');
+                    audio.load();
+                }}
+                radioPlaying = false;
+                if (btn) btn.innerText = 'Play';
+                if (status) {{
+                    status.innerText = 'Stopped — choose a station and press Play';
+                    status.style.color = '#94a3b8';
+                }}
+                updateRadioMiniPlayer();
             }}
 
             const radioStationEl = document.getElementById('radio_station');
             if (radioStationEl) radioStationEl.addEventListener('change', function() {{
                 const audio = document.getElementById('radio_audio');
-                if (radioPlaying) {{
+                if (audio) {{
                     audio.pause();
-                    radioPlaying = false;
-                    document.getElementById('radio_play_btn').innerText = 'Play';
-                    document.getElementById('radio_status').innerText = 'Station changed — press Play';
-                    document.getElementById('radio_status').style.color = '#94a3b8';
+                    audio.removeAttribute('src');
+                    audio.load();
                 }}
+                radioPlaying = false;
+                document.getElementById('radio_play_btn').innerText = 'Play';
+                document.getElementById('radio_status').innerText = 'Station changed — press Play';
+                document.getElementById('radio_status').style.color = '#94a3b8';
+                updateRadioMiniPlayer();
             }});
+
+            // Switch the portal's pre-rendered tabs without unloading the radio audio element.
+            const portalTabPanels = {{
+                incidents: document.getElementById('tab_incidents'),
+                messages: document.getElementById('tab_messages'),
+                community: document.getElementById('tab_community'),
+                market: document.getElementById('tab_market'),
+                farm_market: document.getElementById('tab_farm_market')
+            }};
+            function showPortalTab(tab, updateHistory, targetUrl) {{
+                if (!portalTabPanels[tab]) return;
+                Object.entries(portalTabPanels).forEach(([name, panel]) => {{
+                    if (panel) panel.style.display = name === tab ? 'block' : 'none';
+                }});
+                document.querySelectorAll('.tab-bar a').forEach(link => {{
+                    const isActive = link === document.getElementById('messages-nav-link')
+                        ? tab === 'messages'
+                        : new URL(link.href, window.location.href).searchParams.get('active_tab') === tab;
+                    link.style.background = isActive ? 'rgba(16,185,129,0.2)' : 'transparent';
+                    link.style.color = isActive ? '#10b981' : 'var(--text-muted)';
+                    link.setAttribute('aria-current', isActive ? 'page' : 'false');
+                }});
+                if (updateHistory && targetUrl) history.pushState({{ activeTab: tab }}, '', targetUrl);
+            }}
+
+            function portalTabFromLocation() {{
+                if (window.location.pathname === '/portal/messages') return 'messages';
+                const tab = new URLSearchParams(window.location.search).get('active_tab') || 'incidents';
+                return portalTabPanels[tab] ? tab : 'incidents';
+            }}
+
+            document.querySelectorAll('.tab-bar a').forEach(link => {{
+                link.addEventListener('click', event => {{
+                    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                    const url = new URL(link.href, window.location.href);
+                    const tab = link === document.getElementById('messages-nav-link')
+                        ? 'messages'
+                        : url.searchParams.get('active_tab');
+                    if (!portalTabPanels[tab]) return;
+                    event.preventDefault();
+                    const nextUrl = tab === 'messages'
+                        ? new URL('/portal/feed?active_tab=messages', window.location.origin)
+                        : url;
+                    showPortalTab(tab, true, nextUrl);
+                }});
+            }});
+
+            window.addEventListener('popstate', () => showPortalTab(portalTabFromLocation(), false));
+            showPortalTab(portalTabFromLocation(), false);
+            updateRadioMiniPlayer();
 
             // ----- Occasional, gentle nature moments for the community tab -----
             const natureMomentStories = [
