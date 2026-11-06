@@ -1,5 +1,5 @@
 """
-Farm Watch Enterprise Node 
+Farm Watch Enterprise Node
 --------------------------
 Community farm security platform with real-time alerts, peer verification,
 direct messaging, and administrative oversight.
@@ -104,6 +104,27 @@ DART_WIN_XP = 15
 HUNT_WIN_XP = 10
 PRODUCT_POST_XP = 8
 MAX_SHOUTOUT_LEN = 120
+SHOUTOUT_CATEGORIES = ("Birthday", "Naming", "Wedding", "Harvest", "Thank You", "Other")
+_SHOUTOUT_TEMPLATE_FAMILIES = (
+    ("sunrise", "🌅", 30),
+    ("garden", "🌺", 145),
+    ("celebration", "🎉", 320),
+    ("royal", "👑", 260),
+    ("harvest", "🌾", 45),
+    ("ocean", "💙", 190),
+    ("love", "💐", 345),
+    ("simple", "✨", 215),
+)
+SHOUTOUT_TEMPLATES = {
+    f"{family}-{variant:02d}": (
+        emoji,
+        f"linear-gradient(135deg, hsl({(hue + (variant - 1) * 7) % 360} 72% 22%), "
+        f"hsl({(hue + (variant - 1) * 7) % 360} 78% 48%), "
+        f"hsl({(hue + (variant - 1) * 7) % 360} 90% 82%))",
+    )
+    for family, emoji, hue in _SHOUTOUT_TEMPLATE_FAMILIES
+    for variant in range(1, 26)
+}
 MAX_PRODUCT_TITLE = 80
 MAX_PRODUCT_DESC = 300
 PRODUCT_CATEGORIES = ("Crops", "Livestock", "Tools", "Seeds", "Produce", "Other")
@@ -234,6 +255,16 @@ async def lifespan(app: FastAPI):
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        async with conn.execute("PRAGMA table_info(shoutouts)") as cursor:
+            shoutout_columns = {row[1] for row in await cursor.fetchall()}
+        for column, definition in (
+            ("category", "TEXT NOT NULL DEFAULT 'Other'"),
+            ("recipient", "TEXT"),
+            ("template_key", "TEXT NOT NULL DEFAULT 'garden'"),
+            ("image_path", "TEXT"),
+        ):
+            if column not in shoutout_columns:
+                await conn.execute(f"ALTER TABLE shoutouts ADD COLUMN {column} {definition}")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS statuses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -540,21 +571,23 @@ async def can_view_status(conn, status_id: int, viewer_phone: str) -> bool:
         return await cursor.fetchone() is not None
 
 
-def render_status_card(status, comments) -> str:
+def render_status_card(status, comments, highlighted=False) -> str:
     author_phone = html.escape(str(status["author_phone"]), quote=True)
     author_name = html.escape(status["author_name"] or "")
+    highlight_style = "outline:2px solid #34d399;" if highlighted else ""
     author_link = (
         f'<a href="/portal/feed?active_tab=community&view_profile={author_phone}" '
         f'style="color:#f1f5f9; text-decoration:none;">{author_name}</a>'
     )
     comments_html = "".join(
         f'<div style="font-size:13px; margin:4px 0; color:#cbd5e1;">'
-        f'<b style="color:#6ee7b7;">{html.escape(c["author_name"] or "")}</b>: '
+        f'<a href="/portal/feed?active_tab=community&view_profile={html.escape(str(c["author_phone"]), quote=True)}" '
+        f'style="color:#6ee7b7;font-weight:700;text-decoration:none;">{html.escape(c["author_name"] or "")}</a>: '
         f'{html.escape(c["text"])}</div>'
         for c in comments
     )
     return f"""
-    <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:14px; margin-bottom:12px;">
+    <div id="status-{status['id']}" style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:14px; margin-bottom:12px; {highlight_style}">
         <div style="display:flex; justify-content:space-between; align-items:center;">
             <div style="font-weight:700;">{author_link}</div>
             <span style="font-size:11px; color:#64748b;">{html.escape(str(status['timestamp']))}</span>
@@ -2124,24 +2157,65 @@ async def farmer_checkin(current_user=Depends(get_current_farmer)):
 
 
 @app.post("/portal/shoutout")
-async def post_shoutout(message: str = Form(...), current_user=Depends(get_current_farmer)):
-    """Post a short greeting to the LGA wall."""
+async def post_shoutout(request: Request, current_user=Depends(get_current_farmer)):
+    """Create a celebration card for the signed-in farmer's LGA."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    msg = sanitize(message)[:MAX_SHOUTOUT_LEN]
+    form = await request.form()
+    msg = sanitize(str(form.get("message") or ""))[:MAX_SHOUTOUT_LEN]
     if not msg:
-        return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+        return RedirectResponse(url="/portal/feed?active_tab=shoutouts#shoutout-form", status_code=303)
+    category = str(form.get("category") or "Other")
+    if category not in SHOUTOUT_CATEGORIES:
+        raise HTTPException(status_code=400, detail="Choose a valid shout-out occasion.")
+    template_key = str(form.get("template_key") or "garden")
+    if template_key not in SHOUTOUT_TEMPLATES:
+        raise HTTPException(status_code=400, detail="Choose a valid celebration design.")
+    recipient = sanitize(str(form.get("recipient") or ""))[:60]
+    image_path = None
+    upload = form.get("photo")
+    if hasattr(upload, "read") and getattr(upload, "filename", ""):
+        raw = await upload.read(MAX_UPLOAD_SIZE + 1)
+        if len(raw) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail="Celebration photos must be 15 MB or smaller.")
+        if not raw:
+            raise HTTPException(status_code=400, detail="The selected photo is empty.")
+        try:
+            import io
+            from PIL import Image, ImageOps
+            with Image.open(io.BytesIO(raw)) as source_image:
+                if source_image.width * source_image.height > 25_000_000:
+                    raise HTTPException(status_code=400, detail="Choose an image smaller than 25 megapixels.")
+                image = ImageOps.exif_transpose(source_image).convert("RGB")
+                image.thumbnail((1200, 1200))
+                filename = f"shoutout_{secrets.token_hex(16)}.jpg"
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="The uploaded file must be a valid image.") from exc
+        try:
+            image.save(os.path.join(MEDIA_DIR, filename), "JPEG", quality=82, optimize=True)
+            image_path = filename
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="The celebration photo could not be saved.") from exc
     async with aiosqlite.connect(DB_FILE) as conn:
-        await conn.execute(
-            "INSERT INTO shoutouts (farmer_phone, farmer_name, lga, message) VALUES (?, ?, ?, ?)",
-            (current_user["phone"], current_user["name"], current_user["lga"], msg)
+        cursor = await conn.execute(
+            """INSERT INTO shoutouts
+               (farmer_phone, farmer_name, lga, message, category, recipient, template_key, image_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (current_user["phone"], current_user["name"], current_user["lga"],
+             msg, category, recipient, template_key, image_path)
         )
+        shoutout_id = cursor.lastrowid
         await conn.execute(
             "UPDATE farmers SET xp = xp + ? WHERE phone = ?",
             (SHOUTOUT_XP, current_user["phone"])
         )
         await conn.commit()
-    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+    return RedirectResponse(
+        url=f"/portal/feed?active_tab=shoutouts&shoutout_posted={shoutout_id}#shoutout-{shoutout_id}",
+        status_code=303,
+    )
 
 
 @app.post("/portal/status/post")
@@ -2153,12 +2227,16 @@ async def post_status(content: str = Form(...), current_user=Depends(get_current
     if not text:
         return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
     async with aiosqlite.connect(DB_FILE) as conn:
-        await conn.execute(
+        cursor = await conn.execute(
             "INSERT INTO statuses (author_phone, author_name, content) VALUES (?, ?, ?)",
             (current_user["phone"], current_user["name"], text)
         )
+        status_id = cursor.lastrowid
         await conn.commit()
-    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+    return RedirectResponse(
+        url=f"/portal/feed?active_tab=community&status_posted={status_id}#status-{status_id}",
+        status_code=303,
+    )
 
 
 @app.post("/portal/status/like")
@@ -3329,7 +3407,7 @@ async def simple_messages_page(current_user=Depends(get_current_farmer)):
     for c in contacts:
         contacts_html += (
             '<div style="display:flex; justify-content:space-between; align-items:center; padding:14px; background:rgba(16,185,129,0.08); border-radius:10px; margin-bottom:8px;">'
-            f'<span style="font-weight:700; color:#f1f5f9;">{html.escape(c["name"])}</span>'
+            f'<a href="/portal/feed?active_tab=community&view_profile={html.escape(str(c["phone"]), quote=True)}" style="font-weight:700; color:#f1f5f9;text-decoration:none;">{html.escape(c["name"])}</a>'
             f'<a href="/portal/chat?with={c["phone"]}" style="background:#34d399; color:#042f2e; padding:8px 16px; border-radius:8px; text-decoration:none; font-weight:700; font-size:14px;">Open Chat</a>'
             '</div>'
         )
@@ -3504,7 +3582,7 @@ async def simple_chat_page(
         'button{padding:14px 24px;background:#34d399;color:#042f2e;border:none;border-radius:10px;font-weight:700;font-size:16px;cursor:pointer;}'
         '</style></head><body><div class="wrap">'
         '<div class="header"><a href="/portal/messages" class="back">← Back</a>'
-        f'<div class="name">{html.escape(peer_name)} ✅</div><span></span></div>'
+        f'<div class="name"><a href="/portal/feed?active_tab=community&view_profile={html.escape(str(peer_phone), quote=True)}" style="color:inherit;text-decoration:none;">{html.escape(peer_name)}</a> ✅</div><span></span></div>'
         f'<div style="font-size:13px;color:#94a3b8;margin-bottom:12px;font-family:monospace;">{mask_phone_number(peer_phone)}</div>'
         + ('<div style="background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.4);border-radius:10px;padding:12px;margin-bottom:12px;color:#6ee7b7;font-weight:700;">✅ Message sent successfully.</div>' if sent else '')
         + f'<div class="chat" id="chatBox">{messages_html}</div>'
@@ -3856,6 +3934,8 @@ async def farmer_feed_portal(
     market_page: Optional[int] = Query(1),
     friend_sent: Optional[str] = Query(None),
     profile_updated: Optional[str] = Query(None),
+    status_posted: Optional[int] = Query(None),
+    shoutout_posted: Optional[int] = Query(None),
     invite_sent: Optional[str] = Query(None),
     view_profile: Optional[str] = Query(None),
     friend_name: Optional[str] = Query(None),
@@ -3946,8 +4026,9 @@ async def farmer_feed_portal(
         """, (current_user['lga'],)) as c4:
             recent_checkins = await c4.fetchall()
         async with conn.execute("""
-            SELECT farmer_name, message, timestamp FROM shoutouts
-            WHERE lga = ? ORDER BY id DESC LIMIT 25
+            SELECT id, farmer_phone, farmer_name, lga, message, timestamp,
+                   category, recipient, template_key, image_path
+            FROM shoutouts WHERE lga = ? ORDER BY id DESC LIMIT 25
         """, (current_user['lga'],)) as c5:
             recent_shoutouts = await c5.fetchall()
         # Statuses from friends + own (network growth)
@@ -3968,7 +4049,7 @@ async def farmer_feed_portal(
         if status_posts:
             ids = [s['id'] for s in status_posts]
             ph = ",".join("?" * len(ids))
-            async with conn.execute(f"SELECT status_id, author_name, text FROM status_comments WHERE status_id IN ({ph}) ORDER BY id ASC", ids) as cc:
+            async with conn.execute(f"SELECT status_id, author_phone, author_name, text FROM status_comments WHERE status_id IN ({ph}) ORDER BY id ASC", ids) as cc:
                 for row in await cc.fetchall():
                     status_comments_map.setdefault(row['status_id'], []).append(row)
         async with conn.execute("""
@@ -4010,7 +4091,7 @@ async def farmer_feed_portal(
         """, (current_user["phone"],)) as c_tg:
             trust_groups = await c_tg.fetchall()
         async with conn.execute("""
-            SELECT tg.id, tg.name, f.name AS owner_name
+            SELECT tg.id, tg.name, f.phone AS owner_phone, f.name AS owner_name
             FROM trust_group_members tgm
             JOIN trust_groups tg ON tg.id = tgm.group_id
             JOIN farmers f ON f.phone = tg.owner_phone
@@ -4074,17 +4155,19 @@ async def farmer_feed_portal(
     # Friends panel HTML
     pending_html = ""
     for r in pending_requests:
+        requester_phone = html.escape(str(r["requester_phone"]), quote=True)
+        requester_profile = f"/portal/feed?active_tab=community&view_profile={requester_phone}"
         pending_html += f"""
         <div id="friend-request-{html.escape(r['requester_phone'])}" style="background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:10px; padding:12px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
-            <span style="font-weight:600; color:#f1f5f9;">{html.escape(r['requester_name'] or '')}</span>
+            <a href="{requester_profile}" style="font-weight:600; color:#f1f5f9; text-decoration:none;">{html.escape(r['requester_name'] or '')}</a>
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
-                <a href="/portal/feed?active_tab=community&view_profile={html.escape(r['requester_phone'], quote=True)}" style="background:rgba(59,130,246,0.2); border:1px solid rgba(59,130,246,0.4); color:#93c5fd; font-size:12px; font-weight:700; padding:6px 12px; border-radius:8px; text-decoration:none;">👤 View Profile</a>
+                <a href="{requester_profile}" style="background:rgba(59,130,246,0.2); border:1px solid rgba(59,130,246,0.4); color:#93c5fd; font-size:12px; font-weight:700; padding:6px 12px; border-radius:8px; text-decoration:none;">👤 View Profile</a>
                 <form action="/portal/friend/accept" method="post" style="margin:0;">
-                    <input type="hidden" name="requester_phone" value="{html.escape(r['requester_phone'], quote=True)}">
+                    <input type="hidden" name="requester_phone" value="{requester_phone}">
                     <button type="submit" class="btn btn-emerald" style="padding:6px 12px; font-size:12px;">Accept</button>
                 </form>
                 <form action="/portal/friend/reject" method="post" style="margin:0;">
-                    <input type="hidden" name="requester_phone" value="{html.escape(r['requester_phone'], quote=True)}">
+                    <input type="hidden" name="requester_phone" value="{requester_phone}">
                     <button type="submit" class="btn btn-danger" style="padding:6px 12px; font-size:12px;">Reject</button>
                 </form>
             </div>
@@ -4103,7 +4186,12 @@ async def farmer_feed_portal(
     </div>"""
 
     friends_html = ""
+    friend_suggestion_options = ""
     for fr in my_friends:
+        friend_suggestion_options += (
+            f'<option value="{html.escape(str(fr["friend_phone"]), quote=True)}" '
+            f'label="{html.escape(fr["friend_name"] or "", quote=True)}"></option>'
+        )
         friend_profile_url = (
             f"/portal/feed?active_tab=community&view_profile="
             f"{html.escape(str(fr['friend_phone']), quote=True)}"
@@ -4122,7 +4210,7 @@ async def farmer_feed_portal(
         pending_trust_group_invites_html += f"""
         <div style="background:rgba(59,130,246,.08); border:1px solid rgba(59,130,246,.25); border-radius:10px; padding:12px; margin:8px 0;">
             <div style="font-weight:700; color:#f1f5f9;">Invitation to {html.escape(invite["name"])}</div>
-            <div style="font-size:12px; color:#94a3b8; margin-top:4px;">From {html.escape(invite["owner_name"] or "a friend")}. Accept to receive this group's travel alerts and check-ins.</div>
+            <div style="font-size:12px; color:#94a3b8; margin-top:4px;">From <a href="/portal/feed?active_tab=community&view_profile={html.escape(str(invite['owner_phone']), quote=True)}" style="color:#cbd5e1;text-decoration:none;">{html.escape(invite["owner_name"] or "a friend")}</a>. Accept to receive this group's travel alerts and check-ins.</div>
             <div style="display:flex; gap:8px; margin-top:10px;">
                 <form action="/portal/trust-groups/respond" method="post" style="margin:0;">
                     <input type="hidden" name="group_id" value="{invite["id"]}">
@@ -4208,7 +4296,7 @@ async def farmer_feed_portal(
             trips_html = ""
             for trip in active_trips:
                 async with conn.execute("""
-                    SELECT f.name, tc.timestamp, tc.xp_awarded
+                    SELECT f.phone, f.name, tc.timestamp, tc.xp_awarded
                     FROM trust_trip_checkins tc
                     JOIN farmers f ON f.phone = tc.farmer_phone
                     WHERE tc.trip_id = ?
@@ -4217,7 +4305,7 @@ async def farmer_feed_portal(
                     trip_checkins = await cursor.fetchall()
                 checkin_rows = "".join(
                     f'<div style="font-size:12px; color:#cbd5e1; padding:4px 0;">'
-                    f'✅ <b>{html.escape(row["name"] or "")}</b> is OK '
+                    f'✅ <a href="/portal/feed?active_tab=community&view_profile={html.escape(str(row["phone"]), quote=True)}" style="color:#cbd5e1;font-weight:700;text-decoration:none;">{html.escape(row["name"] or "")}</a> is OK '
                     f'<span style="color:#94a3b8;">· {html.escape(row["timestamp"])}'
                     f'{" · +5 XP" if row["xp_awarded"] else ""}</span></div>'
                     for row in trip_checkins
@@ -4237,7 +4325,7 @@ async def farmer_feed_portal(
                     </div>"""
                 trips_html += f"""
                 <div style="background:rgba(16,185,129,.06); border:1px solid rgba(16,185,129,.2); border-radius:10px; padding:12px; margin-top:10px;">
-                    <div style="font-weight:700; color:#f1f5f9;">🚗 {html.escape(trip["name"] or "")} is travelling to {html.escape(trip["destination"])}</div>
+                    <div style="font-weight:700; color:#f1f5f9;">🚗 <a href="/portal/feed?active_tab=community&view_profile={html.escape(str(trip['farmer_phone']), quote=True)}" style="color:inherit;text-decoration:none;">{html.escape(trip["name"] or "")}</a> is travelling to {html.escape(trip["destination"])}</div>
                     <div style="font-size:11px; color:#94a3b8; margin-top:4px;">Started {html.escape(trip["started_at"])}</div>
                     {f'<div style="font-size:13px; color:#cbd5e1; margin-top:6px;">{html.escape(trip["note"] or "")}</div>' if trip["note"] else ''}
                     <div style="margin-top:8px;">{checkin_rows}</div>
@@ -4246,7 +4334,11 @@ async def farmer_feed_portal(
             if not trips_html:
                 trips_html = '<p style="font-size:13px; color:#94a3b8;">No active travel alerts in this group.</p>'
 
-            members_html = ", ".join(html.escape(member["name"] or "") for member in group_members)
+            members_html = ", ".join(
+                f'<a href="/portal/feed?active_tab=community&view_profile={html.escape(str(member["phone"]), quote=True)}" '
+                f'style="color:#e2e8f0;text-decoration:none;">{html.escape(member["name"] or "")}</a>'
+                for member in group_members
+            )
             trip_form_html = f"""
             <form action="/portal/trust-groups/travel" method="post" style="border-top:1px solid rgba(255,255,255,.08); padding-top:10px; margin-top:10px;">
                 <input type="hidden" name="group_id" value="{group_id}">
@@ -4312,7 +4404,7 @@ async def farmer_feed_portal(
                     prof_status_ids = [status["id"] for status in prof_statuses]
                     placeholders = ",".join("?" * len(prof_status_ids))
                     async with conn.execute(
-                        f"""SELECT status_id, author_name, text FROM status_comments
+                        f"""SELECT status_id, author_phone, author_name, text FROM status_comments
                             WHERE status_id IN ({placeholders}) ORDER BY id ASC""",
                         prof_status_ids
                     ) as cur:
@@ -4356,16 +4448,20 @@ async def farmer_feed_portal(
         leaderboard_html += f"""
         <div style="display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
             <span style="width:28px; text-align:center; font-size:16px;">{medal}</span>
-            <span style="flex:1; font-size:15px; {name_style}">{html.escape(row['name'])}{" (you)" if is_me else ""}</span>
+            <a href="/portal/feed?active_tab=community&view_profile={html.escape(str(row['phone']), quote=True)}" style="flex:1; font-size:15px; text-decoration:none; {name_style}">{html.escape(row['name'] or 'Farmer')}{" (you)" if is_me else ""}</a>
             <span style="font-size:14px; color:#fbbf24; font-weight:700;">⚡ {row['xp']} XP</span>
         </div>"""
     if not leaderboard_html:
         leaderboard_html = '<p style="color:var(--text-muted); font-size:13px;">No ranked farmers yet.</p>'
 
     # Compact ticker text for tip / check-in / leaderboard
-    top_names = " · ".join([f"{r['name']} ({r['xp']} XP)" for r in list(leaderboard_rows)[:3]]) or "No rankings yet"
     checkin_bit = "Checked in today" if checked_in_today else f"Daily check-in available (+{CHECKIN_XP} XP)"
-    ticker_text = f"🌤️ {weather['temp']} · {weather['desc']} · Humidity {weather['humidity']} · Wind {weather['wind']}   •   💡 Tip: {tip_of_day}   •   ✅ {checkin_bit}   •   🏆 Top: {top_names}"
+    ticker_text = f"🌤️ {weather['temp']} · {weather['desc']} · Humidity {weather['humidity']} · Wind {weather['wind']}   •   💡 Tip: {tip_of_day}   •   ✅ {checkin_bit}   •   🏆 Top: "
+    top_names_html = " · ".join(
+        f'<a href="/portal/feed?active_tab=community&view_profile={html.escape(str(row["phone"]), quote=True)}" style="color:#cbd5e1;text-decoration:none;">{html.escape(row["name"] or "Farmer")} ({row["xp"]} XP)</a>'
+        for row in list(leaderboard_rows)[:3]
+    ) or "No rankings yet"
+    ticker_html = f"{html.escape(ticker_text)}{top_names_html}"
 
     products_html = ""
     for p in market_products:
@@ -4494,7 +4590,7 @@ async def farmer_feed_portal(
             </div>
             <p style="font-size:15px; color:#cbd5e1; margin:12px 0; line-height:1.5;">{html.escape(p['description'] or '')}</p>
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; font-size:14px;">
-                <span style="color:#94a3b8; min-width:0;">Seller: <b style="color:#e2e8f0;">{html.escape(p['farmer_name'] or '')}</b></span>
+                <span style="color:#94a3b8; min-width:0;">Seller: <a href="/portal/feed?active_tab=community&view_profile={html.escape(str(p['farmer_phone']), quote=True)}" style="color:#e2e8f0;font-weight:700;text-decoration:none;">{html.escape(p['farmer_name'] or '')}</a></span>
                 <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; max-width:100%;">{call_btn}{msg_btn}{actions}
                     <button type="button" onclick="shareListing('{safe_title}', '{safe_price}')" style="display:inline-block;padding:8px 12px;background:rgba(167,139,250,0.2);border:1px solid rgba(167,139,250,0.4);color:#c4b5fd;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap;">🔗 Share</button>
                 </span>
@@ -4566,19 +4662,52 @@ async def farmer_feed_portal(
 
     checkins_html = "".join([f"""
         <div style="display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.05); font-size:14px;">
-            <span style="color:#e2e8f0; font-weight:600;">{html.escape(c['name'])}</span>
+            <a href="/portal/feed?active_tab=community&view_profile={html.escape(str(c['farmer_phone']), quote=True)}" style="color:#e2e8f0; font-weight:600;text-decoration:none;">{html.escape(c['name'])}</a>
             <span style="color:#94a3b8; font-size:12px;">OK · {c['timestamp']}</span>
         </div>""" for c in recent_checkins]) or '<p style="color:var(--text-muted); font-size:13px;">No check-ins yet today. Be the first!</p>'
 
-    shoutouts_html = "".join([f"""
-        <div style="background:rgba(255,255,255,0.04); border-radius:10px; padding:12px; margin-bottom:8px;">
-            <div style="font-weight:700; color:#6ee7b7; font-size:13px;">{html.escape(s['farmer_name'])}</div>
-            <div style="color:#f1f5f9; font-size:14px; margin-top:4px;">{s['message']}</div>
-            <div style="color:#64748b; font-size:11px; margin-top:4px;">{s['timestamp']}</div>
-        </div>""" for s in recent_shoutouts]) or '<p style="color:var(--text-muted); font-size:13px;">No shout-outs yet. Say hello to your neighbours!</p>'
+    shoutouts_html = ""
+    for shoutout in recent_shoutouts:
+        emoji, background = SHOUTOUT_TEMPLATES.get(
+            shoutout["template_key"] or "garden-01", SHOUTOUT_TEMPLATES["garden-01"]
+        )
+        author_phone = html.escape(str(shoutout["farmer_phone"]), quote=True)
+        recipient = html.escape(shoutout["recipient"] or "")
+        image_html = (
+            f'<img src="/media/{html.escape(os.path.basename(shoutout["image_path"]), quote=True)}" '
+            'alt="Celebration photo" style="width:100%;max-height:220px;object-fit:cover;border-radius:12px;margin:12px 0;">'
+            if shoutout["image_path"] else ""
+        )
+        shoutout_style = (
+            "outline:2px solid #34d399;" if shoutout_posted == shoutout["id"] else ""
+        )
+        shoutouts_html += f"""
+        <article class="shoutout-entry" id="shoutout-{shoutout['id']}" style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:12px;margin-bottom:12px;{shoutout_style}">
+            <div id="shoutout-card-{shoutout['id']}" class="shoutout-card" data-template="{html.escape(shoutout['template_key'] or 'garden', quote=True)}" style="background:{background};color:#fff;border-radius:14px;padding:20px;text-align:center;min-height:145px;box-sizing:border-box;box-shadow:0 8px 24px rgba(0,0,0,.2);">
+                <div style="font-size:30px;">{emoji}</div>
+                <div class="shoutout-category" style="font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;">{html.escape(shoutout['category'] or 'Other')}</div>
+                {f'<div class="shoutout-recipient" style="font-size:19px;font-weight:800;margin-top:8px;">For {recipient}</div>' if recipient else ''}
+                <div class="shoutout-message" style="font-size:17px;line-height:1.45;margin-top:10px;white-space:pre-wrap;">{shoutout['message']}</div>
+                {image_html}
+                <div style="font-size:12px;margin-top:12px;">With love from {html.escape(shoutout['lga'] or 'Olode.com.ng')} · Olode.com.ng</div>
+            </div>
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;margin-top:9px;">
+                <a href="/portal/feed?active_tab=community&view_profile={author_phone}" style="color:#6ee7b7;font-size:13px;font-weight:700;text-decoration:none;">{html.escape(shoutout['farmer_name'] or '')}</a>
+                <span style="color:#64748b;font-size:11px;">{html.escape(str(shoutout['timestamp']))}</span>
+                <span style="display:flex;gap:6px;">
+                    <button type="button" class="btn" onclick="shareShoutout({shoutout['id']})" style="padding:6px 10px;">Share</button>
+                    <button type="button" class="btn" onclick="printShoutout({shoutout['id']})" style="padding:6px 10px;">Print</button>
+                </span>
+            </div>
+        </article>"""
+    if not shoutouts_html:
+        shoutouts_html = '<p style="color:var(--text-muted);font-size:13px;">No shout-outs yet. Create the first celebration card!</p>'
 
     status_html = "".join(
-        render_status_card(s, status_comments_map.get(s["id"], []))
+        render_status_card(
+            s, status_comments_map.get(s["id"], []),
+            highlighted=status_posted == s["id"],
+        )
         for s in status_posts
     )
     if not status_html:
@@ -4636,7 +4765,7 @@ async def farmer_feed_portal(
         clean_target = normalize_nigerian_mobile(search_phone) or clean_phone(search_phone)
         peer_card_html = f"""
         <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.25); border-radius:14px; padding:18px; margin-bottom:16px;">
-            <div style="font-weight:800; font-size:20px; color:#fff; margin-bottom:6px;">{html.escape(friend_name)} ✅</div>
+            <div style="font-weight:800; font-size:20px; color:#fff; margin-bottom:6px;"><a href="/portal/feed?active_tab=community&view_profile={html.escape(str(clean_target), quote=True)}" style="color:inherit;text-decoration:none;">{html.escape(friend_name)}</a> ✅</div>
             <div style="font-size:13px; color:var(--text-muted); font-family:monospace;">{mask_phone_number(clean_target)}</div>
         </div>"""
         # Load any existing messages
@@ -4789,7 +4918,7 @@ async def farmer_feed_portal(
                 <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.25); border-radius:14px; padding:18px; margin-bottom:16px;">
                     <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
                         <div>
-                            <div style="font-weight:800; font-size:20px; color:#fff; margin-bottom:6px;">{html.escape(peer['name'])} {'✅' if peer['status']=='Approved' else ''}</div>
+                            <div style="font-weight:800; font-size:20px; color:#fff; margin-bottom:6px;"><a href="/portal/feed?active_tab=community&view_profile={html.escape(str(peer_phone), quote=True)}" style="color:inherit;text-decoration:none;">{html.escape(peer['name'])}</a> {'✅' if peer['status']=='Approved' else ''}</div>
                             <div style="font-size:13px; color:var(--text-muted);">LGA Sector: <b>{html.escape(peer['lga'])}</b></div>
                             <div style="font-size:13px; color:var(--text-muted); margin-top:4px;">
                                 Status: <span class="badge {status_badge_class}">{html.escape(peer['status'])}</span>
@@ -4908,18 +5037,21 @@ async def farmer_feed_portal(
     tab = (active_tab or "incidents").lower()
     is_messages_tab = tab == "messages"
     is_community_tab = tab == "community"
+    is_shoutouts_tab = tab == "shoutouts"
     is_market_tab = tab == "market"
     is_farm_market_tab = tab == "farm_market"
     is_family_tab = tab == "family"
-    is_incidents_tab = tab not in ("messages", "community", "market", "farm_market", "family")
+    is_incidents_tab = tab not in ("messages", "community", "shoutouts", "market", "farm_market", "family")
     tab_incidents_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_incidents_tab else "background:transparent; color:var(--text-muted);"
     tab_messages_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_messages_tab else "background:transparent; color:var(--text-muted);"
     tab_community_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_community_tab else "background:transparent; color:var(--text-muted);"
+    tab_shoutouts_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_shoutouts_tab else "background:transparent; color:var(--text-muted);"
     tab_market_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_market_tab else "background:transparent; color:var(--text-muted);"
     tab_farm_market_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_farm_market_tab else "background:transparent; color:var(--text-muted);"
     show_incidents = "display:block;" if is_incidents_tab else "display:none;"
     show_messages = "display:block;" if is_messages_tab else "display:none;"
     show_community = "display:block;" if is_community_tab else "display:none;"
+    show_shoutouts = "display:block;" if is_shoutouts_tab else "display:none;"
     show_market = "display:block;" if is_market_tab else "display:none;"
     show_farm_market = "display:block;" if is_farm_market_tab else "display:none;"
     show_family = "display:block;" if is_family_tab else "display:none;"
@@ -4972,26 +5104,31 @@ async def farmer_feed_portal(
             family_groups = await cursor.fetchall()
         for family in family_groups:
             async with conn.execute("""
-                SELECT f.name FROM family_group_members members
+                SELECT f.phone, f.name FROM family_group_members members
                 JOIN farmers f ON f.phone = members.farmer_phone
                 WHERE members.group_id = ? AND COALESCE(f.is_demo, 0) = 0
                 ORDER BY f.name COLLATE NOCASE LIMIT 30
             """, (family["id"],)) as cursor:
                 family_members = await cursor.fetchall()
             async with conn.execute("""
-                SELECT author_name, body, created_at FROM family_meeting_messages
+                SELECT author_phone, author_name, body, created_at FROM family_meeting_messages
                 WHERE group_id = ? ORDER BY id DESC LIMIT 50
             """, (family["id"],)) as cursor:
                 family_messages = await cursor.fetchall()
 
             message_rows = "".join(
                 f'<div style="padding:9px 11px;margin:6px 0;background:rgba(255,255,255,0.04);border-radius:9px;">'
-                f'<strong style="color:#6ee7b7;">{html.escape(message["author_name"])}</strong>'
+                f'<a href="/portal/feed?active_tab=community&view_profile={html.escape(str(message["author_phone"]), quote=True)}" '
+                f'style="color:#6ee7b7;font-weight:700;text-decoration:none;">{html.escape(message["author_name"])}</a>'
                 f'<span style="font-size:11px;color:#94a3b8;margin-left:8px;">{html.escape(message["created_at"] or "")}</span>'
                 f'<div style="color:#e2e8f0;white-space:pre-wrap;overflow-wrap:anywhere;">{html.escape(message["body"])}</div></div>'
                 for message in reversed(family_messages)
             ) or '<p style="color:#94a3b8;text-align:center;">No family messages yet. Send a greeting.</p>'
-            member_names = ", ".join(html.escape(member["name"] or "Farmer") for member in family_members)
+            member_names = ", ".join(
+                f'<a href="/portal/feed?active_tab=community&view_profile={html.escape(str(member["phone"]), quote=True)}" '
+                f'style="color:#c4b5fd;text-decoration:none;">{html.escape(member["name"] or "Farmer")}</a>'
+                for member in family_members
+            )
             code = html.escape(family["invite_code"])
             invite_url = f"/family/invite/{code}"
             name = html.escape(family["name"])
@@ -5115,10 +5252,11 @@ async def farmer_feed_portal(
             <div style="background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:24px; padding:24px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px; margin-bottom:24px;">
                 <div style="display:flex; align-items:center; gap:16px;">
                     <div style="font-size:40px;">👨‍🌾</div>
-                    <div><h1 style="margin:0; font-size:22px; font-weight:800; color:#fff;">Terminal: {html.escape(current_user['name'])} {'✅' if current_user.get('status') == 'Approved' else ''}</h1><span class="badge badge-emerald" style="margin-top:6px;">📍 {html.escape(current_user['lga'])} Sector Grid</span></div>
+                    <div><h1 style="margin:0; font-size:22px; font-weight:800; color:#fff;">Terminal: <a href="/portal/feed?active_tab=community&view_profile={html.escape(str(current_user['phone']), quote=True)}" style="color:inherit;text-decoration:none;">{html.escape(current_user['name'])}</a> {'✅' if current_user.get('status') == 'Approved' else ''}</h1><span class="badge badge-emerald" style="margin-top:6px;">📍 {html.escape(current_user['lga'])} Sector Grid</span></div>
                 </div>
                 <div style="display:flex; gap:12px; align-items:center;"><span id="grid_score_display" class="badge badge-amber" style="font-weight:800; padding:8px 16px; font-size:13px;">⚡ {current_user['xp']} Grid XP</span>
                     {admin_dashboard_link}
+                        <button class="btn" type="button" data-profile-phone="{html.escape(str(current_user['phone']), quote=True)}" onclick="shareMyProfile(this)" style="background:rgba(16,185,129,.12);color:#6ee7b7;border:1px solid rgba(16,185,129,.3);padding:10px 14px;font-size:13px;border-radius:10px;">Ask friends to follow me</button>
                         <button class="btn" type="button" onclick="shareOlodeSite()" style="background:rgba(167,139,250,.12);color:#c4b5fd;border:1px solid rgba(167,139,250,.3);padding:10px 14px;font-size:13px;border-radius:10px;">Share Olode.com.ng</button>
                         <a href="/portal/profile/edit" class="btn" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); padding:10px 16px; font-size:13px; border-radius:10px;">✏️ Edit Profile</a>
                     <a href="/portal/logout" class="btn btn-danger" style="padding:10px 20px; font-size:13px; border-radius:10px;">🔌 Disconnect</a></div>
@@ -5127,8 +5265,9 @@ async def farmer_feed_portal(
             <form action="/portal/feed" method="get" style="margin-bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:12px; padding:8px 12px;">
                 <input type="hidden" name="active_tab" value="community">
                 <span style="font-size:13px; font-weight:600; color:#94a3b8; white-space:nowrap;">🔍 Find a Farmer</span>
-                <input type="text" name="search_phone" placeholder="0803 123 4567" required inputmode="numeric" autocomplete="tel"
+                <input type="text" name="search_phone" list="friend-phone-suggestions" placeholder="0803 123 4567" required inputmode="numeric" autocomplete="tel"
                        style="flex:1; min-width:140px; padding:8px 10px; font-size:14px; background:#0f172a; border:1px solid rgba(52,211,153,0.25); color:#f0fdf4; border-radius:8px; margin:0;">
+                <datalist id="friend-phone-suggestions">{friend_suggestion_options}</datalist>
                 <button type="submit" class="btn btn-emerald" style="padding:8px 14px; font-size:13px; white-space:nowrap;">Search</button>
             </form>
             {f'<div style="margin-bottom:16px;">{peer_card_html}</div>' if search_phone and peer_card_html else ''}
@@ -5136,6 +5275,7 @@ async def farmer_feed_portal(
             <div class="tab-bar">
                 <a href="/portal/feed?active_tab=incidents" class="tab-btn" style="{tab_incidents_active}">🛡️ Alerts</a>
                 <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community{pending_request_badge}</a>
+                <a href="/portal/feed?active_tab=shoutouts" class="tab-btn" style="{tab_shoutouts_active}">🎊 Shout Out</a>
                 <a href="/portal/feed?active_tab=market" class="tab-btn" style="{tab_market_active}">🔍 Find Products</a>
                 <a href="/portal/feed?active_tab=farm_market" class="tab-btn" style="{tab_farm_market_active}">🛒 Farm Market{product_notification_badge}</a>
                 <a href="/portal/feed?active_tab=family" class="tab-btn" style="{'background:rgba(16,185,129,0.2); color:#10b981;' if is_family_tab else 'background:transparent; color:var(--text-muted);'}">👨‍👩‍👧‍👦 Family Meeting</a>
@@ -5346,7 +5486,7 @@ async def farmer_feed_portal(
                     <audio id="radio_audio" crossorigin="anonymous" preload="none" style="display:none;"></audio>
 
                     {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Friend request sent! It will appear under their Requests.</div></div>') if friend_sent else ''}
-                    {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Profile updated successfully.</div></div>') if profile_updated else ''}
+                    {('<div id="profile-updated-notice" class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Profile updated successfully.</div></div>') if profile_updated else ''}
                     <div class="portal-card" style="grid-column:1 / -1;">
                         <div class="card-header">🤝 <h3 class="card-title">Friends & Requests</h3></div>
                         <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
@@ -5362,7 +5502,7 @@ async def farmer_feed_portal(
                     </div>
 
                     <div class="portal-card" style="grid-column:1 / -1;">
-                        <div class="card-header">📝 <h3 class="card-title">Status Feed</h3></div>
+                        <div id="status-feed" class="card-header">📝 <h3 class="card-title">Status Feed</h3></div>
                         <p style="font-size:13px; color:#94a3b8; margin:0 0 12px 0;">Post an update. Friends can like, comment, or repost to grow the network.</p>
                         <form action="/portal/status/post" method="post" style="display:flex; gap:10px; margin-bottom:16px;">
                             <input type="text" name="content" maxlength="280" required placeholder="What's happening on the farm…"
@@ -5372,15 +5512,10 @@ async def farmer_feed_portal(
                         <div style="max-height:480px; overflow-y:auto;">{status_html}</div>
                     </div>
 
-                    <div class="portal-card" style="grid-column:1 / -1;">
-                        <div class="card-header">📣 <h3 class="card-title">Neighbour Shout-outs</h3></div>
-                        <form action="/portal/shoutout" method="post" style="display:flex; gap:10px; margin-bottom:16px;">
-                            <input type="text" name="message" maxlength="{MAX_SHOUTOUT_LEN}" required placeholder="Say hello to your LGA…"
-                                   style="flex:1; padding:12px; font-size:16px; background:#1e293b; border:2px solid #475569; color:#f8fafc; border-radius:10px;">
-                            <button type="submit" class="btn btn-emerald" style="padding:12px 18px;">Post (+{SHOUTOUT_XP} XP)</button>
-                        </form>
-                        <div style="max-height:280px; overflow-y:auto;">{shoutouts_html}</div>
-                    </div>
+                    <a href="/portal/feed?active_tab=shoutouts" class="portal-card" style="grid-column:1/-1;display:block;text-decoration:none;color:inherit;">
+                        <div class="card-header">🎊 <h3 class="card-title">Shout Out</h3></div>
+                        <p style="color:#cbd5e1;margin:0;">Create a birthday, naming, wedding, harvest, or thank-you card to share with your community.</p>
+                    </a>
 
                     <div class="portal-card">
                         <div class="card-header">🎯 <h3 class="card-title">Rolling Dart</h3></div>
@@ -5407,6 +5542,41 @@ async def farmer_feed_portal(
                         </form>
                         <p id="hunt_msg" style="font-size:13px; color:#94a3b8; text-align:center; margin-top:10px;">Press New Hunt to start</p>
                     </div>
+                </div>
+            </div>
+
+            <div id="tab_shoutouts" style="{show_shoutouts}">
+                <div class="portal-card" style="max-width:900px;margin:0 auto 20px;">
+                    <div class="card-header">🎊 <h3 class="card-title">Shout Out</h3></div>
+                    <p style="color:#cbd5e1;line-height:1.55;">Celebrate birthdays, naming ceremonies, weddings, harvests, and other joyful moments. Choose from 200 lightweight designs, add your own words and an optional photo, then share or print your card.</p>
+                    <form id="shoutout-form" action="/portal/shoutout" method="post" enctype="multipart/form-data" style="display:grid;gap:12px;background:rgba(0,0,0,.2);padding:16px;border-radius:14px;">
+                        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;">
+                            <label style="color:#cbd5e1;font-size:13px;">Occasion
+                                <select name="category" required style="width:100%;margin-top:5px;">
+                                    {"".join(f'<option value="{html.escape(category, quote=True)}">{html.escape(category)}</option>' for category in SHOUTOUT_CATEGORIES)}
+                                </select>
+                            </label>
+                            <label style="color:#cbd5e1;font-size:13px;">Celebrant / recipient (optional)
+                                <input name="recipient" maxlength="60" placeholder="Who are you celebrating?" style="width:100%;margin-top:5px;box-sizing:border-box;">
+                            </label>
+                            <label style="color:#cbd5e1;font-size:13px;">Card design
+                                <select name="template_key" required style="width:100%;margin-top:5px;">
+                                    {"".join(f'<option value="{key}">{emoji} {key.replace("-", " ").title()}</option>' for key, (emoji, _) in SHOUTOUT_TEMPLATES.items())}
+                                </select>
+                            </label>
+                        </div>
+                        <label style="color:#cbd5e1;font-size:13px;">Your message
+                            <textarea name="message" maxlength="{MAX_SHOUTOUT_LEN}" required rows="3" placeholder="Write your own warm message…" style="width:100%;box-sizing:border-box;margin-top:5px;"></textarea>
+                        </label>
+                        <label style="color:#cbd5e1;font-size:13px;">Optional celebration photo (up to 15 MB)
+                            <input type="file" name="photo" accept="image/*" style="display:block;width:100%;margin-top:5px;color:#e2e8f0;">
+                        </label>
+                        <button type="submit" class="btn btn-emerald" style="justify-self:start;padding:12px 18px;">Post Shout Out (+{SHOUTOUT_XP} XP)</button>
+                    </form>
+                </div>
+                <div style="max-width:900px;margin:0 auto;">
+                    <h3 style="color:#e2e8f0;">Celebrations from {html.escape(current_user['lga'] or 'your community')}</h3>
+                    {shoutouts_html}
                 </div>
             </div>
 
@@ -5675,6 +5845,152 @@ async def farmer_feed_portal(
                 openSocialShare('whatsapp', text, url);
             }}
 
+            async function shareMyProfile(button) {{
+                const profileUrl = new URL('/portal/feed', window.location.origin);
+                profileUrl.searchParams.set('active_tab', 'community');
+                profileUrl.searchParams.set('view_profile', button.dataset.profilePhone || '');
+                const url = profileUrl.toString();
+                const text = 'Follow me on Olode.com.ng — let’s share farming stories, updates, and community moments.';
+                if (navigator.share) {{
+                    try {{
+                        await navigator.share({{ title: 'Follow me on Olode.com.ng', text, url }});
+                        return;
+                    }} catch (error) {{
+                        if (error.name === 'AbortError') return;
+                        console.error('Could not open the profile share sheet:', error);
+                    }}
+                }}
+                openSocialShare('whatsapp', text, url);
+            }}
+
+            async function shareShoutout(id) {{
+                const card = document.getElementById('shoutout-card-' + id);
+                if (!card) return;
+                const url = new URL('/portal/feed', window.location.origin);
+                url.searchParams.set('active_tab', 'shoutouts');
+                url.hash = 'shoutout-' + id;
+                const text = card.innerText.trim() + '\\n\\nOlode.com.ng';
+                try {{
+                    const blob = await createShoutoutImage(card);
+                    const imageFile = new File([blob], 'olode-shout-out.png', {{ type: 'image/png' }});
+                    if (navigator.share && navigator.canShare && navigator.canShare({{ files: [imageFile] }})) {{
+                        await navigator.share({{
+                            files: [imageFile],
+                            title: 'A celebration from Olode.com.ng',
+                            text,
+                            url: url.toString()
+                        }});
+                        return;
+                    }}
+                    const downloadUrl = URL.createObjectURL(blob);
+                    const downloadLink = document.createElement('a');
+                    downloadLink.href = downloadUrl;
+                    downloadLink.download = 'olode-shout-out.png';
+                    downloadLink.click();
+                    window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+                }} catch (error) {{
+                    if (error.name === 'AbortError') return;
+                    console.error('Could not create or share the shout-out image:', error);
+                }}
+                if (navigator.share) {{
+                    try {{
+                        await navigator.share({{ title: 'A celebration from Olode.com.ng', text, url: url.toString() }});
+                        return;
+                    }} catch (error) {{
+                        if (error.name === 'AbortError') return;
+                        console.error('Could not open the shout-out share sheet:', error);
+                    }}
+                }}
+                openSocialShare('whatsapp', text, url.toString());
+            }}
+
+            async function createShoutoutImage(card) {{
+                const canvas = document.createElement('canvas');
+                canvas.width = 1200;
+                canvas.height = 630;
+                const context = canvas.getContext('2d');
+                if (!context) throw new Error('Image export is not supported by this browser.');
+                const palettes = {{
+                    sunrise: 30,
+                    garden: 145,
+                    celebration: 320,
+                    royal: 260,
+                    harvest: 45,
+                    ocean: 190,
+                    love: 345,
+                    simple: 215
+                }};
+                const templateParts = (card.dataset.template || 'garden-01').split('-');
+                const baseHue = palettes[templateParts[0]] ?? palettes.garden;
+                const hue = (baseHue + (Number(templateParts[1] || 1) - 1) * 7) % 360;
+                const gradient = context.createLinearGradient(0, 0, 1200, 630);
+                gradient.addColorStop(0, `hsl(${{hue}} 72% 22%)`);
+                gradient.addColorStop(0.55, `hsl(${{hue}} 78% 48%)`);
+                gradient.addColorStop(1, `hsl(${{hue}} 90% 82%)`);
+                context.fillStyle = gradient;
+                context.fillRect(0, 0, canvas.width, canvas.height);
+                context.fillStyle = 'rgba(255,255,255,.16)';
+                context.beginPath();
+                context.arc(1100, 40, 210, 0, Math.PI * 2);
+                context.fill();
+                context.fillStyle = '#ffffff';
+                context.textAlign = 'left';
+                context.font = 'bold 25px system-ui, sans-serif';
+                context.fillText(card.querySelector('.shoutout-category')?.textContent.trim() || 'CELEBRATION', 72, 90);
+                context.font = 'bold 50px system-ui, sans-serif';
+                const recipient = card.querySelector('.shoutout-recipient')?.textContent.trim() || '';
+                if (recipient) context.fillText(recipient.slice(0, 34), 72, 170);
+                const message = card.querySelector('.shoutout-message')?.textContent.trim() || '';
+                context.font = '30px system-ui, sans-serif';
+                const words = message.split(/\\s+/);
+                let line = '';
+                let y = recipient ? 245 : 190;
+                for (const word of words) {{
+                    const nextLine = line ? line + ' ' + word : word;
+                    if (context.measureText(nextLine).width > 720 && line) {{
+                        context.fillText(line, 72, y);
+                        y += 46;
+                        line = word;
+                        if (y > 480) break;
+                    }} else {{
+                        line = nextLine;
+                    }}
+                }}
+                if (line && y <= 480) context.fillText(line, 72, y);
+                const photo = card.querySelector('img');
+                if (photo && photo.complete && photo.naturalWidth) {{
+                    const box = {{ x: 850, y: 180, width: 280, height: 300 }};
+                    const scale = Math.max(box.width / photo.naturalWidth, box.height / photo.naturalHeight);
+                    const width = photo.naturalWidth * scale;
+                    const height = photo.naturalHeight * scale;
+                    context.save();
+                    context.beginPath();
+                    context.roundRect(box.x, box.y, box.width, box.height, 22);
+                    context.clip();
+                    context.drawImage(photo, box.x + (box.width - width) / 2, box.y + (box.height - height) / 2, width, height);
+                    context.restore();
+                }}
+                context.font = 'bold 24px system-ui, sans-serif';
+                context.fillText('Olode.com.ng', 72, 565);
+                return await new Promise((resolve, reject) => {{
+                    canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('Could not export the celebration image.')), 'image/png');
+                }});
+            }}
+
+            function printShoutout(id) {{
+                const card = document.getElementById('shoutout-card-' + id);
+                if (!card) return;
+                const printWindow = window.open('', '_blank');
+                if (!printWindow) {{
+                    window.alert('Allow pop-ups to print this celebration card.');
+                    return;
+                }}
+                printWindow.document.write('<!doctype html><html><head><title>Olode.com.ng Shout Out</title><style>body{{font-family:Arial,sans-serif;padding:24px;color:#0f172a}}.card{{max-width:680px;margin:0 auto;border-radius:20px;padding:32px;text-align:center;print-color-adjust:exact;-webkit-print-color-adjust:exact}}img{{max-width:100%;height:auto}}</style></head><body><main class="card">' + card.innerHTML + '</main></body></html>');
+                printWindow.document.close();
+                printWindow.focus();
+                printWindow.print();
+            }}
+
             function shareRadioStation(platform) {{
                 const stationSelect = document.getElementById('radio_station');
                 const station = stationSelect && stationSelect.value;
@@ -5905,6 +6221,7 @@ async def farmer_feed_portal(
                 incidents: document.getElementById('tab_incidents'),
                 messages: document.getElementById('tab_messages'),
                 community: document.getElementById('tab_community'),
+                shoutouts: document.getElementById('tab_shoutouts'),
                 market: document.getElementById('tab_market'),
                 farm_market: document.getElementById('tab_farm_market'),
                 family: document.getElementById('tab_family')
@@ -5949,7 +6266,17 @@ async def farmer_feed_portal(
 
             window.addEventListener('popstate', () => showPortalTab(portalTabFromLocation(), false));
             showPortalTab(portalTabFromLocation(), false);
+            if (window.location.hash.startsWith('#status-') || window.location.hash.startsWith('#shoutout-')) {{
+                window.requestAnimationFrame(() => {{
+                    const target = document.getElementById(decodeURIComponent(window.location.hash.slice(1)));
+                    if (target) target.scrollIntoView({{ block: 'center' }});
+                }});
+            }}
             updateRadioMiniPlayer();
+            const profileUpdatedNotice = document.getElementById('profile-updated-notice');
+            if (profileUpdatedNotice) {{
+                window.setTimeout(() => profileUpdatedNotice.remove(), 200);
+            }}
 
             // ----- Occasional, gentle nature moments for the community tab -----
             const natureMomentStories = [
@@ -6532,7 +6859,7 @@ async def farmer_feed_portal(
                 </form>
                 <div style="flex:1; overflow:hidden; white-space:nowrap;">
                     <div style="display:inline-block; animation:ticker 40s linear infinite; color:#cbd5e1; font-size:14px;">
-                        {html.escape(ticker_text)} &nbsp;&nbsp;&nbsp; {html.escape(ticker_text)}
+                        {ticker_html} &nbsp;&nbsp;&nbsp; {ticker_html}
                     </div>
                 </div>
             </div>
