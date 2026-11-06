@@ -748,6 +748,10 @@ def render_shoutout_card(
                     <button type="button" class="btn" onclick="shareShoutout({shoutout_id}, this)" style="padding:6px 10px;">Share</button>
                     <button type="button" class="btn" onclick="printShoutout({shoutout_id}, this)" style="padding:6px 10px;">Print</button>
                     {remove_photo_html}
+                    {f'''<form action="/portal/shoutout/delete" method="post" style="margin:0;" onsubmit="return confirm('Delete this shout-out permanently?');">
+                        <input type="hidden" name="shoutout_id" value="{shoutout_id}">
+                        <button type="submit" class="btn" style="padding:6px 10px;color:#fecaca;border-color:rgba(248,113,113,.4);">Delete shout-out</button>
+                    </form>''' if str(shoutout["farmer_phone"]) == str(viewer_phone) else ''}
                 </span>
             </div>
         </article>"""
@@ -2471,6 +2475,41 @@ async def remove_shoutout_photo(
             await conn.commit()
     return RedirectResponse(
         url=f"/portal/feed?active_tab=shoutouts&shoutout_posted={shoutout_id}#shoutout-{shoutout_id}",
+        status_code=303,
+    )
+
+
+@app.post("/portal/shoutout/delete")
+async def delete_shoutout(
+    shoutout_id: int = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT image_path FROM shoutouts WHERE id = ? AND farmer_phone = ?",
+            (shoutout_id, current_user["phone"]),
+        ) as cursor:
+            shoutout = await cursor.fetchone()
+        if not shoutout:
+            raise HTTPException(status_code=404, detail="Shout-out not found.")
+        stored_path = shoutout["image_path"]
+        if stored_path:
+            try:
+                remove_social_image(str(stored_path))
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500, detail="The shout-out photo could not be removed."
+                ) from exc
+        await conn.execute(
+            "DELETE FROM shoutouts WHERE id = ? AND farmer_phone = ?",
+            (shoutout_id, current_user["phone"]),
+        )
+        await conn.commit()
+    return RedirectResponse(
+        url="/portal/feed?active_tab=shoutouts#shoutout-list",
         status_code=303,
     )
 
@@ -6046,7 +6085,7 @@ async def farmer_feed_portal(
                 </div>
                 <div style="max-width:900px;margin:0 auto;">
                     <h3 style="color:#e2e8f0;">Celebrations from {html.escape(current_user['lga'] or 'your community')}</h3>
-                    {shoutouts_html}
+                    <div id="shoutout-list">{shoutouts_html}</div>
                 </div>
             </div>
 
@@ -7341,8 +7380,29 @@ async def farmer_feed_portal(
             pollMessageNotifications();
             setInterval(pollMessageNotifications, 15000);
 
+            async function refreshShoutoutList(response, action) {{
+                if (!response.redirected) throw new Error('The shout-out action did not return an updated page.');
+                const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+                const incomingList = page.getElementById('shoutout-list');
+                const currentList = document.getElementById('shoutout-list');
+                if (!incomingList || !currentList) throw new Error('Could not refresh the shout-out list.');
+                currentList.replaceChildren(...Array.from(incomingList.childNodes, node => document.importNode(node, true)));
+                const destination = new URL(response.url, window.location.origin);
+                showPortalTab('shoutouts', false);
+                history.replaceState(history.state, '', destination.href);
+                let targetId = destination.hash ? decodeURIComponent(destination.hash.slice(1)) : '';
+                const postedId = destination.searchParams.get('shoutout_posted');
+                if (postedId) targetId = 'shoutout-' + postedId;
+                if (action.endsWith('/shoutout/delete')) targetId = 'shoutout-list';
+                const target = document.getElementById(targetId)
+                    || (targetId === 'shoutout-list' ? currentList : currentList.querySelector('.shoutout-entry'))
+                    || currentList;
+                target.scrollIntoView({{ block: target === currentList ? 'start' : 'center', behavior: 'smooth' }});
+            }}
+
             // Intercept form submits so actions stay on the page (no jump to top)
             document.addEventListener('submit', async function(e) {{
+                if (e.defaultPrevented) return;
                 const form = e.target;
                 if (!form || form.tagName !== 'FORM') return;
                 const method = (form.method || 'get').toLowerCase();
@@ -7360,6 +7420,24 @@ async def farmer_feed_portal(
                     const fd = new FormData(form);
                     const res = await fetch(action, {{ method: 'POST', body: fd, credentials: 'same-origin' }});
                     const redirectedToLogin = res.redirected && new URL(res.url).pathname === '/portal/login';
+                    if (action.includes('/portal/shoutout')) {{
+                        if (!res.ok || redirectedToLogin) {{
+                            let errorMessage = 'Could not update the shout-out. Please try again.';
+                            try {{
+                                const payload = await res.json();
+                                if (typeof payload.detail === 'string') errorMessage = payload.detail;
+                            }} catch (parseError) {{
+                                console.error('Could not read the shout-out response:', parseError);
+                            }}
+                            throw new Error(errorMessage);
+                        }}
+                        await refreshShoutoutList(res, action);
+                        if (action.endsWith('/shoutout/delete')) showFlash('Shout-out deleted', false);
+                        else if (action.endsWith('/shoutout/remove-photo')) showFlash('Celebration photo removed', false);
+                        else showFlash('Shout-out posted', false);
+                        if (action.endsWith('/portal/shoutout')) form.reset();
+                        return;
+                    }}
                     if (action.includes('/portal/market/edit')) {{
                         const result = await res.json();
                         if (!res.ok) throw new Error(result.detail || 'Could not update listing.');
