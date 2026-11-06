@@ -5682,6 +5682,25 @@ async def farmer_feed_portal(
             background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1000 500' fill='none'%3E%3Cg stroke='%23a7d3b5' stroke-width='2' opacity='.48'%3E%3Cpath d='M18 86 C55 48 78 120 112 83 S164 55 190 94 M18 106 C52 75 78 145 116 105 M982 414 C945 452 922 380 888 417 S836 445 810 406 M982 394 C948 425 922 355 884 395'/%3E%3Cpath d='M18 414 C48 386 57 354 50 326 M982 86 C952 114 943 146 950 174'/%3E%3Cpath d='M38 72c-16-18-27-4-17 8 8 9 23 5 27-9m-3 15c15-17 28-4 18 8-8 9-22 5-27-8m919 324c16 18 27 4 17-8-8-9-23-5-27 9m3-15c-15 17-28 4-18-8 8-9 22-5 27 8'/%3E%3C/g%3E%3Cg stroke='%23cbd5e1' stroke-width='2' opacity='.4'%3E%3Cpath d='M830 40c0-10 8-18 18-18 6 0 12 3 15 8 3-8 11-13 20-13 13 0 23 10 23 23h-76Zm-736 420c0-10 8-18 18-18 6 0 12 3 15 8 3-8 11-13 20-13 13 0 23 10 23 23H94Z'/%3E%3C/g%3E%3C/svg%3E") center / 100% 100% no-repeat;
         }}
         .nature-card > * {{ min-width: 0; }}
+        .nature-label {{
+            border-color: rgba(167, 205, 178, 0.3) !important;
+            background: linear-gradient(110deg, rgba(110, 231, 183, 0.1), rgba(167, 139, 250, 0.1)) !important;
+            box-shadow: inset 0 0 14px rgba(110, 231, 183, 0.04);
+        }}
+        .portal-header .nature-mark {{
+            width: 48px;
+            height: 48px;
+            flex: 0 0 48px;
+            filter: drop-shadow(0 3px 12px rgba(110, 231, 183, 0.24));
+        }}
+        .tab-btn {{
+            border: 1px solid rgba(167, 205, 178, 0.12);
+            background-image: linear-gradient(145deg, rgba(110, 231, 183, 0.025), rgba(167, 139, 250, 0.025));
+        }}
+        .tab-btn:hover {{
+            border-color: rgba(167, 205, 178, 0.34);
+            background-color: rgba(110, 231, 183, 0.08) !important;
+        }}
         .card-header {{ display: flex; align-items: center; gap: 10px; margin-bottom: 18px; border-bottom: 1px solid rgba(110, 231, 183, 0.1); padding-bottom: 12px; }}
         .card-title {{ font-size: 16px; font-weight: 700; color: #ecfdf5; margin: 0; }}
         .weather-value {{ font-size: 32px; font-weight: 800; color: #6ee7b7; margin: 10px 0 5px 0; font-family: monospace; text-shadow: 0 0 20px rgba(52, 211, 153, 0.35); }}
@@ -5702,13 +5721,19 @@ async def farmer_feed_portal(
         <div class="container" style="max-width:1400px; width:100%; padding:20px 16px; margin:0 auto;">
             <div class="portal-header" style="background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:24px; padding:24px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px; margin-bottom:24px;">
                 <div style="display:flex; align-items:center; gap:16px;">
-                    <div style="font-size:40px;">👨‍🌾</div>
-                    <div><h1 style="margin:0; font-size:22px; font-weight:800; color:#fff;">Terminal: <a href="/portal/feed?active_tab=community&view_profile={html.escape(str(current_user['phone']), quote=True)}" style="color:inherit;text-decoration:none;">{html.escape(current_user['name'])}</a> {'✅' if current_user.get('status') == 'Approved' else ''}</h1><span class="badge badge-emerald" style="margin-top:6px;">📍 {html.escape(current_user['lga'])} Sector Grid</span></div>
+                    <svg class="nature-mark" viewBox="0 0 64 64" role="img" aria-label="Olode nature mark" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="32" cy="32" r="29" fill="rgba(16,54,41,.72)" stroke="rgba(167,211,181,.55)" stroke-width="1.5"/>
+                        <path d="M32 47V27" stroke="#a7d3b5" stroke-width="2.5" stroke-linecap="round"/>
+                        <path d="M32 36C22 36 17 30 18 21c9 0 15 4 14 13Zm0-6c0-10 6-16 16-16 0 10-5 16-16 16Z" fill="rgba(110,231,183,.2)" stroke="#a7d3b5" stroke-width="2" stroke-linejoin="round"/>
+                        <path d="M21 47h22M25 51h14" stroke="#d6c49a" stroke-width="2" stroke-linecap="round"/>
+                        <circle cx="47" cy="18" r="4" fill="#e8dba9"/>
+                    </svg>
+                    <div><h1 style="margin:0; font-size:22px; font-weight:800; color:#fff;">Farmstead: <a href="/portal/feed?active_tab=community&view_profile={html.escape(str(current_user['phone']), quote=True)}" style="color:inherit;text-decoration:none;">{html.escape(current_user['name'])}</a> {'🌿' if current_user.get('status') == 'Approved' else ''}</h1><span class="badge badge-emerald nature-label" style="margin-top:6px;">🌱 {html.escape(current_user['lga'])} Community</span></div>
                 </div>
-                <div class="portal-header-actions"><span id="grid_score_display" class="badge badge-amber" style="font-weight:800; padding:8px 16px; font-size:13px;">⚡ {current_user['xp']} Grid XP</span>
+                <div class="portal-header-actions"><span id="grid_score_display" class="badge badge-amber nature-label" style="font-weight:800; padding:8px 16px; font-size:13px;">🌿 {current_user['xp']} Growth Points</span>
                     {admin_dashboard_link}
-                        <button class="btn" type="button" data-profile-phone="{html.escape(str(current_user['phone']), quote=True)}" onclick="shareMyProfile(this)" style="background:rgba(16,185,129,.12);color:#6ee7b7;border:1px solid rgba(16,185,129,.3);padding:10px 14px;font-size:13px;border-radius:10px;">Ask friends to follow me</button>
-                        <button class="btn" type="button" onclick="shareOlodeSite()" style="background:rgba(167,139,250,.12);color:#c4b5fd;border:1px solid rgba(167,139,250,.3);padding:10px 14px;font-size:13px;border-radius:10px;">Share Olode.com.ng</button>
+                        <button class="btn" type="button" data-profile-phone="{html.escape(str(current_user['phone']), quote=True)}" onclick="shareMyProfile(this)" style="background:rgba(16,185,129,.12);color:#6ee7b7;border:1px solid rgba(16,185,129,.3);padding:10px 14px;font-size:13px;border-radius:10px;">🌱 Invite friends to grow with me</button>
+                        <button class="btn" type="button" onclick="shareOlodeSite()" style="background:rgba(167,139,250,.12);color:#c4b5fd;border:1px solid rgba(167,139,250,.3);padding:10px 14px;font-size:13px;border-radius:10px;">🍃 Share Olode.com.ng</button>
                         <a href="/portal/profile/edit" class="btn" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); padding:10px 16px; font-size:13px; border-radius:10px;">✏️ Edit Profile</a>
                     <a href="/portal/logout" class="btn btn-danger" style="padding:10px 20px; font-size:13px; border-radius:10px;">🔌 Disconnect</a></div>
             </div>
@@ -5724,15 +5749,15 @@ async def farmer_feed_portal(
             {f'<div style="margin-bottom:16px;">{peer_card_html}</div>' if search_phone and peer_card_html else ''}
 
             <div class="tab-bar">
-                <a href="/portal/feed?active_tab=incidents" class="tab-btn" style="{tab_incidents_active}">🛡️ Alerts</a>
-                <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community</a>
-                <a href="/portal/feed?active_tab=friends" class="tab-btn" style="{tab_friends_active}">🤝 Friends & Requests{pending_request_badge}</a>
-                <a href="/portal/feed?active_tab=shoutouts" class="tab-btn" style="{tab_shoutouts_active}">🎊 Shout Out</a>
-                <a href="/portal/feed?active_tab=market" class="tab-btn" style="{tab_market_active}">🔍 Find Products</a>
-                <a href="/portal/feed?active_tab=farm_market" class="tab-btn" style="{tab_farm_market_active}">🛒 Farm Market{product_notification_badge}</a>
-                <a href="/portal/feed?active_tab=family" class="tab-btn" style="{'background:rgba(16,185,129,0.2); color:#10b981;' if is_family_tab else 'background:transparent; color:var(--text-muted);'}">👨‍👩‍👧‍👦 Family Meeting</a>
-                <a id="messages-nav-link" href="/portal/messages" class="tab-btn" style="background:transparent; color:var(--text-muted);">💬 Messages{unread_badge}</a>
-                <button type="button" onclick="enableMessageNotifications()" class="tab-btn" style="background:transparent; color:var(--text-muted); border:0; cursor:pointer;">🔔 Enable alerts</button>
+                <a href="/portal/feed?active_tab=incidents" class="tab-btn" style="{tab_incidents_active}">🌿 Alerts</a>
+                <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🌳 Community</a>
+                <a href="/portal/feed?active_tab=friends" class="tab-btn" style="{tab_friends_active}">🍀 Friends & Requests{pending_request_badge}</a>
+                <a href="/portal/feed?active_tab=shoutouts" class="tab-btn" style="{tab_shoutouts_active}">🌸 Shout Out</a>
+                <a href="/portal/feed?active_tab=market" class="tab-btn" style="{tab_market_active}">🥕 Find Products</a>
+                <a href="/portal/feed?active_tab=farm_market" class="tab-btn" style="{tab_farm_market_active}">🧺 Farm Market{product_notification_badge}</a>
+                <a href="/portal/feed?active_tab=family" class="tab-btn" style="{'background:rgba(16,185,129,0.2); color:#10b981;' if is_family_tab else 'background:transparent; color:var(--text-muted);'}">🌱 Family Meeting</a>
+                <a id="messages-nav-link" href="/portal/messages" class="tab-btn" style="background:transparent; color:var(--text-muted);">🐦 Messages{unread_badge}</a>
+                <button type="button" onclick="enableMessageNotifications()" class="tab-btn" style="background:transparent; color:var(--text-muted); border:0; cursor:pointer;">🌼 Enable alerts</button>
             </div>
 
             <div id="tab_incidents" style="{show_incidents}">
