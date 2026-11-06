@@ -1,11 +1,21 @@
+# The persistent disk requires a paid Render web-service plan. SQLite data and
+# uploaded media are stored on the same disk so they survive redeploys/restarts.
 services:
   - type: web
-    name: farm-watch-node
+    name: app
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
-    plan: free
+    plan: starter
+    disk:
+      name: farm-watch-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
+      - key: DB_FILE
+        value: /var/data/farm_watch.db
+      - key: MEDIA_DIR
+        value: /var/data/media
       - key: ADMIN_USERNAME
         value: chief
       - key: ADMIN_PASSWORD
