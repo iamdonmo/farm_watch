@@ -5660,6 +5660,28 @@ async def farmer_feed_portal(
             display: flex;
             flex-direction: column;
         }}
+        .nature-card {{
+            position: relative;
+            isolation: isolate;
+            min-width: 0;
+            box-sizing: border-box;
+            border-color: rgba(167, 205, 178, 0.25) !important;
+            background:
+                radial-gradient(ellipse at 8% 0%, rgba(167, 139, 250, 0.09), transparent 34%),
+                radial-gradient(ellipse at 100% 100%, rgba(110, 231, 183, 0.08), transparent 38%),
+                linear-gradient(155deg, rgba(22, 52, 38, 0.94), rgba(18, 40, 48, 0.92)) !important;
+        }}
+        .nature-card::before {{
+            content: "";
+            position: absolute;
+            z-index: -1;
+            pointer-events: none;
+            inset: 6px;
+            border: 1px solid rgba(174, 211, 183, 0.16);
+            border-radius: 15px;
+            background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1000 500' fill='none'%3E%3Cg stroke='%23a7d3b5' stroke-width='2' opacity='.48'%3E%3Cpath d='M18 86 C55 48 78 120 112 83 S164 55 190 94 M18 106 C52 75 78 145 116 105 M982 414 C945 452 922 380 888 417 S836 445 810 406 M982 394 C948 425 922 355 884 395'/%3E%3Cpath d='M18 414 C48 386 57 354 50 326 M982 86 C952 114 943 146 950 174'/%3E%3Cpath d='M38 72c-16-18-27-4-17 8 8 9 23 5 27-9m-3 15c15-17 28-4 18 8-8 9-22 5-27-8m919 324c16 18 27 4 17-8-8-9-23-5-27 9m3-15c-15 17-28 4-18-8 8-9 22-5 27 8'/%3E%3C/g%3E%3Cg stroke='%23cbd5e1' stroke-width='2' opacity='.4'%3E%3Cpath d='M830 40c0-10 8-18 18-18 6 0 12 3 15 8 3-8 11-13 20-13 13 0 23 10 23 23h-76Zm-736 420c0-10 8-18 18-18 6 0 12 3 15 8 3-8 11-13 20-13 13 0 23 10 23 23H94Z'/%3E%3C/g%3E%3C/svg%3E") center / 100% 100% no-repeat;
+        }}
+        .nature-card > * {{ min-width: 0; }}
         .card-header {{ display: flex; align-items: center; gap: 10px; margin-bottom: 18px; border-bottom: 1px solid rgba(110, 231, 183, 0.1); padding-bottom: 12px; }}
         .card-title {{ font-size: 16px; font-weight: 700; color: #ecfdf5; margin: 0; }}
         .weather-value {{ font-size: 32px; font-weight: 800; color: #6ee7b7; margin: 10px 0 5px 0; font-family: monospace; text-shadow: 0 0 20px rgba(52, 211, 153, 0.35); }}
@@ -5837,7 +5859,7 @@ async def farmer_feed_portal(
                 </div>
 
                 <!-- Farm Radio Receiver -->
-                <div class="portal-card" style="margin-top:24px; border-color: rgba(168,85,247,0.25);">
+                <div class="portal-card nature-card" style="margin-top:24px; border-color: rgba(168,85,247,0.25);">
                     <div class="card-header" style="border-color: rgba(168,85,247,0.2);">
                         📻 <h3 class="card-title" style="color:#c4b5fd;">Farm Radio</h3>
                     </div>
@@ -5918,7 +5940,7 @@ async def farmer_feed_portal(
 
                     {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Friend request sent! It will appear under their Requests.</div></div>') if friend_sent else ''}
                     {('<div id="profile-updated-notice" class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Profile updated successfully.</div></div>') if profile_updated else ''}
-                    <div class="portal-card" style="grid-column:1 / -1;">
+                    <div class="portal-card nature-card" style="grid-column:1 / -1;">
                         <div id="status-feed" class="card-header">📝 <h3 class="card-title">Status Feed</h3></div>
                         <p style="font-size:13px; color:#94a3b8; margin:0 0 12px 0;">Post an update. Friends can like, comment, or repost to grow the network.</p>
                         <form action="/portal/status/post" method="post" enctype="multipart/form-data" style="display:grid;grid-template-columns:1fr auto;gap:10px;margin-bottom:16px;">
@@ -5931,12 +5953,12 @@ async def farmer_feed_portal(
                         <div style="max-height:480px; overflow-y:auto;">{status_html}</div>
                     </div>
 
-                    <a href="/portal/feed?active_tab=shoutouts" class="portal-card" style="grid-column:1/-1;display:block;text-decoration:none;color:inherit;">
+                    <a href="/portal/feed?active_tab=shoutouts" class="portal-card nature-card" style="grid-column:1/-1;display:block;text-decoration:none;color:inherit;">
                         <div class="card-header">🎊 <h3 class="card-title">Shout Out</h3></div>
                         <p style="color:#cbd5e1;margin:0;">Create a birthday, naming, wedding, harvest, or thank-you card to share with your community.</p>
                     </a>
 
-                    <div class="portal-card">
+                    <div class="portal-card nature-card">
                         <div class="card-header">🎯 <h3 class="card-title">Rolling Dart</h3></div>
                         <p style="font-size:13px; color:#94a3b8; margin:0 0 12px 0;">Tap <b>Roll</b> — score 50+ to earn {DART_WIN_XP} XP</p>
                         <div id="dart_board" style="position:relative; width:220px; height:220px; margin:0 auto 14px; border-radius:50%; background:radial-gradient(circle, #fef3c7 0%, #f59e0b 35%, #dc2626 60%, #1e293b 61%, #334155 100%); border:4px solid #64748b; display:flex; align-items:center; justify-content:center;">
@@ -5950,7 +5972,7 @@ async def farmer_feed_portal(
                         <p id="dart_msg" style="font-size:13px; color:#94a3b8; text-align:center; margin-top:10px;"></p>
                     </div>
 
-                    <div class="portal-card">
+                    <div class="portal-card nature-card">
                         <div class="card-header">🌾 <h3 class="card-title">XP Hunt</h3></div>
                         <p style="font-size:13px; color:#94a3b8; margin:0 0 12px 0;">Find the golden seed! Tap tiles — 3 finds = {HUNT_WIN_XP} XP</p>
                         <div id="hunt_grid" style="display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:14px;"></div>
@@ -5969,7 +5991,7 @@ async def farmer_feed_portal(
             </div>
 
             <div id="tab_shoutouts" style="{show_shoutouts}">
-                <div class="portal-card" style="max-width:900px;margin:0 auto 20px;">
+                <div class="portal-card nature-card" style="max-width:900px;margin:0 auto 20px;">
                     <div class="card-header">🎊 <h3 class="card-title">Shout Out</h3></div>
                     <p style="color:#cbd5e1;line-height:1.55;">Celebrate birthdays, naming ceremonies, weddings, harvests, and other joyful moments. Choose from 200 lightweight designs, add your own words and an optional photo, then share or print your card.</p>
                     <form id="shoutout-form" action="/portal/shoutout" method="post" enctype="multipart/form-data" style="display:grid;gap:12px;background:rgba(0,0,0,.2);padding:16px;border-radius:14px;">
