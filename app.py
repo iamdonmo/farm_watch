@@ -3799,8 +3799,37 @@ async def message_notifications(current_user=Depends(get_current_farmer)):
             LIMIT 10
         """, (current_user["phone"],)) as cursor:
             unread_messages = await cursor.fetchall()
+        async with conn.execute(
+            """SELECT COUNT(*) FROM friendships
+               WHERE receiver_phone = ? AND status = 'pending'
+                 AND EXISTS (
+                     SELECT 1 FROM farmers f
+                     WHERE f.phone = friendships.requester_phone
+                       AND COALESCE(f.is_demo, 0) = 0
+                 )""",
+            (current_user["phone"],),
+        ) as cursor:
+            friend_request_count = (await cursor.fetchone())[0]
+        async with conn.execute("""
+            SELECT fr.id, fr.requester_phone, f.name AS requester_name
+            FROM friendships fr
+            LEFT JOIN farmers f ON f.phone = fr.requester_phone
+            WHERE fr.receiver_phone = ? AND fr.status = 'pending'
+              AND COALESCE(f.is_demo, 0) = 0
+            ORDER BY fr.id DESC LIMIT 20
+        """, (current_user["phone"],)) as cursor:
+            friend_requests = await cursor.fetchall()
     return {
         "unread_count": unread_count,
+        "friend_request_count": friend_request_count,
+        "friend_requests": [
+            {
+                "id": request["id"],
+                "requester_phone": request["requester_phone"],
+                "requester_name": request["requester_name"] or "A farmer",
+            }
+            for request in friend_requests
+        ],
         "messages": [
             {
                 "id": message["id"],
@@ -4417,7 +4446,7 @@ async def farmer_feed_portal(
         """, (current_user['lga'],)) as c7:
             leaderboard_rows = await c7.fetchall()
         async with conn.execute("""
-            SELECT f.requester_phone, fa.name as requester_name
+            SELECT f.id, f.requester_phone, fa.name as requester_name
             FROM friendships f
             JOIN farmers fa ON fa.phone = f.requester_phone
             WHERE f.receiver_phone = ? AND f.status = 'pending'
@@ -4511,7 +4540,7 @@ async def farmer_feed_portal(
         requester_phone = html.escape(str(r["requester_phone"]), quote=True)
         requester_profile = f"/portal/feed?active_tab=community&view_profile={requester_phone}"
         pending_html += f"""
-        <div id="friend-request-{html.escape(r['requester_phone'])}" style="background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:10px; padding:12px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+        <div id="friend-request-{r['id']}" data-friend-request-id="{r['id']}" style="background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:10px; padding:12px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
             <a href="{requester_profile}" style="font-weight:600; color:#f1f5f9; text-decoration:none;">{html.escape(r['requester_name'] or '')}</a>
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
                 <a href="{requester_profile}" style="background:rgba(59,130,246,0.2); border:1px solid rgba(59,130,246,0.4); color:#93c5fd; font-size:12px; font-weight:700; padding:6px 12px; border-radius:8px; text-decoration:none;">👤 View Profile</a>
@@ -4532,11 +4561,16 @@ async def farmer_feed_portal(
     <div id="friend-requests-panel" class="portal-card" style="margin-bottom:20px; border:1px solid rgba(245,158,11,0.35);">
         <div class="card-header" style="justify-content:space-between;">
             <h3 class="card-title" style="color:#fbbf24;">👋 Friend Requests</h3>
-            <span style="background:rgba(245,158,11,0.2); color:#fbbf24; border-radius:999px; padding:4px 10px; font-weight:800;">{pending_request_count}</span>
+            <span id="friend-request-count" style="background:rgba(245,158,11,0.2); color:#fbbf24; border-radius:999px; padding:4px 10px; font-weight:800;">{pending_request_count}</span>
         </div>
         <p style="font-size:13px; color:#cbd5e1; margin:0 0 12px;">Requests from other farmers appear here. Accept to add them to your friends.</p>
-        {pending_html}
+        <div id="pending-friend-request-list">{pending_html}</div>
     </div>"""
+    pending_request_badge = (
+        f'<span id="friend-request-tab-badge" style="display:inline-block;background:#ef4444;color:white;font-size:11px;font-weight:800;padding:2px 7px;border-radius:10px;margin-left:6px;">{pending_request_count}</span>'
+        if pending_request_count else
+        '<span id="friend-request-tab-badge" style="display:none;background:#ef4444;color:white;font-size:11px;font-weight:800;padding:2px 7px;border-radius:10px;margin-left:6px;">0</span>'
+    )
 
     friends_html = ""
     friend_suggestion_options = ""
@@ -4556,6 +4590,13 @@ async def farmer_feed_portal(
         </div>"""
     if not friends_html:
         friends_html = '<p style="color:var(--text-muted); font-size:13px;">No friends yet. Add some from your neighbors!</p>'
+    friends_tab_content = f"""
+        {pending_requests_panel}
+        <div class="portal-card" style="grid-column:1 / -1;">
+            <div class="card-header">🤝 <h3 class="card-title">My Friends</h3></div>
+            <p style="font-size:13px;color:#cbd5e1;margin:0 0 12px;">View accepted friends or open their profiles.</p>
+            {friends_html}
+        </div>"""
 
     trust_groups_html = ""
     pending_trust_group_invites_html = ""
@@ -4716,6 +4757,7 @@ async def farmer_feed_portal(
     profile_card_html = ""
     profile_status_html = ""
     profile_shoutouts_html = ""
+    profile_page_mode = False
     if view_profile:
         clean_view = normalize_nigerian_mobile(view_profile) or clean_phone(view_profile)
         alternate_view = None
@@ -4743,6 +4785,7 @@ async def farmer_feed_portal(
                 can_view_profile = relation_status in ("accepted", "pending")
                 is_accepted_friend = relation_status == "accepted"
             if prof and can_view_profile and (is_accepted_friend or prof["phone"] == current_user["phone"]) and prof["status"] == STATUS_APPROVED:
+                profile_page_mode = True
                 async with conn.execute("""
                     SELECT s.id, s.author_phone, s.author_name, s.content, s.timestamp,
                            s.image_path, f.avatar_path,
@@ -4799,7 +4842,7 @@ async def farmer_feed_portal(
                     if profile_avatar_path else ""
                 )
                 profile_card_html = f"""
-                <div style="background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.25); border-radius:14px; padding:18px; margin-bottom:16px;">
+                <div id="profile-header" style="background:linear-gradient(145deg,rgba(74,18,40,.92),rgba(40,12,30,.96));border:1px solid rgba(190,72,112,.38);border-radius:18px;padding:22px;margin-bottom:16px;box-shadow:0 16px 40px rgba(0,0,0,.3);">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
                         <div style="display:flex;align-items:center;font-weight:800;font-size:18px;color:#fff;">{profile_avatar_html}{html.escape(prof['name'] or '')} {'✅' if prof['status']=='Approved' else ''}</div>
                         <a href="/portal/feed?active_tab=community" style="color:#94a3b8; font-size:12px; text-decoration:none;">✕ Close</a>
@@ -4812,7 +4855,7 @@ async def farmer_feed_portal(
                         <div><span style="color:#94a3b8;">State</span><br><b style="color:#e2e8f0;">{html.escape(prof['state'] or '')}</b></div>
                         <div><span style="color:#94a3b8;">Grid XP</span><br><b style="color:#fbbf24;">⚡ {prof['xp'] or 0}</b></div>
                     </div>
-                    <p style="font-size:12px; color:#94a3b8; margin:12px 0 0 0;">Full phone number is hidden until you accept the request.</p>
+                    <p style="font-size:12px; color:#e7b5c5; margin:12px 0 0 0;">You are viewing {html.escape(prof['name'] or 'this farmer')}'s profile. Their wall is shared with accepted friends.</p>
                 </div>"""
         else:
             profile_card_html = '<div style="color:#f87171; padding:12px;">Profile not found.</div>'
@@ -5390,24 +5433,56 @@ async def farmer_feed_portal(
     tab = (active_tab or "incidents").lower()
     is_messages_tab = tab == "messages"
     is_community_tab = tab == "community"
+    is_friends_tab = tab == "friends"
     is_shoutouts_tab = tab == "shoutouts"
     is_market_tab = tab == "market"
     is_farm_market_tab = tab == "farm_market"
     is_family_tab = tab == "family"
-    is_incidents_tab = tab not in ("messages", "community", "shoutouts", "market", "farm_market", "family")
+    is_incidents_tab = tab not in ("messages", "community", "friends", "shoutouts", "market", "farm_market", "family")
     tab_incidents_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_incidents_tab else "background:transparent; color:var(--text-muted);"
     tab_messages_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_messages_tab else "background:transparent; color:var(--text-muted);"
     tab_community_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_community_tab else "background:transparent; color:var(--text-muted);"
+    tab_friends_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_friends_tab else "background:transparent; color:var(--text-muted);"
     tab_shoutouts_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_shoutouts_tab else "background:transparent; color:var(--text-muted);"
     tab_market_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_market_tab else "background:transparent; color:var(--text-muted);"
     tab_farm_market_active = "background:rgba(16,185,129,0.2); color:#10b981;" if is_farm_market_tab else "background:transparent; color:var(--text-muted);"
     show_incidents = "display:block;" if is_incidents_tab else "display:none;"
     show_messages = "display:block;" if is_messages_tab else "display:none;"
     show_community = "display:block;" if is_community_tab else "display:none;"
+    show_friends = "display:block;" if is_friends_tab else "display:none;"
     show_shoutouts = "display:block;" if is_shoutouts_tab else "display:none;"
     show_market = "display:block;" if is_market_tab else "display:none;"
     show_farm_market = "display:block;" if is_farm_market_tab else "display:none;"
     show_family = "display:block;" if is_family_tab else "display:none;"
+    profile_view_styles = """
+        body.profile-view {
+            min-height:100vh;
+            background:radial-gradient(ellipse at top,rgba(107,28,58,.38),transparent 58%),linear-gradient(160deg,#180b13,#10090e 70%,#1d0c16);
+        }
+        body.profile-view .container { max-width:980px!important; padding-top:72px!important; }
+        body.profile-view .portal-header,
+        body.profile-view .container > form,
+        body.profile-view .tab-bar,
+        body.profile-view #tab_incidents,
+        body.profile-view #tab_friends,
+        body.profile-view #tab_shoutouts,
+        body.profile-view #tab_market,
+        body.profile-view #tab_farm_market,
+        body.profile-view #tab_messages,
+        body.profile-view #tab_family { display:none!important; }
+        body.profile-view #tab_community { display:block!important; }
+        body.profile-view #tab_community > :not(#profile-view) { display:none!important; }
+        body.profile-view #profile-view { display:block!important; }
+        body.profile-view #profile-view .portal-card,
+        body.profile-view #profile-wall [id^="status-"] {
+            background:linear-gradient(145deg,rgba(75,20,43,.9),rgba(36,12,28,.96))!important;
+            border-color:rgba(190,72,112,.3)!important;
+        }
+        body.profile-view #profile-wall .shoutout-entry {
+            background:linear-gradient(145deg,rgba(90,24,49,.92),rgba(42,13,31,.96))!important;
+            border-color:rgba(209,91,130,.4)!important;
+        }
+    """
     checked_in_btn = "background:#334155; color:#94a3b8; pointer-events:none;" if checked_in_today else ""
     checked_in_label = "Checked in today ✓" if checked_in_today else f"I'm OK (+{CHECKIN_XP} XP)"
     pending_request_badge = (
@@ -5599,8 +5674,9 @@ async def farmer_feed_portal(
             .tab-bar {{ gap:4px; padding:4px; }}
             .tab-btn {{ flex:1 1 45%; padding:10px 6px; font-size:12px; }}
         }}
+        {profile_view_styles}
     </style></head>
-    <body>
+    <body class="{'profile-view' if profile_page_mode else ''}">
         <div class="container" style="max-width:1400px; width:100%; padding:20px 16px; margin:0 auto;">
             <div class="portal-header" style="background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:24px; padding:24px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px; margin-bottom:24px;">
                 <div style="display:flex; align-items:center; gap:16px;">
@@ -5627,7 +5703,8 @@ async def farmer_feed_portal(
 
             <div class="tab-bar">
                 <a href="/portal/feed?active_tab=incidents" class="tab-btn" style="{tab_incidents_active}">🛡️ Alerts</a>
-                <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community{pending_request_badge}</a>
+                <a href="/portal/feed?active_tab=community" class="tab-btn" style="{tab_community_active}">🎉 Community</a>
+                <a href="/portal/feed?active_tab=friends" class="tab-btn" style="{tab_friends_active}">🤝 Friends & Requests{pending_request_badge}</a>
                 <a href="/portal/feed?active_tab=shoutouts" class="tab-btn" style="{tab_shoutouts_active}">🎊 Shout Out</a>
                 <a href="/portal/feed?active_tab=market" class="tab-btn" style="{tab_market_active}">🔍 Find Products</a>
                 <a href="/portal/feed?active_tab=farm_market" class="tab-btn" style="{tab_farm_market_active}">🛒 Farm Market{product_notification_badge}</a>
@@ -5675,9 +5752,10 @@ async def farmer_feed_portal(
             </div>
 
             <div id="tab_community" style="{show_community}">
-                {pending_requests_panel}
-                {profile_card_html}
-                {f'<div class="portal-card" style="margin-bottom:20px;"><div class="card-header">📝 <h3 class="card-title">Wall: statuses and shout-outs</h3></div><h4 style="color:#cbd5e1;margin:8px 0;">Statuses</h4>{profile_status_html}<h4 style="color:#cbd5e1;margin:18px 0 8px;">Shout-outs</h4>{profile_shoutouts_html}</div>' if profile_status_html or profile_shoutouts_html else ''}
+                <section id="profile-view" style="display:{'block' if profile_page_mode else 'none'};max-width:920px;margin:0 auto 22px;">
+                    {profile_card_html}
+                    {f'<div id="profile-wall" class="portal-card" style="margin-bottom:20px;background:linear-gradient(155deg,rgba(74,18,40,.88),rgba(40,12,30,.94));border-color:rgba(190,72,112,.3);"><div class="card-header" style="border-color:rgba(190,72,112,.25);"><h3 class="card-title">📝 Wall: statuses and shout-outs</h3></div><h4 style="color:#f0c2d0;margin:8px 0;">Statuses</h4>{profile_status_html}<h4 style="color:#f0c2d0;margin:18px 0 8px;">Shout-outs</h4>{profile_shoutouts_html}</div>' if profile_page_mode else ''}
+                </section>
                 <div class="portal-grid">
                     <div class="portal-card">
                         <div class="card-header">🌤️ <h3 class="card-title">Live Weather</h3></div>
@@ -5841,20 +5919,6 @@ async def farmer_feed_portal(
                     {('<div class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Friend request sent! It will appear under their Requests.</div></div>') if friend_sent else ''}
                     {('<div id="profile-updated-notice" class="portal-card" style="grid-column:1/-1; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); padding:16px;"><div style="color:#6ee7b7; font-weight:700;">✅ Profile updated successfully.</div></div>') if profile_updated else ''}
                     <div class="portal-card" style="grid-column:1 / -1;">
-                        <div class="card-header">🤝 <h3 class="card-title">Friends & Requests</h3></div>
-                        <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
-                            <div>
-                                <div style="font-size:13px; font-weight:700; color:#6ee7b7; margin-bottom:8px;">Friend Requests</div>
-                                <a href="#friend-requests-panel" style="color:#93c5fd; font-size:13px;">View requests at the top of Community{f' ({pending_request_count} new)' if pending_request_count else ''}</a>
-                            </div>
-                            <div>
-                                <div style="font-size:13px; font-weight:700; color:#6ee7b7; margin-bottom:8px;">My Friends</div>
-                                {friends_html}
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="portal-card" style="grid-column:1 / -1;">
                         <div id="status-feed" class="card-header">📝 <h3 class="card-title">Status Feed</h3></div>
                         <p style="font-size:13px; color:#94a3b8; margin:0 0 12px 0;">Post an update. Friends can like, comment, or repost to grow the network.</p>
                         <form action="/portal/status/post" method="post" enctype="multipart/form-data" style="display:grid;grid-template-columns:1fr auto;gap:10px;margin-bottom:16px;">
@@ -5898,6 +5962,10 @@ async def farmer_feed_portal(
                         <p id="hunt_msg" style="font-size:13px; color:#94a3b8; text-align:center; margin-top:10px;">Press New Hunt to start</p>
                     </div>
                 </div>
+            </div>
+
+            <div id="tab_friends" style="{show_friends}">
+                <div class="portal-grid">{friends_tab_content}</div>
             </div>
 
             <div id="tab_shoutouts" style="{show_shoutouts}">
@@ -6633,6 +6701,7 @@ async def farmer_feed_portal(
                 incidents: document.getElementById('tab_incidents'),
                 messages: document.getElementById('tab_messages'),
                 community: document.getElementById('tab_community'),
+                friends: document.getElementById('tab_friends'),
                 shoutouts: document.getElementById('tab_shoutouts'),
                 market: document.getElementById('tab_market'),
                 farm_market: document.getElementById('tab_farm_market'),
@@ -6660,6 +6729,55 @@ async def farmer_feed_portal(
                 return portalTabPanels[tab] ? tab : 'incidents';
             }}
 
+            async function navigateProfile(url, addHistory) {{
+                const targetUrl = new URL(url, window.location.href);
+                if (targetUrl.origin !== window.location.origin || targetUrl.pathname !== '/portal/feed') {{
+                    window.location.assign(targetUrl.href);
+                    return;
+                }}
+                try {{
+                    const response = await fetch(targetUrl.href, {{
+                        credentials: 'same-origin',
+                        cache: 'no-store'
+                    }});
+                    if (!response.ok) throw new Error('Could not load this profile.');
+                    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+                    const incomingProfile = page.getElementById('profile-view');
+                    const currentProfile = document.getElementById('profile-view');
+                    if (!incomingProfile || !currentProfile) throw new Error('Profile content was not available.');
+                    const isProfilePage = page.body.classList.contains('profile-view');
+                    currentProfile.replaceWith(incomingProfile);
+                    document.body.classList.toggle('profile-view', isProfilePage);
+                    showPortalTab(portalTabFromUrl(targetUrl), false);
+                    if (addHistory) history.pushState({{ profileView: isProfilePage }}, '', targetUrl);
+                    window.scrollTo(0, 0);
+                }} catch (error) {{
+                    console.error('Could not navigate to profile without reloading:', error);
+                    window.location.assign(targetUrl.href);
+                }}
+            }}
+
+            function portalTabFromUrl(url) {{
+                if (url.pathname === '/portal/messages') return 'messages';
+                const tab = url.searchParams.get('active_tab') || 'incidents';
+                return portalTabPanels[tab] ? tab : 'incidents';
+            }}
+
+            document.addEventListener('click', event => {{
+                if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                if (!(event.target instanceof Element)) return;
+                const link = event.target.closest('a[href]');
+                if (!link) return;
+                const url = new URL(link.href, window.location.href);
+                const isProfileLink = url.pathname === '/portal/feed' && url.searchParams.has('view_profile');
+                const isProfileClose = document.body.classList.contains('profile-view')
+                    && link.closest('#profile-view')
+                    && url.pathname === '/portal/feed';
+                if (!isProfileLink && !isProfileClose) return;
+                event.preventDefault();
+                navigateProfile(url, true);
+            }});
+
             document.querySelectorAll('.tab-bar a').forEach(link => {{
                 link.addEventListener('click', event => {{
                     if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -6676,7 +6794,15 @@ async def farmer_feed_portal(
                 }});
             }});
 
-            window.addEventListener('popstate', () => showPortalTab(portalTabFromLocation(), false));
+            window.addEventListener('popstate', () => {{
+                const url = new URL(window.location.href);
+                if (url.pathname === '/portal/feed' && (url.searchParams.has('view_profile') || document.body.classList.contains('profile-view'))) {{
+                    navigateProfile(url, false);
+                    return;
+                }}
+                document.body.classList.remove('profile-view');
+                showPortalTab(portalTabFromUrl(url), false);
+            }});
             showPortalTab(portalTabFromLocation(), false);
             if (window.location.hash.startsWith('#status-') || window.location.hash.startsWith('#shoutout-')) {{
                 window.requestAnimationFrame(() => {{
@@ -6937,7 +7063,7 @@ async def farmer_feed_portal(
                 }}
                 Notification.requestPermission().then(permission => {{
                     showFlash(permission === 'granted'
-                        ? 'Message alerts enabled'
+                        ? 'Message and friend request alerts enabled'
                         : 'Allow notifications in your browser settings to receive desktop alerts',
                         permission !== 'granted');
                 }});
@@ -7013,6 +7139,122 @@ async def farmer_feed_portal(
                 }}
             }}
 
+            let notifiedFriendRequestIds = new Set(
+                Array.from(document.querySelectorAll('#pending-friend-request-list [data-friend-request-id]'))
+                    .map(request => String(request.dataset.friendRequestId))
+            );
+            try {{
+                const storedFriendRequestIds = JSON.parse(sessionStorage.getItem('farmwatch_notified_friend_requests') || '[]');
+                if (Array.isArray(storedFriendRequestIds)) {{
+                    storedFriendRequestIds.forEach(id => notifiedFriendRequestIds.add(String(id)));
+                }}
+            }} catch (error) {{
+                console.warn('Could not restore friend-request notification state:', error);
+            }}
+
+            function showIncomingFriendRequestNotification(request) {{
+                const profileUrl = new URL('/portal/feed', window.location.origin);
+                profileUrl.searchParams.set('active_tab', 'friends');
+                const toast = document.createElement('a');
+                toast.href = profileUrl.pathname + profileUrl.search;
+                toast.style.cssText = 'position:fixed;top:24px;right:20px;z-index:10002;display:block;width:min(360px,calc(100vw - 40px));padding:16px;background:#1f1020;color:#f8fafc;border:1px solid rgba(244,114,182,.55);border-radius:14px;box-shadow:0 12px 36px rgba(0,0,0,.45);text-decoration:none;';
+                const heading = document.createElement('strong');
+                heading.textContent = '👋 New friend request';
+                const sender = document.createElement('div');
+                sender.textContent = request.requester_name + ' would like to connect';
+                sender.style.cssText = 'margin-top:7px;color:#e2e8f0;font-size:14px;line-height:1.4;overflow-wrap:anywhere;';
+                const hint = document.createElement('div');
+                hint.textContent = 'Tap to review the request';
+                hint.style.cssText = 'margin-top:8px;color:#f9a8d4;font-size:12px;font-weight:700;';
+                toast.append(heading, sender, hint);
+                document.body.appendChild(toast);
+                setTimeout(() => toast.remove(), 9000);
+                if ('Notification' in window && Notification.permission === 'granted') {{
+                    const notification = new Notification('New friend request', {{
+                        body: request.requester_name + ' would like to connect',
+                        tag: 'farmwatch-friend-request-' + request.id
+                    }});
+                    notification.onclick = () => {{
+                        window.focus();
+                        window.location.href = toast.href;
+                    }};
+                }}
+            }}
+
+            function updateFriendRequestPanel(data) {{
+                const requests = Array.isArray(data.friend_requests) ? data.friend_requests : [];
+                const count = Number(data.friend_request_count) || 0;
+                const counter = document.getElementById('friend-request-count');
+                const badge = document.getElementById('friend-request-tab-badge');
+                const list = document.getElementById('pending-friend-request-list');
+                if (counter) counter.textContent = String(count);
+                if (badge) {{
+                    badge.textContent = String(count);
+                    badge.style.display = count ? 'inline-block' : 'none';
+                }}
+                if (list) {{
+                    list.replaceChildren();
+                    if (!requests.length) {{
+                        const empty = document.createElement('p');
+                        empty.textContent = 'No new friend requests right now.';
+                        empty.style.cssText = 'color:var(--text-muted);font-size:13px;margin:0;';
+                        list.appendChild(empty);
+                    }} else {{
+                        requests.forEach(request => {{
+                            const row = document.createElement('div');
+                            row.dataset.friendRequestId = String(request.id);
+                            row.style.cssText = 'background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);border-radius:10px;padding:12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;';
+                            const profileUrl = new URL('/portal/feed', window.location.origin);
+                            profileUrl.searchParams.set('active_tab', 'community');
+                            profileUrl.searchParams.set('view_profile', request.requester_phone);
+                            const name = document.createElement('a');
+                            name.href = profileUrl.pathname + profileUrl.search;
+                            name.textContent = request.requester_name || 'A farmer';
+                            name.style.cssText = 'font-weight:600;color:#f1f5f9;text-decoration:none;';
+                            const actions = document.createElement('div');
+                            actions.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;';
+                            const view = document.createElement('a');
+                            view.href = name.href;
+                            view.textContent = '👤 View Profile';
+                            view.style.cssText = 'background:rgba(59,130,246,0.2);border:1px solid rgba(59,130,246,0.4);color:#93c5fd;font-size:12px;font-weight:700;padding:6px 12px;border-radius:8px;text-decoration:none;';
+                            actions.append(name, view);
+                            for (const [action, label, buttonClass] of [
+                                ['/portal/friend/accept', 'Accept', 'btn btn-emerald'],
+                                ['/portal/friend/reject', 'Reject', 'btn btn-danger']
+                            ]) {{
+                                const form = document.createElement('form');
+                                form.action = action;
+                                form.method = 'post';
+                                form.style.margin = '0';
+                                const input = document.createElement('input');
+                                input.type = 'hidden';
+                                input.name = 'requester_phone';
+                                input.value = request.requester_phone;
+                                const button = document.createElement('button');
+                                button.type = 'submit';
+                                button.className = buttonClass;
+                                button.textContent = label;
+                                button.style.cssText = 'padding:6px 12px;font-size:12px;';
+                                form.append(input, button);
+                                actions.appendChild(form);
+                            }}
+                            row.append(name, actions);
+                            list.appendChild(row);
+                        }});
+                    }}
+                }}
+                const newRequests = requests.filter(request => !notifiedFriendRequestIds.has(String(request.id)));
+                newRequests.forEach(request => {{
+                    notifiedFriendRequestIds.add(String(request.id));
+                    showIncomingFriendRequestNotification(request);
+                }});
+                try {{
+                    sessionStorage.setItem('farmwatch_notified_friend_requests', JSON.stringify([...notifiedFriendRequestIds].slice(-100)));
+                }} catch (error) {{
+                    console.warn('Could not save friend-request notification state:', error);
+                }}
+            }}
+
             let notifiedMessageIds = new Set();
             try {{
                 const storedMessageIds = JSON.parse(sessionStorage.getItem('farmwatch_notified_messages') || '[]');
@@ -7031,6 +7273,7 @@ async def farmer_feed_portal(
                     }});
                     if (!response.ok) return;
                     const data = await response.json();
+                    updateFriendRequestPanel(data);
                     const count = Number(data.unread_count) || 0;
                     badge.textContent = count;
                     badge.style.display = count ? 'inline-block' : 'none';
@@ -7104,6 +7347,9 @@ async def farmer_feed_portal(
                     else if (succeeded) msg = 'Success';
                     else msg = 'Something went wrong';
                     showFlash(msg, !succeeded);
+                    if (succeeded && (action.includes('/friend/accept') || action.includes('/friend/reject'))) {{
+                        pollMessageNotifications();
+                    }}
                     // Light UI updates without reload
                     if (succeeded && action.includes('/status/like') && btn) {{
                         const m = btn.innerText.match(/\\d+/);
