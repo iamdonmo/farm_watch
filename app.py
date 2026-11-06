@@ -220,8 +220,30 @@ async def lifespan(app: FastAPI):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 blocker_phone TEXT NOT NULL,
                 blocked_phone TEXT NOT NULL,
+                guard_status TEXT NOT NULL DEFAULT 'blocked',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(blocker_phone, blocked_phone)
+            );
+        """)
+        async with conn.execute("PRAGMA table_info(blocked_nodes)") as cursor:
+            blocked_node_columns = {row[1] for row in await cursor.fetchall()}
+        if "guard_status" not in blocked_node_columns:
+            await conn.execute(
+                "ALTER TABLE blocked_nodes ADD COLUMN guard_status TEXT NOT NULL DEFAULT 'blocked'"
+            )
+        if "created_at" not in blocked_node_columns:
+            await conn.execute("ALTER TABLE blocked_nodes ADD COLUMN created_at DATETIME")
+            await conn.execute(
+                "UPDATE blocked_nodes SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"
+            )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS farmer_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_phone TEXT NOT NULL,
+                target_phone TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(reporter_phone, target_phone, reason)
             );
         """)
         await conn.execute("""
@@ -527,6 +549,34 @@ def clean_phone(phone: str) -> str:
     return "".join(c for c in phone if c.isdigit())
 
 
+def phone_aliases(phone: str) -> set[str]:
+    cleaned = clean_phone(phone)
+    aliases = {cleaned}
+    if cleaned.startswith("0") and len(cleaned) == 11:
+        aliases.add("234" + cleaned[1:])
+    elif cleaned.startswith("234") and len(cleaned) == 13:
+        aliases.add("0" + cleaned[3:])
+    return aliases
+
+
+async def guard_status(conn, phone_a: str, phone_b: str) -> Optional[str]:
+    """Return the strongest active Guardroom restriction for a farmer pair."""
+    aliases_a = phone_aliases(phone_a)
+    aliases_b = phone_aliases(phone_b)
+    placeholders_a = ",".join("?" for _ in aliases_a)
+    placeholders_b = ",".join("?" for _ in aliases_b)
+    async with conn.execute(
+        f"""SELECT guard_status FROM blocked_nodes
+           WHERE (blocker_phone IN ({placeholders_a}) AND blocked_phone IN ({placeholders_b}))
+              OR (blocker_phone IN ({placeholders_b}) AND blocked_phone IN ({placeholders_a}))
+           ORDER BY CASE guard_status WHEN 'expelled' THEN 0 ELSE 1 END
+           LIMIT 1""",
+        tuple(aliases_a) + tuple(aliases_b) + tuple(aliases_b) + tuple(aliases_a),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return row[0] if row else None
+
+
 # Valid Nigerian mobile prefixes (local 11-digit and international 13-digit forms)
 _VALID_LOCAL_PREFIXES = ("070", "080", "081", "090", "091")
 _VALID_INTL_PREFIXES = ("23470", "23480", "23481", "23490", "23491")
@@ -575,6 +625,8 @@ async def can_view_status(conn, status_id: int, viewer_phone: str) -> bool:
     author_phone = status["author_phone"] if isinstance(status, aiosqlite.Row) else status[0]
     if author_phone == viewer_phone:
         return True
+    if await guard_status(conn, viewer_phone, author_phone):
+        return False
     async with conn.execute("""
         SELECT 1 FROM friendships
         WHERE status = 'accepted'
@@ -624,7 +676,13 @@ def render_status_card(status, comments, highlighted=False) -> str:
             <form action="/portal/status/like" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{status['id']}"><button type="submit" style="background:none;border:none;color:#60a5fa;cursor:pointer;font-size:13px;">👍 {status['likes']}</button></form>
             <form action="/portal/status/repost" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{status['id']}"><button type="submit" style="background:none;border:none;color:#34d399;cursor:pointer;font-size:13px;">🔁 Repost</button></form>
             <form action="/portal/status/hide" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{status['id']}"><button type="submit" style="background:none;border:none;color:#94a3b8;cursor:pointer;font-size:13px;">🙈 Hide</button></form>
-            <form action="/portal/status/report" method="post" style="margin:0;"><input type="hidden" name="status_id" value="{status['id']}"><input type="hidden" name="reason" value="Inappropriate"><button type="submit" style="background:none;border:none;color:#f87171;cursor:pointer;font-size:13px;">🚩 Report</button></form>
+            <details style="display:inline-block;"><summary style="color:#f87171;cursor:pointer;font-size:13px;list-style:none;">🚩 Report</summary>
+                <form action="/portal/status/report" method="post" style="display:grid;gap:6px;margin:6px 0;padding:10px;background:rgba(0,0,0,.2);border-radius:8px;">
+                    <input type="hidden" name="status_id" value="{status['id']}">
+                    <textarea name="reason" required minlength="5" maxlength="500" placeholder="Why should this post be reviewed?" style="min-width:220px;padding:8px;background:#1e293b;color:#fff;border:1px solid #475569;border-radius:8px;"></textarea>
+                    <button type="submit" class="btn btn-danger" style="padding:6px 10px;">Send report</button>
+                </form>
+            </details>
         </div>
         {comments_html}
         <form action="/portal/status/comment" method="post" style="display:flex; gap:6px; margin-top:8px;">
@@ -1612,6 +1670,7 @@ async def admin_flush_grid_data(username: str = Depends(authenticate_admin)):
         await conn.execute("DELETE FROM direct_messages;")
         await conn.execute("DELETE FROM blocked_nodes;")
         await conn.execute("DELETE FROM message_reports;")
+        await conn.execute("DELETE FROM farmer_reports;")
         await conn.execute("DELETE FROM sensor_readings;")
         await conn.execute("DELETE FROM checkins;")
         await conn.execute("DELETE FROM shoutouts;")
@@ -1907,6 +1966,15 @@ async def admin_dashboard(request: Request):
             ORDER BY mr.id DESC LIMIT 30
         """) as c3:
             recent_reports = await c3.fetchall()
+        async with conn.execute("""
+            SELECT fr.id, fr.timestamp, fr.reporter_phone, fr.target_phone,
+                   fr.reason, reporter.name AS reporter_name, target.name AS target_name
+            FROM farmer_reports fr
+            LEFT JOIN farmers reporter ON reporter.phone = fr.reporter_phone
+            LEFT JOIN farmers target ON target.phone = fr.target_phone
+            ORDER BY fr.id DESC LIMIT 50
+        """) as c_farmer_reports:
+            recent_farmer_reports = await c_farmer_reports.fetchall()
         async with conn.execute("SELECT * FROM farm_products ORDER BY id DESC LIMIT 100") as c4:
             all_products = await c4.fetchall()
 
@@ -2065,6 +2133,22 @@ async def admin_dashboard(request: Request):
             <tbody>{reports_rows or "<tr><td colspan='4' style='color:var(--text-muted); font-style:italic;'>No message reports yet.</td></tr>"}</tbody>
         </table>
     </div>"""
+    farmer_report_rows = "".join(
+        f"""<tr>
+            <td style="font-size:12px;color:var(--text-muted);">{html.escape(str(report["timestamp"]))}</td>
+            <td>{html.escape(report["reporter_name"] or report["reporter_phone"])}</td>
+            <td>{html.escape(report["target_name"] or report["target_phone"])}</td>
+            <td style="white-space:pre-wrap;">{html.escape(report["reason"])}</td>
+        </tr>"""
+        for report in recent_farmer_reports
+    )
+    farmer_reports_table = f"""
+    <div style="overflow-x:auto;">
+        <table class="data-table">
+            <thead><tr><th>When</th><th>Reporter</th><th>Reported farmer</th><th>Reason</th></tr></thead>
+            <tbody>{farmer_report_rows or "<tr><td colspan='4' style='color:var(--text-muted);font-style:italic;'>No farmer reports yet.</td></tr>"}</tbody>
+        </table>
+    </div>"""
 
     html_template_head = f"""
     <html>
@@ -2096,6 +2180,7 @@ async def admin_dashboard(request: Request):
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🛒 Manage Adverts / Products</h3>{pending_products_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⏳ Executive Node Approvals Pending</h3>{pending_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🚩 Recent Message Reports</h3>{reports_table}</div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🛡️ Farmer Safety Reports</h3>{farmer_reports_table}</div>
             <div class="glass-panel" style="padding: 30px;"><h3>🗂️ Active Grid Infrastructure Map</h3>{active_table}</div>
         </div>
     """
@@ -2624,22 +2709,26 @@ async def hide_status(status_id: int = Form(...), current_user=Depends(get_curre
 
 
 @app.post("/portal/status/report")
-async def report_status(status_id: int = Form(...), reason: str = Form("Inappropriate"), current_user=Depends(get_current_farmer)):
+async def report_status(status_id: int = Form(...), reason: str = Form(...), current_user=Depends(get_current_farmer)):
     """Report a post for moderation."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    clean_reason = reason.strip()
+    if len(clean_reason) < 5 or len(clean_reason) > 500:
+        raise HTTPException(status_code=422, detail="Please provide a reason (5–500 characters).")
     async with aiosqlite.connect(DB_FILE) as conn:
         if not await can_view_status(conn, status_id, current_user["phone"]):
             raise HTTPException(status_code=404, detail="Status not found")
-        try:
-            await conn.execute(
-                "INSERT INTO status_reports (status_id, reporter_phone, reason) VALUES (?, ?, ?)",
-                (status_id, current_user["phone"], sanitize(reason)[:100])
-            )
-            await conn.commit()
-        except Exception:
-            pass
-    return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
+        await conn.execute(
+            """INSERT OR IGNORE INTO status_reports
+               (status_id, reporter_phone, reason) VALUES (?, ?, ?)""",
+            (status_id, current_user["phone"], sanitize(clean_reason)[:500])
+        )
+        await conn.commit()
+    return RedirectResponse(
+        url="/portal/feed?active_tab=community&report_sent=1",
+        status_code=303,
+    )
 
 
 @app.post("/portal/market/post")
@@ -2989,50 +3078,229 @@ async def submit_game_score(
 
 
 @app.post("/portal/flag-node")
-async def handle_flag_node(target_phone: str = Form(...), current_user=Depends(get_current_farmer)):
-    """Flag a peer node for administrative review."""
+async def handle_flag_node(
+    target_phone: str = Form(...),
+    reason: str = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    """Record a reasoned farmer report for administrator review."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized session")
     clean_t = clean_phone(target_phone)
+    clean_reason = reason.strip()
+    if not clean_t:
+        raise HTTPException(status_code=400, detail="Choose another farmer to report.")
+    if len(clean_reason) < 5 or len(clean_reason) > 500:
+        raise HTTPException(status_code=422, detail="Please provide a reason (5–500 characters).")
     async with aiosqlite.connect(DB_FILE) as conn:
+        target_aliases = phone_aliases(clean_t)
+        target_placeholders = ",".join("?" for _ in target_aliases)
+        async with conn.execute(
+            f"SELECT phone FROM farmers WHERE phone IN ({target_placeholders}) AND COALESCE(is_demo, 0) = 0",
+            tuple(target_aliases),
+        ) as cursor:
+            target = await cursor.fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="Farmer not found.")
+        clean_t = target[0]
+        if clean_t in phone_aliases(current_user["phone"]):
+            raise HTTPException(status_code=400, detail="Choose another farmer to report.")
         await conn.execute(
-            "UPDATE farmers SET status = ? WHERE phone = ?",
-            (STATUS_REPORTED, clean_t)
+            """INSERT OR IGNORE INTO farmer_reports
+               (reporter_phone, target_phone, reason) VALUES (?, ?, ?)""",
+            (current_user["phone"], clean_t, clean_reason[:500]),
         )
         await conn.commit()
-    return RedirectResponse(url="/portal/feed", status_code=303)
+    return RedirectResponse(url="/portal/feed?report_sent=1", status_code=303)
 
 
 @app.post("/portal/block-node")
 async def handle_block_node(target_phone: str = Form(...), current_user=Depends(get_current_farmer)):
-    """Block a peer so they can no longer message you."""
+    """Place a peer in the current user's Guardroom."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     clean_t = clean_phone(target_phone)
-    if clean_t == current_user["phone"]:
-        return RedirectResponse(url="/portal/feed?active_tab=messages", status_code=303)
+    if clean_t in phone_aliases(current_user["phone"]):
+        raise HTTPException(status_code=400, detail="You cannot block yourself.")
     async with aiosqlite.connect(DB_FILE) as conn:
+        current_guard = await guard_status(conn, current_user["phone"], clean_t)
+        if current_guard == "expelled":
+            return RedirectResponse(
+                url="/portal/guardroom?notice=expelled",
+                status_code=303,
+            )
+        if current_guard == "blocked":
+            return RedirectResponse(
+                url="/portal/guardroom?notice=sent",
+                status_code=303,
+            )
+        target_aliases = phone_aliases(clean_t)
+        target_placeholders = ",".join("?" for _ in target_aliases)
+        async with conn.execute(
+            f"SELECT phone FROM farmers WHERE phone IN ({target_placeholders}) AND COALESCE(is_demo, 0) = 0",
+            tuple(target_aliases),
+        ) as cursor:
+            target = await cursor.fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="Farmer not found.")
+        clean_t = target[0]
         await conn.execute(
-            "INSERT OR IGNORE INTO blocked_nodes (blocker_phone, blocked_phone) VALUES (?, ?)",
+            """INSERT INTO blocked_nodes (blocker_phone, blocked_phone, guard_status, created_at)
+               VALUES (?, ?, 'blocked', CURRENT_TIMESTAMP)
+               ON CONFLICT(blocker_phone, blocked_phone) DO NOTHING""",
             (current_user["phone"], clean_t)
         )
         await conn.commit()
-    return RedirectResponse(url=f"/portal/feed?active_tab=messages&search_phone={clean_t}", status_code=303)
+    return RedirectResponse(url="/portal/guardroom?notice=sent", status_code=303)
 
 
 @app.post("/portal/unblock-node")
 async def handle_unblock_node(target_phone: str = Form(...), current_user=Depends(get_current_farmer)):
-    """Remove a previously blocked peer."""
+    """Release a peer from the current user's Guardroom."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     clean_t = clean_phone(target_phone)
+    blocker_aliases = phone_aliases(current_user["phone"])
+    target_aliases = phone_aliases(clean_t)
+    blocker_placeholders = ",".join("?" for _ in blocker_aliases)
+    target_placeholders = ",".join("?" for _ in target_aliases)
     async with aiosqlite.connect(DB_FILE) as conn:
+        if await guard_status(conn, current_user["phone"], clean_t) == "expelled":
+            raise HTTPException(
+                status_code=409,
+                detail="An expelled farmer cannot be released from the Guardroom.",
+            )
         await conn.execute(
-            "DELETE FROM blocked_nodes WHERE blocker_phone = ? AND blocked_phone = ?",
-            (current_user["phone"], clean_t)
+            f"""DELETE FROM blocked_nodes
+                WHERE blocker_phone IN ({blocker_placeholders})
+                  AND blocked_phone IN ({target_placeholders})
+                  AND guard_status = 'blocked'""",
+            tuple(blocker_aliases) + tuple(target_aliases),
         )
         await conn.commit()
-    return RedirectResponse(url=f"/portal/feed?active_tab=messages&search_phone={clean_t}", status_code=303)
+    return RedirectResponse(url="/portal/guardroom?notice=released", status_code=303)
+
+
+@app.post("/portal/guardroom/expel")
+async def expel_guardroom_farmer(
+    target_phone: str = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    """Permanently remove both sides of a farmer pair from each other's network."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    clean_t = clean_phone(target_phone)
+    if not clean_t or clean_t in phone_aliases(current_user["phone"]):
+        raise HTTPException(status_code=400, detail="Choose another farmer to expel.")
+    blocker_aliases = phone_aliases(current_user["phone"])
+    target_aliases = phone_aliases(clean_t)
+    blocker_placeholders = ",".join("?" for _ in blocker_aliases)
+    target_placeholders = ",".join("?" for _ in target_aliases)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute(
+            f"""SELECT 1 FROM blocked_nodes
+                WHERE blocker_phone IN ({blocker_placeholders})
+                  AND blocked_phone IN ({target_placeholders})""",
+            tuple(blocker_aliases) + tuple(target_aliases),
+        ) as cursor:
+            is_in_guardroom = await cursor.fetchone()
+        if not is_in_guardroom:
+            raise HTTPException(status_code=404, detail="Farmer not found in your Guardroom.")
+        await conn.execute(
+            f"""UPDATE blocked_nodes SET guard_status = 'expelled'
+                WHERE blocker_phone IN ({blocker_placeholders})
+                  AND blocked_phone IN ({target_placeholders})""",
+            tuple(blocker_aliases) + tuple(target_aliases),
+        )
+        await conn.execute(
+            """DELETE FROM friendships
+               WHERE (requester_phone = ? AND receiver_phone = ?)
+                  OR (requester_phone = ? AND receiver_phone = ?)""",
+            (current_user["phone"], clean_t, clean_t, current_user["phone"]),
+        )
+        await conn.commit()
+    return RedirectResponse(url="/portal/guardroom?notice=expelled", status_code=303)
+
+
+@app.get("/portal/guardroom", response_class=HTMLResponse)
+async def guardroom_page(
+    notice: Optional[str] = Query(None),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        return RedirectResponse(url="/portal/login", status_code=303)
+    owner_aliases = phone_aliases(current_user["phone"])
+    owner_placeholders = ",".join("?" for _ in owner_aliases)
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            f"""SELECT bn.blocked_phone, bn.guard_status, bn.created_at, f.name
+                FROM blocked_nodes bn
+                LEFT JOIN farmers f ON f.phone = bn.blocked_phone
+                WHERE bn.blocker_phone IN ({owner_placeholders})
+               ORDER BY CASE bn.guard_status WHEN 'expelled' THEN 1 ELSE 0 END,
+                        bn.id DESC""",
+            tuple(owner_aliases),
+        ) as cursor:
+            guarded_farmers = await cursor.fetchall()
+    notice_messages = {
+        "sent": "This farmer has been sent to your Guardroom. They are hidden from each other while held here.",
+        "released": "Farmer released. If you were friends before, they are back in your friends list.",
+        "expelled": "Farmer expelled. Both accounts are removed from each other's view and cannot reconnect.",
+    }
+    notice_html = ""
+    if notice in notice_messages:
+        notice_html = (
+            '<div style="padding:12px 16px;margin:0 0 16px;background:rgba(110,231,183,.12);'
+            'border:1px solid rgba(110,231,183,.3);border-radius:12px;color:#a7f3d0;">'
+            + html.escape(notice_messages[notice])
+            + "</div>"
+        )
+    rows = []
+    for farmer in guarded_farmers:
+        phone_value = html.escape(str(farmer["blocked_phone"]), quote=True)
+        name = html.escape(farmer["name"] or "Former farmer")
+        status = farmer["guard_status"] or "blocked"
+        if status == "expelled":
+            action_html = '<span style="color:#fca5a5;font-weight:800;">🌲 Expelled permanently</span>'
+        else:
+            action_html = f"""
+                <form action="/portal/unblock-node" method="post" style="margin:0;">
+                    <input type="hidden" name="target_phone" value="{phone_value}">
+                    <button class="btn btn-emerald" type="submit">Release to friends</button>
+                </form>
+                <form action="/portal/guardroom/expel" method="post" style="margin:0;"
+                      onsubmit="return confirm('Expel this person permanently? Neither of you will be able to find or reconnect with the other. This cannot be undone.');">
+                    <input type="hidden" name="target_phone" value="{phone_value}">
+                    <button class="btn btn-danger" type="submit">Expel to the forest</button>
+                </form>"""
+        rows.append(f"""
+            <article style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
+                padding:16px;margin:10px 0;background:rgba(10,18,16,.82);border:1px solid rgba(167,211,181,.24);border-radius:14px;">
+                <div>
+                    <div style="font-weight:800;color:#f0fdf4;">{name}</div>
+                    <div style="font-size:12px;color:#a7c4b5;margin-top:4px;">{html.escape(str(farmer["created_at"]))}</div>
+                    <div style="font-size:12px;color:#d6d3d1;margin-top:5px;">{"Held in your Guardroom" if status == "blocked" else "Expelled permanently"}</div>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">{action_html}</div>
+            </article>""")
+    entries = "".join(rows) or (
+        '<p style="color:#cbd5e1;text-align:center;padding:20px;">Your Guardroom is empty. '
+        'People you block will appear here.</p>'
+    )
+    return HTMLResponse(f"""<!doctype html>
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Guardroom | Olode</title><style>{UPGRADED_CSS}
+        .guardroom {{ max-width:860px;margin:24px auto;padding:24px;border:1px solid rgba(167,211,181,.28);
+            border-radius:20px;background-color:rgba(8,20,15,.94);
+            background-image:linear-gradient(rgba(8,20,15,.91),rgba(8,20,15,.94)),
+            url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' viewBox='0 0 180 180'%3E%3Cg fill='none' stroke='%23a7d3b5' stroke-width='3' opacity='.32'%3E%3Cpath d='M18 0v180M54 0v180M90 0v180M126 0v180M162 0v180M0 18h180M0 54h180M0 90h180M0 126h180M0 162h180'/%3E%3C/g%3E%3C/svg%3E");box-shadow:0 18px 48px rgba(0,0,0,.35); }}
+        </style></head><body><main class="guardroom">
+            <a href="/portal/feed?active_tab=friends" class="btn" style="display:inline-block;text-decoration:none;">← Back to Friends & Requests</a>
+            <h1 style="color:#d1fae5;margin-bottom:6px;">🛡️ Guardroom</h1>
+            <p style="color:#cbd5e1;line-height:1.55;">Blocked people are held here and cannot find or contact you. Release someone to restore your previous friendship, or permanently expel them. Expulsion also removes them from your view and cannot be undone.</p>
+            {notice_html}{entries}
+        </main></body></html>""")
 
 
 @app.post("/portal/messages/report")
@@ -3140,14 +3408,8 @@ async def send_direct_message(
         if not same_lga and not is_friend and not has_product:
             return RedirectResponse(url=redirect_url + "&error=lga", status_code=303)
 
-        # Block check (either direction)
-        async with conn.execute("""
-            SELECT 1 FROM blocked_nodes
-            WHERE (blocker_phone = ? AND blocked_phone = ?)
-               OR (blocker_phone = ? AND blocked_phone = ?)
-        """, (current_user["phone"], clean_r, clean_r, current_user["phone"])) as cur:
-            if await cur.fetchone():
-                return RedirectResponse(url=redirect_url + "&error=blocked", status_code=303)
+        if await guard_status(conn, current_user["phone"], clean_r):
+            return RedirectResponse(url=redirect_url + "&error=blocked", status_code=303)
 
         # Rate limit: messages to this peer in the last hour
         async with conn.execute("""
@@ -3269,9 +3531,14 @@ async def send_friend_request(
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     clean_t = clean_phone(target_phone)
-    if clean_t == current_user["phone"]:
+    if clean_t in phone_aliases(current_user["phone"]):
         return RedirectResponse(url="/portal/feed?active_tab=community", status_code=303)
     async with aiosqlite.connect(DB_FILE) as conn:
+        if await guard_status(conn, current_user["phone"], clean_t):
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot connect with this farmer because of an active Guardroom restriction.",
+            )
         # Only block if already accepted friends. Pending requests do not block new ones.
         async with conn.execute("""
             SELECT status FROM friendships
@@ -3301,6 +3568,11 @@ async def accept_friend_request(
         raise HTTPException(status_code=401, detail="Unauthorized")
     clean_r = clean_phone(requester_phone)
     async with aiosqlite.connect(DB_FILE) as conn:
+        if await guard_status(conn, current_user["phone"], clean_r):
+            raise HTTPException(
+                status_code=403,
+                detail="This farmer cannot be added while a Guardroom restriction is active.",
+            )
         await conn.execute(
             "UPDATE friendships SET status = 'accepted' WHERE requester_phone = ? AND receiver_phone = ? AND status = 'pending'",
             (clean_r, current_user["phone"])
@@ -3825,7 +4097,13 @@ async def message_notifications(current_user=Depends(get_current_farmer)):
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         async with conn.execute(
-            "SELECT COUNT(*) AS unread_count FROM direct_messages WHERE receiver_phone = ? AND seen = 0",
+            """SELECT COUNT(*) AS unread_count FROM direct_messages dm
+               WHERE dm.receiver_phone = ? AND dm.seen = 0
+                 AND NOT EXISTS (
+                     SELECT 1 FROM blocked_nodes bn
+                     WHERE (bn.blocker_phone = dm.sender_phone AND bn.blocked_phone = dm.receiver_phone)
+                        OR (bn.blocker_phone = dm.receiver_phone AND bn.blocked_phone = dm.sender_phone)
+                 )""",
             (current_user["phone"],)
         ) as cursor:
             unread_count = (await cursor.fetchone())["unread_count"]
@@ -3834,6 +4112,11 @@ async def message_notifications(current_user=Depends(get_current_farmer)):
             FROM direct_messages dm
             LEFT JOIN farmers f ON f.phone = dm.sender_phone
             WHERE dm.receiver_phone = ? AND dm.seen = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM blocked_nodes bn
+                  WHERE (bn.blocker_phone = dm.sender_phone AND bn.blocked_phone = dm.receiver_phone)
+                     OR (bn.blocker_phone = dm.receiver_phone AND bn.blocked_phone = dm.sender_phone)
+              )
             ORDER BY dm.id DESC
             LIMIT 10
         """, (current_user["phone"],)) as cursor:
@@ -3845,6 +4128,11 @@ async def message_notifications(current_user=Depends(get_current_farmer)):
                      SELECT 1 FROM farmers f
                      WHERE f.phone = friendships.requester_phone
                        AND COALESCE(f.is_demo, 0) = 0
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM blocked_nodes bn
+                     WHERE (bn.blocker_phone = friendships.requester_phone AND bn.blocked_phone = friendships.receiver_phone)
+                        OR (bn.blocker_phone = friendships.receiver_phone AND bn.blocked_phone = friendships.requester_phone)
                  )""",
             (current_user["phone"],),
         ) as cursor:
@@ -3855,6 +4143,11 @@ async def message_notifications(current_user=Depends(get_current_farmer)):
             LEFT JOIN farmers f ON f.phone = fr.requester_phone
             WHERE fr.receiver_phone = ? AND fr.status = 'pending'
               AND COALESCE(f.is_demo, 0) = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM blocked_nodes bn
+                  WHERE (bn.blocker_phone = fr.requester_phone AND bn.blocked_phone = fr.receiver_phone)
+                     OR (bn.blocker_phone = fr.receiver_phone AND bn.blocked_phone = fr.requester_phone)
+              )
             ORDER BY fr.id DESC LIMIT 20
         """, (current_user["phone"],)) as cursor:
             friend_requests = await cursor.fetchall()
@@ -3960,6 +4253,8 @@ async def simple_chat_page(
         elif not peer and clean_with.startswith("234") and len(clean_with) == 13:
             async with conn.execute("SELECT name, phone FROM farmers WHERE phone = ? AND COALESCE(is_demo, 0) = 0", ("0" + clean_with[3:],)) as cur:
                 peer = await cur.fetchone()
+        if peer and await guard_status(conn, current_user["phone"], peer["phone"]):
+            peer = None
         msgs = []
         peer_phone = clean_with
         peer_name = "Unknown"
@@ -4327,6 +4622,12 @@ async def delete_account(current_user=Depends(get_current_farmer)):
         await conn.execute("DELETE FROM family_groups WHERE owner_phone = ?", (phone,))
         await conn.execute("DELETE FROM direct_messages WHERE sender_phone = ? OR receiver_phone = ?", (phone, phone))
         await conn.execute("DELETE FROM friendships WHERE requester_phone = ? OR receiver_phone = ?", (phone, phone))
+        await conn.execute("DELETE FROM farmer_reports WHERE reporter_phone = ? OR target_phone = ?", (phone, phone))
+        await conn.execute("""
+            DELETE FROM blocked_nodes
+            WHERE (blocker_phone = ? OR blocked_phone = ?)
+              AND guard_status != 'expelled'
+        """, (phone, phone))
         await conn.execute("DELETE FROM farm_products WHERE farmer_phone = ?", (phone,))
         await conn.execute("DELETE FROM sensor_readings WHERE farmer_phone = ?", (phone,))
         await conn.execute("DELETE FROM checkins WHERE farmer_phone = ?", (phone,))
@@ -4352,6 +4653,7 @@ async def farmer_feed_portal(
     market_mine: Optional[str] = Query(None),
     market_page: Optional[int] = Query(1),
     friend_sent: Optional[str] = Query(None),
+    report_sent: Optional[str] = Query(None),
     profile_updated: Optional[str] = Query(None),
     status_posted: Optional[int] = Query(None),
     shoutout_posted: Optional[int] = Query(None),
@@ -4417,12 +4719,35 @@ async def farmer_feed_portal(
         )
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM farmers WHERE lga = ? AND status = 'Pending' AND COALESCE(is_demo, 0) = 0",
-                                (current_user['lga'],)) as c1:
+        async with conn.execute("""
+            SELECT * FROM farmers f
+            WHERE f.lga = ? AND f.status = 'Pending' AND COALESCE(f.is_demo, 0) = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM blocked_nodes bn
+                  WHERE (bn.blocker_phone = ? AND bn.blocked_phone = f.phone)
+                     OR (bn.blocker_phone = f.phone AND bn.blocked_phone = ?)
+              )
+        """, (current_user['lga'], current_user['phone'], current_user['phone'])) as c1:
             pending_neighbors = await c1.fetchall()
-        async with conn.execute("SELECT * FROM farmers WHERE lga = ? AND status = 'Approved' AND phone != ? AND COALESCE(is_demo, 0) = 0",
-                                (current_user['lga'], current_user['phone'])) as c2:
+        pending_neighbors = [
+            farmer for farmer in pending_neighbors
+            if not await guard_status(conn, current_user["phone"], farmer["phone"])
+        ]
+        async with conn.execute("""
+            SELECT * FROM farmers f
+            WHERE f.lga = ? AND f.status = 'Approved' AND f.phone != ?
+              AND COALESCE(f.is_demo, 0) = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM blocked_nodes bn
+                  WHERE (bn.blocker_phone = ? AND bn.blocked_phone = f.phone)
+                     OR (bn.blocker_phone = f.phone AND bn.blocked_phone = ?)
+              )
+        """, (current_user['lga'], current_user['phone'], current_user['phone'], current_user['phone'])) as c2:
             approved_neighbors = await c2.fetchall()
+        approved_neighbors = [
+            farmer for farmer in approved_neighbors
+            if not await guard_status(conn, current_user["phone"], farmer["phone"])
+        ]
         # Existing friendships (pending or accepted) for current user
         async with conn.execute("""
             SELECT requester_phone, receiver_phone, status FROM friendships
@@ -4432,6 +4757,8 @@ async def farmer_feed_portal(
         friend_status_map = {}
         for fr in friend_rows:
             other = fr["receiver_phone"] if fr["requester_phone"] == current_user["phone"] else fr["requester_phone"]
+            if await guard_status(conn, current_user["phone"], other):
+                continue
             friend_status_map[other] = fr["status"]
         async with conn.execute("SELECT * FROM alerts_log WHERE lga = ? AND status = 'Active' ORDER BY id DESC",
                                 (current_user['lga'],)) as c3:
@@ -4441,14 +4768,25 @@ async def farmer_feed_portal(
             SELECT c.farmer_phone, f.name, c.timestamp FROM checkins c
             JOIN farmers f ON f.phone = c.farmer_phone
             WHERE c.lga = ? AND c.timestamp > datetime('now', '-1 day')
+              AND NOT EXISTS (
+                  SELECT 1 FROM blocked_nodes bn
+                  WHERE (bn.blocker_phone = ? AND bn.blocked_phone = c.farmer_phone)
+                     OR (bn.blocker_phone = c.farmer_phone AND bn.blocked_phone = ?)
+              )
             ORDER BY c.id DESC LIMIT 20
-        """, (current_user['lga'],)) as c4:
+        """, (current_user['lga'], current_user['phone'], current_user['phone'])) as c4:
             recent_checkins = await c4.fetchall()
         async with conn.execute("""
             SELECT id, farmer_phone, farmer_name, lga, message, timestamp,
                    category, recipient, template_key, image_path
-            FROM shoutouts WHERE lga = ? ORDER BY id DESC LIMIT 25
-        """, (current_user['lga'],)) as c5:
+            FROM shoutouts s WHERE lga = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM blocked_nodes bn
+                  WHERE (bn.blocker_phone = ? AND bn.blocked_phone = s.farmer_phone)
+                     OR (bn.blocker_phone = s.farmer_phone AND bn.blocked_phone = ?)
+              )
+            ORDER BY id DESC LIMIT 25
+        """, (current_user['lga'], current_user['phone'], current_user['phone'])) as c5:
             recent_shoutouts = await c5.fetchall()
         # Statuses from friends + own (network growth)
         friend_phones = [ph for ph, st in friend_status_map.items() if st == 'accepted']
@@ -4481,8 +4819,13 @@ async def farmer_feed_portal(
         async with conn.execute("""
             SELECT name, xp, phone FROM farmers
             WHERE lga = ? AND status = 'Approved' AND COALESCE(is_demo, 0) = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM blocked_nodes bn
+                  WHERE (bn.blocker_phone = ? AND bn.blocked_phone = farmers.phone)
+                     OR (bn.blocker_phone = farmers.phone AND bn.blocked_phone = ?)
+              )
             ORDER BY xp DESC LIMIT 10
-        """, (current_user['lga'],)) as c7:
+        """, (current_user['lga'], current_user['phone'], current_user['phone'])) as c7:
             leaderboard_rows = await c7.fetchall()
         async with conn.execute("""
             SELECT f.id, f.requester_phone, fa.name as requester_name
@@ -4490,6 +4833,11 @@ async def farmer_feed_portal(
             JOIN farmers fa ON fa.phone = f.requester_phone
             WHERE f.receiver_phone = ? AND f.status = 'pending'
               AND COALESCE(fa.is_demo, 0) = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM blocked_nodes bn
+                  WHERE (bn.blocker_phone = f.receiver_phone AND bn.blocked_phone = f.requester_phone)
+                     OR (bn.blocker_phone = f.requester_phone AND bn.blocked_phone = f.receiver_phone)
+              )
         """, (current_user['phone'],)) as c_fr:
             pending_requests = await c_fr.fetchall()
         async with conn.execute("""
@@ -4501,8 +4849,18 @@ async def farmer_feed_portal(
             WHERE f.status = 'accepted'
               AND (f.requester_phone = ? OR f.receiver_phone = ?)
               AND COALESCE(fa.is_demo, 0) = 0
-        """, (current_user['phone'], current_user['phone'], current_user['phone'], current_user['phone'])) as c_ff:
+              AND NOT EXISTS (
+                  SELECT 1 FROM blocked_nodes bn
+                  WHERE (bn.blocker_phone = ? AND bn.blocked_phone = CASE WHEN f.requester_phone = ? THEN f.receiver_phone ELSE f.requester_phone END)
+                     OR (bn.blocker_phone = CASE WHEN f.requester_phone = ? THEN f.receiver_phone ELSE f.requester_phone END AND bn.blocked_phone = ?)
+              )
+        """, (current_user['phone'], current_user['phone'], current_user['phone'], current_user['phone'],
+              current_user['phone'], current_user['phone'], current_user['phone'], current_user['phone'])) as c_ff:
             my_friends = await c_ff.fetchall()
+        my_friends = [
+            friend for friend in my_friends
+            if not await guard_status(conn, current_user["phone"], friend["friend_phone"])
+        ]
         async with conn.execute("""
             SELECT tg.id, tg.name, tg.owner_phone
             FROM trust_groups tg
@@ -4804,13 +5162,20 @@ async def farmer_feed_portal(
             alternate_view = "234" + clean_view[1:]
         elif clean_view.startswith("234") and len(clean_view) == 13:
             alternate_view = "0" + clean_view[3:]
+        guarded_profile = False
         async with aiosqlite.connect(DB_FILE) as conn:
             conn.row_factory = aiosqlite.Row
-            async with conn.execute(
-                "SELECT * FROM farmers WHERE phone IN (?, ?) AND COALESCE(is_demo, 0) = 0",
-                (clean_view, alternate_view or clean_view)
-            ) as cur:
-                prof = await cur.fetchone()
+            if clean_view != current_user["phone"] and await guard_status(
+                conn, current_user["phone"], clean_view
+            ):
+                guarded_profile = True
+                prof = None
+            else:
+                async with conn.execute(
+                    "SELECT * FROM farmers WHERE phone IN (?, ?) AND COALESCE(is_demo, 0) = 0",
+                    (clean_view, alternate_view or clean_view)
+                ) as cur:
+                    prof = await cur.fetchone()
             can_view_profile = bool(prof and prof["phone"] == current_user["phone"])
             is_accepted_friend = False
             if prof and not can_view_profile:
@@ -4896,6 +5261,8 @@ async def farmer_feed_portal(
                     </div>
                     <p style="font-size:12px; color:#e7b5c5; margin:12px 0 0 0;">You are viewing {html.escape(prof['name'] or 'this farmer')}'s profile. Their wall is shared with accepted friends.</p>
                 </div>"""
+        elif guarded_profile:
+            profile_card_html = '<div style="color:#cbd5e1;padding:12px;">This profile is not available.</div>'
         else:
             profile_card_html = '<div style="color:#f87171; padding:12px;">Profile not found.</div>'
 
@@ -5166,6 +5533,20 @@ async def farmer_feed_portal(
                 <input type='hidden' name='target_phone' value='{fphone}'>
                 <button type='submit' class='btn' style='padding:6px 12px; font-size:12px; background:rgba(59,130,246,0.2); color:#93c5fd; border:1px solid rgba(59,130,246,0.4);'>👋 Add Friend</button>
             </form>"""
+        report_farmer_form = f"""
+            <details style="display:inline-block;">
+                <summary style="cursor:pointer;color:#fecaca;font-size:12px;">🚩 Report</summary>
+                <form action="/portal/flag-node" method="post" style="display:grid;gap:6px;min-width:220px;padding:10px;background:#111827;border-radius:8px;margin-top:6px;">
+                    <input type="hidden" name="target_phone" value="{html.escape(str(fphone), quote=True)}">
+                    <textarea name="reason" required minlength="5" maxlength="500" placeholder="Reason for report" style="padding:8px;background:#1e293b;color:#fff;border:1px solid #475569;border-radius:8px;"></textarea>
+                    <button type="submit" class="btn btn-danger" style="padding:6px 10px;">Submit report</button>
+                </form>
+            </details>"""
+        block_farmer_form = f"""
+            <form action="/portal/block-node" method="post" style="margin:0;">
+                <input type="hidden" name="target_phone" value="{html.escape(str(fphone), quote=True)}">
+                <button type="submit" class="btn btn-danger" style="padding:6px 10px;font-size:12px;">🚫 Send to Guardroom</button>
+            </form>"""
         nb_approved_parts.append(f"""
         <div style='padding:12px 16px; background:rgba(16,185,129,0.03); border:1px solid rgba(16,185,129,0.15); border-radius:10px; margin-bottom:8px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;'>
             🟢 <div style='flex:1; min-width:120px;'>
@@ -5173,7 +5554,8 @@ async def farmer_feed_portal(
                 <span title="Verified & Approved" style="color:#34d399; font-size:14px; margin-left:6px;">✅</span>
             </div>
             {friend_btn}
-            <form action='/portal/flag-node' method='post' style='margin:0;'><input type='hidden' name='target_phone' value='{fphone}'><button type='submit' class='btn btn-danger' style='padding:4px 10px; font-size:11px; border-radius:6px;'>Flag</button></form>
+            {report_farmer_form}
+            {block_farmer_form}
             <span style='font-size:11px; color:var(--accent-emerald); background:rgba(16,185,129,0.1); padding:2px 8px; border-radius:4px;'>Verified</span>
         </div>""")
     nb_approved = "".join(nb_approved_parts)
@@ -5184,6 +5566,7 @@ async def farmer_feed_portal(
     send_form_html = ""
     safety_notice = ""
     clean_search = ""
+    guarded_search = False
     if search_phone:
         normalized = normalize_nigerian_mobile(search_phone)
         if normalized:
@@ -5263,6 +5646,10 @@ async def farmer_feed_portal(
                     clean_search = peer["phone"]
 
             if peer:
+                guarded_search = bool(await guard_status(conn, current_user["phone"], peer["phone"]))
+                if guarded_search:
+                    peer = None
+            if peer:
                 my_phone = current_user["phone"]
                 peer_phone = peer["phone"]
                 same_lga = peer["lga"] == current_user["lga"]
@@ -5329,10 +5716,16 @@ async def farmer_feed_portal(
 
                 # Prominent privacy controls
                 report_btn = f"""
-                <form action="/portal/flag-node" method="post" style="margin:0;">
-                    <input type="hidden" name="target_phone" value="{peer_phone}">
-                    <button type="submit" style="background:rgba(239,68,68,0.2); border:1px solid rgba(239,68,68,0.5); color:#fecaca; font-size:13px; font-weight:700; padding:10px 16px; border-radius:8px; cursor:pointer;">🚩 Report</button>
-                </form>"""
+                <details>
+                    <summary style="background:rgba(239,68,68,0.2); border:1px solid rgba(239,68,68,0.5); color:#fecaca; font-size:13px; font-weight:700; padding:10px 16px; border-radius:8px; cursor:pointer; list-style:none;">🚩 Report farmer</summary>
+                    <form action="/portal/flag-node" method="post" style="display:grid;gap:8px;margin-top:8px;padding:12px;background:rgba(0,0,0,.24);border-radius:10px;">
+                        <input type="hidden" name="target_phone" value="{html.escape(str(peer_phone), quote=True)}">
+                        <label style="font-size:12px;color:#cbd5e1;">Reason for report
+                            <textarea name="reason" required minlength="5" maxlength="500" placeholder="Describe what happened so our team can review it." style="display:block;width:100%;box-sizing:border-box;margin-top:5px;padding:9px;background:#1e293b;color:#fff;border:1px solid #475569;border-radius:8px;"></textarea>
+                        </label>
+                        <button type="submit" class="btn btn-danger" style="padding:8px 12px;">Send report</button>
+                    </form>
+                </details>"""
 
                 # Friend request button
                 fstatus = friend_status_map.get(peer_phone)
@@ -5447,6 +5840,11 @@ async def farmer_feed_portal(
                         </div>
                         <button type="submit" class="btn btn-emerald" style="padding:12px 20px; white-space:nowrap;">Send</button>
                     </form>"""
+            elif guarded_search:
+                peer_card_html = """
+                <div role="status" style="background:rgba(15,23,42,.8);border:1px solid rgba(148,163,184,.25);border-radius:14px;padding:18px;margin-bottom:16px;text-align:center;color:#cbd5e1;">
+                    This farmer is not available in search.
+                </div>"""
             else:
                 peer_card_html = f"""
                 <div style="background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.25); border-radius:14px; padding:18px; margin-bottom:16px; text-align:center;">
@@ -5773,9 +6171,11 @@ async def farmer_feed_portal(
                     {admin_dashboard_link}
                         <button class="btn" type="button" data-profile-phone="{html.escape(str(current_user['phone']), quote=True)}" onclick="shareMyProfile(this)" style="background:rgba(16,185,129,.12);color:#6ee7b7;border:1px solid rgba(16,185,129,.3);padding:10px 14px;font-size:13px;border-radius:10px;">🌱 Invite friends to grow with me</button>
                         <button class="btn" type="button" onclick="shareOlodeSite()" style="background:rgba(167,139,250,.12);color:#c4b5fd;border:1px solid rgba(167,139,250,.3);padding:10px 14px;font-size:13px;border-radius:10px;">🍃 Share Olode.com.ng</button>
+                        <a href="/portal/guardroom" class="btn" style="background:rgba(110,231,183,.1);color:#a7f3d0;border:1px solid rgba(110,231,183,.25);padding:10px 14px;font-size:13px;border-radius:10px;">🛡️ Guardroom</a>
                         <a href="/portal/profile/edit" class="btn" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); padding:10px 16px; font-size:13px; border-radius:10px;">✏️ Edit Profile</a>
                     <a href="/portal/logout" class="btn btn-danger" style="padding:10px 20px; font-size:13px; border-radius:10px;">🔌 Disconnect</a></div>
             </div>
+            {('<div role="status" style="margin:-8px 0 16px;padding:12px 16px;background:rgba(110,231,183,.1);border:1px solid rgba(110,231,183,.25);border-radius:12px;color:#a7f3d0;">Thank you for helping keep the site safe. Your report has been sent to the team for review.</div>') if report_sent else ''}
 
             <form action="/portal/feed" method="get" style="margin-bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:12px; padding:8px 12px;">
                 <input type="hidden" name="active_tab" value="community">
@@ -7420,6 +7820,13 @@ async def farmer_feed_portal(
                     const fd = new FormData(form);
                     const res = await fetch(action, {{ method: 'POST', body: fd, credentials: 'same-origin' }});
                     const redirectedToLogin = res.redirected && new URL(res.url).pathname === '/portal/login';
+                    if (action.includes('/portal/block-node') || action.includes('/portal/unblock-node') || action.includes('/portal/guardroom/')) {{
+                        if (!res.ok || redirectedToLogin || new URL(res.url).origin !== window.location.origin) {{
+                            throw new Error('Could not update the Guardroom. Please try again.');
+                        }}
+                        window.location.assign(res.url);
+                        return;
+                    }}
                     if (action.includes('/portal/shoutout')) {{
                         if (!res.ok || redirectedToLogin) {{
                             let errorMessage = 'Could not update the shout-out. Please try again.';
@@ -7464,10 +7871,10 @@ async def farmer_feed_portal(
                     else if (action.includes('/market/review')) msg = 'Review submitted';
                     else if (action.includes('/market/interest')) msg = 'Your message has been sent';
                     else if (action.includes('/shoutout')) msg = 'Shout-out posted';
+                    else if (action.includes('/flag-node')) msg = 'Thank you for helping keep the site safe. Your report has been sent for review.';
                     else if (action.includes('/checkin')) msg = 'Checked in';
                     else if (action.includes('/block-node')) msg = 'Blocked';
                     else if (action.includes('/unblock-node')) msg = 'Unblocked';
-                    else if (action.includes('/flag-node')) msg = 'Reported';
                     else if (action.includes('/sensors/submit')) msg = 'Soil reading saved';
                     else if (succeeded) msg = 'Success';
                     else msg = 'Something went wrong';
