@@ -5272,7 +5272,7 @@ async def farmer_feed_portal(
             rotate_form = ""
             if family["owner_phone"] == current_user["phone"]:
                 rotate_form = f"""
-                    <form action="/portal/family/rotate-code" method="post" style="margin:0;">
+                    <form action="/portal/family/rotate-code" method="post" data-auto-refresh style="margin:0;">
                         <input type="hidden" name="group_id" value="{family['id']}">
                         <button class="btn" type="submit" style="padding:8px 11px;background:rgba(245,158,11,.12);color:#fbbf24;border:1px solid rgba(245,158,11,.3);">Renew invite code</button>
                     </form>"""
@@ -5301,7 +5301,7 @@ async def farmer_feed_portal(
                             <p style="color:#cbd5e1;font-size:13px;margin:0 0 14px;">{member_names or 'No members yet'}</p>
                             <h4 style="color:#c4b5fd;margin:0 0 6px;">Family notes and messages</h4>
                             <div style="max-height:230px;overflow:auto;padding:8px;background:rgba(0,0,0,.2);border-radius:10px;">{message_rows}</div>
-                            <form action="/portal/family/message" method="post" style="display:flex;gap:8px;margin-top:10px;">
+                            <form action="/portal/family/message" method="post" data-auto-refresh style="display:flex;gap:8px;margin-top:10px;">
                                 <input type="hidden" name="group_id" value="{family['id']}">
                                 <input type="text" name="body" required maxlength="500" placeholder="Leave a family message..." style="flex:1;min-width:0;">
                                 <button class="btn btn-emerald" type="submit">Send</button>
@@ -5317,7 +5317,7 @@ async def farmer_feed_portal(
     family_create_html = ""
     if current_user.get("status") == STATUS_APPROVED:
         family_create_html = f"""
-            <form action="/portal/family/create" method="post" style="display:grid;gap:10px;">
+            <form action="/portal/family/create" method="post" data-auto-refresh style="display:grid;gap:10px;">
                 <label for="family_name" style="color:#e2e8f0;font-weight:700;">Family name</label>
                 <input id="family_name" name="family_name" required maxlength="80" placeholder="e.g. Adeyemi Family">
                 <label for="family_lga" style="color:#e2e8f0;font-weight:700;">LGA</label>
@@ -5880,7 +5880,7 @@ async def farmer_feed_portal(
                         </div>
                         <div style="background:rgba(0,0,0,.2);padding:16px;border-radius:12px;">
                             <h4 style="color:#c4b5fd;margin-top:0;">Join with an invite code</h4>
-                            <form action="/portal/family/join" method="post" style="display:grid;gap:10px;">
+                            <form action="/portal/family/join" method="post" data-auto-refresh style="display:grid;gap:10px;">
                                 <label for="family_invite_code" style="color:#e2e8f0;">Enter the 16-character code</label>
                                 <input id="family_invite_code" name="invite_code" required minlength="16" maxlength="16" pattern="[A-Fa-f0-9]{{16}}" placeholder="e.g. 8F3A10B7C24D9901" style="text-transform:uppercase;">
                                 <button class="btn btn-emerald" type="submit">Join family</button>
@@ -6353,6 +6353,58 @@ async def farmer_feed_portal(
                 document.getElementById('radio_status').innerText = 'Station changed — press Play';
                 document.getElementById('radio_status').style.color = '#94a3b8';
                 updateRadioMiniPlayer();
+            }});
+
+            document.addEventListener('submit', async event => {{
+                const form = event.target;
+                if (!(form instanceof HTMLFormElement) || !form.hasAttribute('data-auto-refresh') || event.defaultPrevented) return;
+                event.preventDefault();
+                const submitButton = form.querySelector('button[type="submit"], input[type="submit"]');
+                const originalLabel = submitButton && (submitButton.innerText || submitButton.value);
+                let feedback = form.querySelector('[data-submit-feedback]');
+                if (!feedback) {{
+                    feedback = document.createElement('p');
+                    feedback.dataset.submitFeedback = 'true';
+                    feedback.setAttribute('role', 'status');
+                    feedback.style.cssText = 'grid-column:1/-1;margin:4px 0;color:#fca5a5;font-size:13px;';
+                    form.appendChild(feedback);
+                }}
+                if (submitButton) {{
+                    submitButton.disabled = true;
+                    if (submitButton instanceof HTMLButtonElement) submitButton.innerText = 'Updating…';
+                    else submitButton.value = 'Updating…';
+                }}
+                feedback.textContent = '';
+                try {{
+                    const response = await fetch(form.action, {{
+                        method: form.method || 'POST',
+                        body: new FormData(form),
+                        credentials: 'same-origin',
+                        cache: 'no-store'
+                    }});
+                    if (!response.ok || !response.redirected) {{
+                        let errorMessage = 'This action could not be completed. Please try again.';
+                        try {{
+                            const payload = await response.json();
+                            if (typeof payload.detail === 'string') errorMessage = payload.detail;
+                        }} catch (parseError) {{
+                            console.error('Could not read the family meeting response:', parseError);
+                        }}
+                        throw new Error(errorMessage);
+                    }}
+                    const refreshUrl = new URL(response.url, window.location.origin);
+                    if (refreshUrl.origin !== window.location.origin) throw new Error('The update returned an unexpected destination.');
+                    refreshUrl.searchParams.set('_refresh', String(Date.now()));
+                    window.location.replace(refreshUrl.toString());
+                }} catch (error) {{
+                    feedback.textContent = error.message || 'This action could not be completed. Please try again.';
+                    if (submitButton) {{
+                        submitButton.disabled = false;
+                        if (submitButton instanceof HTMLButtonElement) submitButton.innerText = originalLabel;
+                        else submitButton.value = originalLabel;
+                    }}
+                    console.error('Could not update the family meeting:', error);
+                }}
             }});
 
             // Switch the portal's pre-rendered tabs without unloading the radio audio element.
