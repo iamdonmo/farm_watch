@@ -608,6 +608,61 @@ def render_status_card(status, comments, highlighted=False) -> str:
     </div>"""
 
 
+def render_shoutout_card(
+    shoutout, viewer_phone: str, highlighted: bool = False, id_prefix: str = ""
+) -> str:
+    template_key = shoutout["template_key"] or "garden-01"
+    emoji, background = SHOUTOUT_TEMPLATES.get(
+        template_key, SHOUTOUT_TEMPLATES["garden-01"]
+    )
+    shoutout_id = int(shoutout["id"])
+    author_phone = html.escape(str(shoutout["farmer_phone"]), quote=True)
+    recipient = html.escape(shoutout["recipient"] or "")
+    image_path = os.path.basename(str(shoutout["image_path"])) if shoutout["image_path"] else ""
+    image_html = (
+        f'<img class="shoutout-photo" src="/media/{html.escape(image_path, quote=True)}" '
+        'alt="Celebration portrait" style="display:block;width:144px;height:180px;'
+        'object-fit:contain;object-position:center;background:rgba(15,23,42,.35);'
+        'border:3px solid rgba(255,255,255,.8);border-radius:16px;margin:14px auto;'
+        'box-shadow:0 10px 24px rgba(0,0,0,.28);">'
+        if image_path else ""
+    )
+    remove_photo_html = ""
+    if image_path and str(shoutout["farmer_phone"]) == str(viewer_phone):
+        remove_photo_html = f"""
+            <form action="/portal/shoutout/remove-photo" method="post" style="margin:0;"
+                  onsubmit="return confirm('Remove the photo from this shout-out?');">
+                <input type="hidden" name="shoutout_id" value="{shoutout_id}">
+                <button type="submit" class="btn" style="padding:6px 10px;color:#fecaca;">Remove photo</button>
+            </form>"""
+    card_highlight = "outline:2px solid #34d399;" if highlighted else ""
+    article_id = f"{id_prefix}shoutout-{shoutout_id}"
+    card_id = f"{id_prefix}shoutout-card-{shoutout_id}"
+    return f"""
+        <article class="shoutout-entry" id="{article_id}" style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:12px;margin-bottom:12px;{card_highlight}">
+            <div id="{card_id}" class="shoutout-card" data-template="{html.escape(template_key, quote=True)}" style="position:relative;isolation:isolate;overflow:hidden;background:{background};background-image:radial-gradient(circle at 9% 12%,rgba(255,255,255,.48),transparent 25%),radial-gradient(circle at 90% 86%,rgba(255,255,255,.28),transparent 34%),{background};color:#fff;border-radius:16px;padding:22px;text-align:center;min-height:145px;box-sizing:border-box;box-shadow:0 12px 30px rgba(0,0,0,.3);">
+                <div aria-hidden="true" style="position:absolute;inset:10px;border:1px solid rgba(255,255,255,.32);border-radius:12px;pointer-events:none;"></div>
+                <div style="position:relative;z-index:1;">
+                    <div style="font-size:30px;text-shadow:0 2px 12px rgba(0,0,0,.25);">{emoji}</div>
+                    <div class="shoutout-category" style="font-size:12px;font-weight:900;text-transform:uppercase;letter-spacing:.12em;text-shadow:0 1px 5px rgba(0,0,0,.35);">{html.escape(shoutout['category'] or 'Other')}</div>
+                    {f'<div class="shoutout-recipient" style="font-size:19px;font-weight:800;margin-top:8px;text-shadow:0 2px 8px rgba(0,0,0,.3);">For {recipient}</div>' if recipient else ''}
+                    <div class="shoutout-message" style="font-size:17px;font-weight:600;line-height:1.45;margin-top:10px;white-space:pre-wrap;text-shadow:0 1px 6px rgba(0,0,0,.3);">{html.escape(shoutout['message'] or '')}</div>
+                    {image_html}
+                    <div style="font-size:12px;font-weight:700;margin-top:12px;text-shadow:0 1px 5px rgba(0,0,0,.3);">With love from {html.escape(shoutout['lga'] or 'Olode.com.ng')} · Olode.com.ng</div>
+                </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;margin-top:9px;">
+                <a href="/portal/feed?active_tab=community&view_profile={author_phone}" style="color:#6ee7b7;font-size:13px;font-weight:700;text-decoration:none;">{html.escape(shoutout['farmer_name'] or '')}</a>
+                <span style="color:#64748b;font-size:11px;">{html.escape(str(shoutout['timestamp']))}</span>
+                <span style="display:flex;gap:6px;flex-wrap:wrap;">
+                    <button type="button" class="btn" onclick="shareShoutout({shoutout_id}, this)" style="padding:6px 10px;">Share</button>
+                    <button type="button" class="btn" onclick="printShoutout({shoutout_id}, this)" style="padding:6px 10px;">Print</button>
+                    {remove_photo_html}
+                </span>
+            </div>
+        </article>"""
+
+
 async def is_trust_group_member(conn, group_id: int, farmer_phone: str) -> bool:
     async with conn.execute(
         """SELECT 1 FROM trust_group_members
@@ -1166,16 +1221,60 @@ UPGRADED_CSS = """
             linear-gradient(165deg, #0a1f14 0%, #0d2818 35%, #122a2a 70%, #0f1a24 100%);
         background-attachment: fixed;
     }
+    .portal-header { align-items: center; }
+    .portal-header-actions {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+    }
     body::before {
         content: "";
         position: fixed;
         inset: 0;
         pointer-events: none;
         z-index: 0;
-        opacity: 0.4;
+        opacity: 0.55;
         background-image:
+            radial-gradient(1px 1px at 8% 18%, rgba(255,255,255,.82) 98%, transparent),
+            radial-gradient(1.5px 1.5px at 26% 74%, rgba(196,181,253,.8) 98%, transparent),
+            radial-gradient(1px 1px at 44% 34%, rgba(255,255,255,.78) 98%, transparent),
+            radial-gradient(1.5px 1.5px at 63% 82%, rgba(167,243,208,.75) 98%, transparent),
+            radial-gradient(1px 1px at 78% 21%, rgba(255,255,255,.8) 98%, transparent),
+            radial-gradient(1px 1px at 92% 61%, rgba(196,181,253,.82) 98%, transparent),
             radial-gradient(circle at 20% 80%, rgba(134, 239, 172, 0.08) 0%, transparent 25%),
             radial-gradient(circle at 80% 40%, rgba(45, 212, 191, 0.07) 0%, transparent 30%);
+    }
+    @media (max-width: 640px) {
+        body { padding: 18px 10px; }
+        .portal-header { padding: 16px !important; align-items: flex-start !important; }
+        .portal-header > div:first-child { gap: 10px !important; min-width: 0; }
+        .portal-header > div:first-child h1 { font-size: 17px !important; overflow-wrap: anywhere; }
+        .portal-header-actions {
+            width: 100%;
+            display: grid !important;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            justify-content: stretch;
+            gap: 8px !important;
+        }
+        .portal-header-actions > * { min-width: 0; max-width: 100%; }
+        .portal-header-actions .badge { grid-column: 1 / -1; justify-self: start; }
+        .portal-header-actions .btn,
+        .portal-header-actions > a {
+            width: 100%;
+            min-height: 42px;
+            padding: 9px 7px !important;
+            box-sizing: border-box;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            line-height: 1.25;
+        }
     }
     .container { max-width: 1100px; margin: 0 auto; width: 100%; position: relative; z-index: 1; }
     .glass-panel {
@@ -2186,8 +2285,15 @@ async def post_shoutout(request: Request, current_user=Depends(get_current_farme
             with Image.open(io.BytesIO(raw)) as source_image:
                 if source_image.width * source_image.height > 25_000_000:
                     raise HTTPException(status_code=400, detail="Choose an image smaller than 25 megapixels.")
-                image = ImageOps.exif_transpose(source_image).convert("RGB")
-                image.thumbnail((1200, 1200))
+                from PIL import ImageFilter
+                portrait = ImageOps.exif_transpose(source_image).convert("RGB")
+                image = ImageOps.fit(portrait, (480, 600)).filter(ImageFilter.GaussianBlur(24))
+                image = Image.blend(image, Image.new("RGB", image.size, "#14202f"), 0.3)
+                foreground = ImageOps.contain(portrait, (444, 564))
+                image.paste(
+                    foreground,
+                    ((image.width - foreground.width) // 2, (image.height - foreground.height) // 2)
+                )
                 filename = f"shoutout_{secrets.token_hex(16)}.jpg"
         except HTTPException:
             raise
@@ -2212,6 +2318,42 @@ async def post_shoutout(request: Request, current_user=Depends(get_current_farme
             (SHOUTOUT_XP, current_user["phone"])
         )
         await conn.commit()
+    return RedirectResponse(
+        url=f"/portal/feed?active_tab=shoutouts&shoutout_posted={shoutout_id}#shoutout-{shoutout_id}",
+        status_code=303,
+    )
+
+
+@app.post("/portal/shoutout/remove-photo")
+async def remove_shoutout_photo(
+    shoutout_id: int = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT image_path FROM shoutouts WHERE id = ? AND farmer_phone = ?",
+            (shoutout_id, current_user["phone"]),
+        ) as cursor:
+            shoutout = await cursor.fetchone()
+        if not shoutout:
+            raise HTTPException(status_code=404, detail="Shout-out not found.")
+        stored_path = shoutout["image_path"]
+        if stored_path:
+            filename = os.path.basename(str(stored_path))
+            photo_path = os.path.join(MEDIA_DIR, filename)
+            try:
+                if os.path.isfile(photo_path):
+                    os.remove(photo_path)
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail="The photo could not be removed.") from exc
+            await conn.execute(
+                "UPDATE shoutouts SET image_path = NULL WHERE id = ? AND farmer_phone = ?",
+                (shoutout_id, current_user["phone"]),
+            )
+            await conn.commit()
     return RedirectResponse(
         url=f"/portal/feed?active_tab=shoutouts&shoutout_posted={shoutout_id}#shoutout-{shoutout_id}",
         status_code=303,
@@ -4362,6 +4504,7 @@ async def farmer_feed_portal(
     # Profile viewer: accepted friends can see and reply to each other's statuses.
     profile_card_html = ""
     profile_status_html = ""
+    profile_shoutouts_html = ""
     if view_profile:
         clean_view = normalize_nigerian_mobile(view_profile) or clean_phone(view_profile)
         alternate_view = None
@@ -4413,7 +4556,25 @@ async def farmer_feed_portal(
                 profile_status_html = "".join(
                     render_status_card(status, prof_comments_map.get(status["id"], []))
                     for status in prof_statuses
-                ) or '<p style="color:var(--text-muted); font-size:13px;">No statuses posted yet.</p>'
+                )
+                async with conn.execute(
+                    """SELECT * FROM shoutouts WHERE farmer_phone = ?
+                       ORDER BY id DESC LIMIT 30""",
+                    (prof["phone"],),
+                ) as cur:
+                    prof_shoutouts = await cur.fetchall()
+                profile_shoutouts_html = "".join(
+                    render_shoutout_card(
+                        shoutout, current_user["phone"], id_prefix="profile-"
+                    )
+                    for shoutout in prof_shoutouts
+                )
+                if not profile_status_html and not profile_shoutouts_html:
+                    profile_status_html = '<p style="color:var(--text-muted); font-size:13px;">No statuses or shout-outs posted yet.</p>'
+                elif not profile_status_html:
+                    profile_status_html = '<p style="color:var(--text-muted); font-size:13px;">No statuses posted yet.</p>'
+                elif not profile_shoutouts_html:
+                    profile_shoutouts_html = '<p style="color:var(--text-muted); font-size:13px;">No shout-outs posted yet.</p>'
         if prof:
             if not can_view_profile:
                 profile_card_html = '<div style="color:#fbbf24; padding:12px;">You can view this profile after they accept your friend request.</div>'
@@ -4668,38 +4829,11 @@ async def farmer_feed_portal(
 
     shoutouts_html = ""
     for shoutout in recent_shoutouts:
-        emoji, background = SHOUTOUT_TEMPLATES.get(
-            shoutout["template_key"] or "garden-01", SHOUTOUT_TEMPLATES["garden-01"]
+        shoutouts_html += render_shoutout_card(
+            shoutout,
+            current_user["phone"],
+            highlighted=shoutout_posted == shoutout["id"],
         )
-        author_phone = html.escape(str(shoutout["farmer_phone"]), quote=True)
-        recipient = html.escape(shoutout["recipient"] or "")
-        image_html = (
-            f'<img src="/media/{html.escape(os.path.basename(shoutout["image_path"]), quote=True)}" '
-            'alt="Celebration photo" style="width:100%;max-height:220px;object-fit:cover;border-radius:12px;margin:12px 0;">'
-            if shoutout["image_path"] else ""
-        )
-        shoutout_style = (
-            "outline:2px solid #34d399;" if shoutout_posted == shoutout["id"] else ""
-        )
-        shoutouts_html += f"""
-        <article class="shoutout-entry" id="shoutout-{shoutout['id']}" style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:12px;margin-bottom:12px;{shoutout_style}">
-            <div id="shoutout-card-{shoutout['id']}" class="shoutout-card" data-template="{html.escape(shoutout['template_key'] or 'garden', quote=True)}" style="background:{background};color:#fff;border-radius:14px;padding:20px;text-align:center;min-height:145px;box-sizing:border-box;box-shadow:0 8px 24px rgba(0,0,0,.2);">
-                <div style="font-size:30px;">{emoji}</div>
-                <div class="shoutout-category" style="font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;">{html.escape(shoutout['category'] or 'Other')}</div>
-                {f'<div class="shoutout-recipient" style="font-size:19px;font-weight:800;margin-top:8px;">For {recipient}</div>' if recipient else ''}
-                <div class="shoutout-message" style="font-size:17px;line-height:1.45;margin-top:10px;white-space:pre-wrap;">{shoutout['message']}</div>
-                {image_html}
-                <div style="font-size:12px;margin-top:12px;">With love from {html.escape(shoutout['lga'] or 'Olode.com.ng')} · Olode.com.ng</div>
-            </div>
-            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;margin-top:9px;">
-                <a href="/portal/feed?active_tab=community&view_profile={author_phone}" style="color:#6ee7b7;font-size:13px;font-weight:700;text-decoration:none;">{html.escape(shoutout['farmer_name'] or '')}</a>
-                <span style="color:#64748b;font-size:11px;">{html.escape(str(shoutout['timestamp']))}</span>
-                <span style="display:flex;gap:6px;">
-                    <button type="button" class="btn" onclick="shareShoutout({shoutout['id']})" style="padding:6px 10px;">Share</button>
-                    <button type="button" class="btn" onclick="printShoutout({shoutout['id']})" style="padding:6px 10px;">Print</button>
-                </span>
-            </div>
-        </article>"""
     if not shoutouts_html:
         shoutouts_html = '<p style="color:var(--text-muted);font-size:13px;">No shout-outs yet. Create the first celebration card!</p>'
 
@@ -5249,12 +5383,12 @@ async def farmer_feed_portal(
     </style></head>
     <body>
         <div class="container" style="max-width:1400px; width:100%; padding:20px 16px; margin:0 auto;">
-            <div style="background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:24px; padding:24px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px; margin-bottom:24px;">
+            <div class="portal-header" style="background:var(--panel-glass); border:1px solid var(--border-glass); border-radius:24px; padding:24px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px; margin-bottom:24px;">
                 <div style="display:flex; align-items:center; gap:16px;">
                     <div style="font-size:40px;">👨‍🌾</div>
                     <div><h1 style="margin:0; font-size:22px; font-weight:800; color:#fff;">Terminal: <a href="/portal/feed?active_tab=community&view_profile={html.escape(str(current_user['phone']), quote=True)}" style="color:inherit;text-decoration:none;">{html.escape(current_user['name'])}</a> {'✅' if current_user.get('status') == 'Approved' else ''}</h1><span class="badge badge-emerald" style="margin-top:6px;">📍 {html.escape(current_user['lga'])} Sector Grid</span></div>
                 </div>
-                <div style="display:flex; gap:12px; align-items:center;"><span id="grid_score_display" class="badge badge-amber" style="font-weight:800; padding:8px 16px; font-size:13px;">⚡ {current_user['xp']} Grid XP</span>
+                <div class="portal-header-actions"><span id="grid_score_display" class="badge badge-amber" style="font-weight:800; padding:8px 16px; font-size:13px;">⚡ {current_user['xp']} Grid XP</span>
                     {admin_dashboard_link}
                         <button class="btn" type="button" data-profile-phone="{html.escape(str(current_user['phone']), quote=True)}" onclick="shareMyProfile(this)" style="background:rgba(16,185,129,.12);color:#6ee7b7;border:1px solid rgba(16,185,129,.3);padding:10px 14px;font-size:13px;border-radius:10px;">Ask friends to follow me</button>
                         <button class="btn" type="button" onclick="shareOlodeSite()" style="background:rgba(167,139,250,.12);color:#c4b5fd;border:1px solid rgba(167,139,250,.3);padding:10px 14px;font-size:13px;border-radius:10px;">Share Olode.com.ng</button>
@@ -5324,7 +5458,7 @@ async def farmer_feed_portal(
             <div id="tab_community" style="{show_community}">
                 {pending_requests_panel}
                 {profile_card_html}
-                {f'<div class="portal-card" style="margin-bottom:20px;"><div class="card-header">📝 <h3 class="card-title">Statuses & replies</h3></div>{profile_status_html}</div>' if profile_status_html else ''}
+                {f'<div class="portal-card" style="margin-bottom:20px;"><div class="card-header">📝 <h3 class="card-title">Wall: statuses and shout-outs</h3></div><h4 style="color:#cbd5e1;margin:8px 0;">Statuses</h4>{profile_status_html}<h4 style="color:#cbd5e1;margin:18px 0 8px;">Shout-outs</h4>{profile_shoutouts_html}</div>' if profile_status_html or profile_shoutouts_html else ''}
                 <div class="portal-grid">
                     <div class="portal-card">
                         <div class="card-header">🌤️ <h3 class="card-title">Live Weather</h3></div>
@@ -5863,8 +5997,13 @@ async def farmer_feed_portal(
                 openSocialShare('whatsapp', text, url);
             }}
 
-            async function shareShoutout(id) {{
-                const card = document.getElementById('shoutout-card-' + id);
+            function getShoutoutCard(id, button) {{
+                return button?.closest('.shoutout-entry')?.querySelector('.shoutout-card')
+                    || document.getElementById('shoutout-card-' + id);
+            }}
+
+            async function shareShoutout(id, button) {{
+                const card = getShoutoutCard(id, button);
                 if (!card) return;
                 const url = new URL('/portal/feed', window.location.origin);
                 url.searchParams.set('active_tab', 'shoutouts');
@@ -5959,8 +6098,8 @@ async def farmer_feed_portal(
                 if (line && y <= 480) context.fillText(line, 72, y);
                 const photo = card.querySelector('img');
                 if (photo && photo.complete && photo.naturalWidth) {{
-                    const box = {{ x: 850, y: 180, width: 280, height: 300 }};
-                    const scale = Math.max(box.width / photo.naturalWidth, box.height / photo.naturalHeight);
+                    const box = {{ x: 850, y: 145, width: 280, height: 350 }};
+                    const scale = Math.min(box.width / photo.naturalWidth, box.height / photo.naturalHeight);
                     const width = photo.naturalWidth * scale;
                     const height = photo.naturalHeight * scale;
                     context.save();
@@ -5977,15 +6116,15 @@ async def farmer_feed_portal(
                 }});
             }}
 
-            function printShoutout(id) {{
-                const card = document.getElementById('shoutout-card-' + id);
+            function printShoutout(id, button) {{
+                const card = getShoutoutCard(id, button);
                 if (!card) return;
                 const printWindow = window.open('', '_blank');
                 if (!printWindow) {{
                     window.alert('Allow pop-ups to print this celebration card.');
                     return;
                 }}
-                printWindow.document.write('<!doctype html><html><head><title>Olode.com.ng Shout Out</title><style>body{{font-family:Arial,sans-serif;padding:24px;color:#0f172a}}.card{{max-width:680px;margin:0 auto;border-radius:20px;padding:32px;text-align:center;print-color-adjust:exact;-webkit-print-color-adjust:exact}}img{{max-width:100%;height:auto}}</style></head><body><main class="card">' + card.innerHTML + '</main></body></html>');
+                printWindow.document.write('<!doctype html><html><head><title>Olode.com.ng Shout Out</title><style>body{{font-family:Arial,sans-serif;padding:24px;color:#0f172a}}.card{{max-width:680px;margin:0 auto;border-radius:20px;padding:32px;text-align:center;print-color-adjust:exact;-webkit-print-color-adjust:exact}}img{{display:block;width:144px!important;height:180px!important;max-width:100%;object-fit:contain!important;object-position:center;background:#e2e8f0;border-radius:16px;margin:14px auto;print-color-adjust:exact;-webkit-print-color-adjust:exact}}</style></head><body><main class="card">' + card.innerHTML + '</main></body></html>');
                 printWindow.document.close();
                 printWindow.focus();
                 printWindow.print();
