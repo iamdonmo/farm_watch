@@ -296,6 +296,35 @@ async def lifespan(app: FastAPI):
             if column not in shoutout_columns:
                 await conn.execute(f"ALTER TABLE shoutouts ADD COLUMN {column} {definition}")
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS shoutout_likes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shoutout_id INTEGER NOT NULL,
+                user_phone TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(shoutout_id, user_phone)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS shoutout_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shoutout_id INTEGER NOT NULL,
+                author_phone TEXT NOT NULL,
+                author_name TEXT,
+                text TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS shoutout_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shoutout_id INTEGER NOT NULL,
+                reporter_phone TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(shoutout_id, reporter_phone)
+            );
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS statuses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 author_phone TEXT NOT NULL,
@@ -463,6 +492,14 @@ async def lifespan(app: FastAPI):
                 author_name TEXT NOT NULL,
                 body TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS family_message_notifications (
+                message_id INTEGER NOT NULL,
+                user_phone TEXT NOT NULL,
+                is_read INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (message_id, user_phone)
             );
         """)
         async with conn.execute("PRAGMA table_info(trust_group_members)") as cursor:
@@ -636,6 +673,60 @@ async def can_view_status(conn, status_id: int, viewer_phone: str) -> bool:
         return await cursor.fetchone() is not None
 
 
+async def can_view_shoutout(conn, shoutout_id: int, viewer_phone: str) -> bool:
+    async with conn.execute(
+        "SELECT farmer_phone, lga FROM shoutouts WHERE id = ?",
+        (shoutout_id,),
+    ) as cursor:
+        shoutout = await cursor.fetchone()
+    if not shoutout:
+        return False
+    author_phone = shoutout["farmer_phone"] if isinstance(shoutout, aiosqlite.Row) else shoutout[0]
+    author_lga = shoutout["lga"] if isinstance(shoutout, aiosqlite.Row) else shoutout[1]
+    if await guard_status(conn, viewer_phone, author_phone):
+        return False
+    if author_phone == viewer_phone:
+        return True
+    async with conn.execute(
+        "SELECT lga FROM farmers WHERE phone = ?",
+        (viewer_phone,),
+    ) as cursor:
+        viewer = await cursor.fetchone()
+    viewer_lga = viewer["lga"] if isinstance(viewer, aiosqlite.Row) else viewer[0] if viewer else None
+    if viewer_lga and viewer_lga == author_lga:
+        return True
+    async with conn.execute("""
+        SELECT 1 FROM friendships
+        WHERE status = 'accepted'
+          AND ((requester_phone = ? AND receiver_phone = ?)
+            OR (requester_phone = ? AND receiver_phone = ?))
+    """, (viewer_phone, author_phone, author_phone, viewer_phone)) as cursor:
+        return await cursor.fetchone() is not None
+
+
+async def load_shoutout_comments(conn, shoutouts):
+    comments_by_shoutout = {}
+    shoutout_ids = [int(shoutout["id"]) for shoutout in shoutouts]
+    if not shoutout_ids:
+        return comments_by_shoutout
+    placeholders = ",".join("?" for _ in shoutout_ids)
+    async with conn.execute(
+        f"""SELECT id, shoutout_id, author_phone, author_name, text
+            FROM (
+                SELECT shoutout_id, author_phone, author_name, text, id,
+                       ROW_NUMBER() OVER (PARTITION BY shoutout_id ORDER BY id DESC) AS position
+                FROM shoutout_comments
+                WHERE shoutout_id IN ({placeholders})
+            )
+            WHERE position <= 5
+            ORDER BY id ASC""",
+        shoutout_ids,
+    ) as cursor:
+        for comment in await cursor.fetchall():
+            comments_by_shoutout.setdefault(comment["shoutout_id"], []).append(comment)
+    return comments_by_shoutout
+
+
 def render_status_card(status, comments, highlighted=False) -> str:
     author_phone = html.escape(str(status["author_phone"]), quote=True)
     author_name = html.escape(status["author_name"] or "")
@@ -757,7 +848,8 @@ def remove_social_image(filename: Optional[str]) -> None:
 
 
 def render_shoutout_card(
-    shoutout, viewer_phone: str, highlighted: bool = False, id_prefix: str = ""
+    shoutout, viewer_phone: str, highlighted: bool = False, id_prefix: str = "",
+    comments=(),
 ) -> str:
     template_key = shoutout["template_key"] or "garden-01"
     emoji, background = SHOUTOUT_TEMPLATES.get(
@@ -786,6 +878,26 @@ def render_shoutout_card(
     card_highlight = "outline:2px solid #34d399;" if highlighted else ""
     article_id = f"{id_prefix}shoutout-{shoutout_id}"
     card_id = f"{id_prefix}shoutout-card-{shoutout_id}"
+    comments_html = "".join(
+        f'<div style="padding:6px 9px;margin-top:5px;background:rgba(255,255,255,.04);border-radius:8px;">'
+        f'<a href="/portal/feed?active_tab=community&view_profile={html.escape(str(comment["author_phone"]), quote=True)}" '
+        f'style="color:#a7f3d0;font-weight:700;text-decoration:none;">{html.escape(comment["author_name"] or "Farmer")}</a>'
+        f'<span style="color:#cbd5e1;"> {html.escape(comment["text"])}</span></div>'
+        for comment in comments
+    )
+    if not comments_html:
+        comments_html = '<div style="font-size:12px;color:#94a3b8;margin-top:6px;">No comments yet.</div>'
+    report_html = ""
+    if str(shoutout["farmer_phone"]) != str(viewer_phone):
+        report_html = f"""
+            <details style="display:inline-block;">
+                <summary style="cursor:pointer;color:#fca5a5;font-size:12px;padding:6px;">Report</summary>
+                <form action="/portal/shoutout/report" method="post" style="display:grid;gap:6px;margin-top:6px;">
+                    <input type="hidden" name="shoutout_id" value="{shoutout_id}">
+                    <textarea name="reason" required minlength="5" maxlength="500" placeholder="Reason for report" style="width:100%;box-sizing:border-box;padding:8px;background:#0f172a;color:#fff;border:1px solid #475569;border-radius:8px;"></textarea>
+                    <button type="submit" class="btn btn-danger" style="padding:6px 10px;">Send report</button>
+                </form>
+            </details>"""
     return f"""
         <article class="shoutout-entry" id="{article_id}" style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:12px;margin-bottom:12px;{card_highlight}">
             <div id="{card_id}" class="shoutout-card" data-template="{html.escape(template_key, quote=True)}" style="position:relative;isolation:isolate;overflow:hidden;background:{background};background-image:radial-gradient(circle at 9% 12%,rgba(255,255,255,.48),transparent 25%),radial-gradient(circle at 90% 86%,rgba(255,255,255,.28),transparent 34%),{background};color:#fff;border-radius:16px;padding:22px;text-align:center;min-height:145px;box-sizing:border-box;box-shadow:0 12px 30px rgba(0,0,0,.3);">
@@ -803,14 +915,27 @@ def render_shoutout_card(
                 <a href="/portal/feed?active_tab=community&view_profile={author_phone}" style="color:#6ee7b7;font-size:13px;font-weight:700;text-decoration:none;">{html.escape(shoutout['farmer_name'] or '')}</a>
                 <span style="color:#64748b;font-size:11px;">{html.escape(str(shoutout['timestamp']))}</span>
                 <span style="display:flex;gap:6px;flex-wrap:wrap;">
+                    <form action="/portal/shoutout/like" method="post" style="margin:0;">
+                        <input type="hidden" name="shoutout_id" value="{shoutout_id}">
+                        <button type="submit" class="btn" style="padding:6px 10px;color:#f9a8d4;">{"💚 Liked" if shoutout["liked_by_viewer"] else "🤍 Like"} {shoutout["like_count"]}</button>
+                    </form>
                     <button type="button" class="btn" onclick="shareShoutout({shoutout_id}, this)" style="padding:6px 10px;">Share</button>
                     <button type="button" class="btn" onclick="printShoutout({shoutout_id}, this)" style="padding:6px 10px;">Print</button>
                     {remove_photo_html}
+                    {report_html}
                     {f'''<form action="/portal/shoutout/delete" method="post" style="margin:0;" onsubmit="return confirm('Delete this shout-out permanently?');">
                         <input type="hidden" name="shoutout_id" value="{shoutout_id}">
                         <button type="submit" class="btn" style="padding:6px 10px;color:#fecaca;border-color:rgba(248,113,113,.4);">Delete shout-out</button>
                     </form>''' if str(shoutout["farmer_phone"]) == str(viewer_phone) else ''}
                 </span>
+            </div>
+            <div class="shoutout-comments" style="margin-top:8px;">
+                {comments_html}
+                <form action="/portal/shoutout/comment" method="post" style="display:flex;gap:6px;margin-top:8px;">
+                    <input type="hidden" name="shoutout_id" value="{shoutout_id}">
+                    <input type="text" name="text" required maxlength="200" placeholder="Write a comment…" style="min-width:0;flex:1;padding:8px 10px;font-size:13px;">
+                    <button type="submit" class="btn" style="padding:7px 10px;">Comment</button>
+                </form>
             </div>
         </article>"""
 
@@ -1975,6 +2100,15 @@ async def admin_dashboard(request: Request):
             ORDER BY fr.id DESC LIMIT 50
         """) as c_farmer_reports:
             recent_farmer_reports = await c_farmer_reports.fetchall()
+        async with conn.execute("""
+            SELECT sr.id, sr.timestamp, sr.reporter_phone, reporter.name AS reporter_name,
+                   sr.reason, s.farmer_name, s.message
+            FROM shoutout_reports sr
+            JOIN shoutouts s ON s.id = sr.shoutout_id
+            LEFT JOIN farmers reporter ON reporter.phone = sr.reporter_phone
+            ORDER BY sr.id DESC LIMIT 50
+        """) as c_shoutout_reports:
+            recent_shoutout_reports = await c_shoutout_reports.fetchall()
         async with conn.execute("SELECT * FROM farm_products ORDER BY id DESC LIMIT 100") as c4:
             all_products = await c4.fetchall()
 
@@ -2149,6 +2283,23 @@ async def admin_dashboard(request: Request):
             <tbody>{farmer_report_rows or "<tr><td colspan='4' style='color:var(--text-muted);font-style:italic;'>No farmer reports yet.</td></tr>"}</tbody>
         </table>
     </div>"""
+    shoutout_report_rows = "".join(
+        f"""<tr>
+            <td style="font-size:12px;color:var(--text-muted);">{html.escape(str(report["timestamp"]))}</td>
+            <td>{html.escape(report["reporter_name"] or report["reporter_phone"])}</td>
+            <td>{html.escape(report["farmer_name"] or "Farmer")}</td>
+            <td style="white-space:pre-wrap;">{html.escape(report["reason"])}</td>
+            <td style="white-space:pre-wrap;">{html.escape(report["message"] or "")}</td>
+        </tr>"""
+        for report in recent_shoutout_reports
+    )
+    shoutout_reports_table = f"""
+    <div style="overflow-x:auto;">
+        <table class="data-table">
+            <thead><tr><th>When</th><th>Reporter</th><th>Shout-out author</th><th>Reason</th><th>Shout-out</th></tr></thead>
+            <tbody>{shoutout_report_rows or "<tr><td colspan='5' style='color:var(--text-muted);font-style:italic;'>No shout-out reports yet.</td></tr>"}</tbody>
+        </table>
+    </div>"""
 
     html_template_head = f"""
     <html>
@@ -2181,6 +2332,7 @@ async def admin_dashboard(request: Request):
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>⏳ Executive Node Approvals Pending</h3>{pending_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🚩 Recent Message Reports</h3>{reports_table}</div>
             <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🛡️ Farmer Safety Reports</h3>{farmer_reports_table}</div>
+            <div class="glass-panel" style="margin-bottom: 30px; padding: 30px;"><h3>🎊 Shout-out Reports</h3>{shoutout_reports_table}</div>
             <div class="glass-panel" style="padding: 30px;"><h3>🗂️ Active Grid Infrastructure Map</h3>{active_table}</div>
         </div>
     """
@@ -2595,6 +2747,79 @@ async def delete_shoutout(
         await conn.commit()
     return RedirectResponse(
         url="/portal/feed?active_tab=shoutouts#shoutout-list",
+        status_code=303,
+    )
+
+
+@app.post("/portal/shoutout/like")
+async def like_shoutout(
+    shoutout_id: int = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        if not await can_view_shoutout(conn, shoutout_id, current_user["phone"]):
+            raise HTTPException(status_code=404, detail="Shout-out not found")
+        await conn.execute(
+            "INSERT OR IGNORE INTO shoutout_likes (shoutout_id, user_phone) VALUES (?, ?)",
+            (shoutout_id, current_user["phone"]),
+        )
+        await conn.commit()
+    return RedirectResponse(
+        url=f"/portal/feed?active_tab=shoutouts&shoutout_id={shoutout_id}#shoutout-{shoutout_id}",
+        status_code=303,
+    )
+
+
+@app.post("/portal/shoutout/comment")
+async def comment_shoutout(
+    shoutout_id: int = Form(...),
+    text: str = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    comment = sanitize(text)[:200]
+    if not comment:
+        raise HTTPException(status_code=422, detail="Write a comment before posting.")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        if not await can_view_shoutout(conn, shoutout_id, current_user["phone"]):
+            raise HTTPException(status_code=404, detail="Shout-out not found")
+        await conn.execute(
+            """INSERT INTO shoutout_comments
+               (shoutout_id, author_phone, author_name, text) VALUES (?, ?, ?, ?)""",
+            (shoutout_id, current_user["phone"], current_user["name"], comment),
+        )
+        await conn.commit()
+    return RedirectResponse(
+        url=f"/portal/feed?active_tab=shoutouts&shoutout_id={shoutout_id}#shoutout-{shoutout_id}",
+        status_code=303,
+    )
+
+
+@app.post("/portal/shoutout/report")
+async def report_shoutout(
+    shoutout_id: int = Form(...),
+    reason: str = Form(...),
+    current_user=Depends(get_current_farmer),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    clean_reason = reason.strip()
+    if len(clean_reason) < 5 or len(clean_reason) > 500:
+        raise HTTPException(status_code=422, detail="Please provide a reason (5–500 characters).")
+    async with aiosqlite.connect(DB_FILE) as conn:
+        if not await can_view_shoutout(conn, shoutout_id, current_user["phone"]):
+            raise HTTPException(status_code=404, detail="Shout-out not found")
+        await conn.execute(
+            """INSERT OR IGNORE INTO shoutout_reports
+               (shoutout_id, reporter_phone, reason) VALUES (?, ?, ?)""",
+            (shoutout_id, current_user["phone"], sanitize(clean_reason)[:500]),
+        )
+        await conn.commit()
+    return RedirectResponse(
+        url=f"/portal/feed?active_tab=shoutouts&shoutout_id={shoutout_id}&shoutout_reported=1#shoutout-{shoutout_id}",
         status_code=303,
     )
 
@@ -4121,6 +4346,25 @@ async def message_notifications(current_user=Depends(get_current_farmer)):
             LIMIT 10
         """, (current_user["phone"],)) as cursor:
             unread_messages = await cursor.fetchall()
+        async with conn.execute("""
+            SELECT COUNT(*) FROM family_message_notifications
+            WHERE user_phone = ? AND is_read = 0
+        """, (current_user["phone"],)) as cursor:
+            family_unread_count = (await cursor.fetchone())[0]
+        async with conn.execute("""
+            SELECT n.message_id, m.author_phone, m.author_name, m.body, m.created_at, m.group_id
+            FROM family_message_notifications n
+            JOIN family_meeting_messages m ON m.id = n.message_id
+            WHERE n.user_phone = ? AND n.is_read = 0
+            ORDER BY n.message_id DESC LIMIT 10
+        """, (current_user["phone"],)) as cursor:
+            family_unread_messages = await cursor.fetchall()
+        if family_unread_messages:
+            await conn.executemany(
+                """UPDATE family_message_notifications SET is_read = 1
+                   WHERE message_id = ? AND user_phone = ?""",
+                [(message["message_id"], current_user["phone"]) for message in family_unread_messages],
+            )
         async with conn.execute(
             """SELECT COUNT(*) FROM friendships
                WHERE receiver_phone = ? AND status = 'pending'
@@ -4152,7 +4396,7 @@ async def message_notifications(current_user=Depends(get_current_farmer)):
         """, (current_user["phone"],)) as cursor:
             friend_requests = await cursor.fetchall()
     return {
-        "unread_count": unread_count,
+        "unread_count": unread_count + family_unread_count,
         "friend_request_count": friend_request_count,
         "friend_requests": [
             {
@@ -4172,6 +4416,17 @@ async def message_notifications(current_user=Depends(get_current_farmer)):
                 "kind": "marketplace" if (message["body"] or "").startswith("I am interested in your listing:") else "message",
             }
             for message in unread_messages
+        ] + [
+            {
+                "id": f"family-{message['message_id']}",
+                "sender_phone": message["author_phone"],
+                "sender_name": message["author_name"] or "A family member",
+                "body": message["body"] or "",
+                "timestamp": message["created_at"],
+                "kind": "family",
+                "group_id": message["group_id"],
+            }
+            for message in family_unread_messages
         ],
     }
 
@@ -4479,10 +4734,16 @@ async def post_family_message(
             membership = await cursor.fetchone()
         if not membership:
             raise HTTPException(status_code=403, detail="Join this family meeting before posting")
-        await conn.execute(
+        cursor = await conn.execute(
             """INSERT INTO family_meeting_messages
                (group_id, author_phone, author_name, body) VALUES (?, ?, ?, ?)""",
             (group_id, current_user["phone"], current_user["name"], message),
+        )
+        await conn.execute(
+            """INSERT OR IGNORE INTO family_message_notifications (message_id, user_phone)
+               SELECT ?, farmer_phone FROM family_group_members
+               WHERE group_id = ? AND farmer_phone != ?""",
+            (cursor.lastrowid, group_id, current_user["phone"]),
         )
         await conn.commit()
     return RedirectResponse("/portal/feed?active_tab=family", status_code=303)
@@ -4678,6 +4939,12 @@ async def farmer_feed_portal(
             ) as cur:
                 unread_count = (await cur.fetchone())[0]
             async with conn.execute(
+               """SELECT COUNT(*) FROM family_message_notifications
+                  WHERE user_phone = ? AND is_read = 0""",
+               (current_user["phone"],)
+            ) as cur:
+               unread_count += (await cur.fetchone())[0]
+            async with conn.execute(
                 """SELECT COUNT(*) FROM farm_product_notifications
                    WHERE farmer_phone = ? AND is_read = 0""",
                 (current_user["phone"],)
@@ -4777,8 +5044,11 @@ async def farmer_feed_portal(
         """, (current_user['lga'], current_user['phone'], current_user['phone'])) as c4:
             recent_checkins = await c4.fetchall()
         async with conn.execute("""
-            SELECT id, farmer_phone, farmer_name, lga, message, timestamp,
-                   category, recipient, template_key, image_path
+            SELECT s.id, s.farmer_phone, s.farmer_name, s.lga, s.message, s.timestamp,
+                   s.category, s.recipient, s.template_key, s.image_path,
+                   (SELECT COUNT(*) FROM shoutout_likes sl WHERE sl.shoutout_id = s.id) AS like_count,
+                   EXISTS(SELECT 1 FROM shoutout_likes sl
+                          WHERE sl.shoutout_id = s.id AND sl.user_phone = ?) AS liked_by_viewer
             FROM shoutouts s WHERE lga = ?
               AND NOT EXISTS (
                   SELECT 1 FROM blocked_nodes bn
@@ -4786,8 +5056,9 @@ async def farmer_feed_portal(
                      OR (bn.blocker_phone = s.farmer_phone AND bn.blocked_phone = ?)
               )
             ORDER BY id DESC LIMIT 25
-        """, (current_user['lga'], current_user['phone'], current_user['phone'])) as c5:
+        """, (current_user['phone'], current_user['lga'], current_user['phone'], current_user['phone'])) as c5:
             recent_shoutouts = await c5.fetchall()
+        shoutout_comments_map = await load_shoutout_comments(conn, recent_shoutouts)
         # Statuses from friends + own (network growth)
         friend_phones = [ph for ph, st in friend_status_map.items() if st == 'accepted']
         friend_phones.append(current_user['phone'])
@@ -5218,14 +5489,20 @@ async def farmer_feed_portal(
                     for status in prof_statuses
                 )
                 async with conn.execute(
-                    """SELECT * FROM shoutouts WHERE farmer_phone = ?
+                    """SELECT s.*,
+                             (SELECT COUNT(*) FROM shoutout_likes sl WHERE sl.shoutout_id = s.id) AS like_count,
+                             EXISTS(SELECT 1 FROM shoutout_likes sl
+                                    WHERE sl.shoutout_id = s.id AND sl.user_phone = ?) AS liked_by_viewer
+                       FROM shoutouts s WHERE farmer_phone = ?
                        ORDER BY id DESC LIMIT 30""",
-                    (prof["phone"],),
+                    (current_user["phone"], prof["phone"]),
                 ) as cur:
                     prof_shoutouts = await cur.fetchall()
+                prof_shoutout_comments = await load_shoutout_comments(conn, prof_shoutouts)
                 profile_shoutouts_html = "".join(
                     render_shoutout_card(
-                        shoutout, current_user["phone"], id_prefix="profile-"
+                       shoutout, current_user["phone"], id_prefix="profile-",
+                       comments=prof_shoutout_comments.get(shoutout["id"], []),
                     )
                     for shoutout in prof_shoutouts
                 )
@@ -5501,6 +5778,7 @@ async def farmer_feed_portal(
             shoutout,
             current_user["phone"],
             highlighted=shoutout_posted == shoutout["id"],
+            comments=shoutout_comments_map.get(shoutout["id"], []),
         )
     if not shoutouts_html:
         shoutouts_html = '<p style="color:var(--text-muted);font-size:13px;">No shout-outs yet. Create the first celebration card!</p>'
@@ -7598,9 +7876,14 @@ async def farmer_feed_portal(
             setInterval(pollFarmProductNotifications, 15000);
 
             function showIncomingMessageNotification(message, totalNew) {{
-                const title = message.kind === 'marketplace' ? 'Marketplace message' : 'New friend message';
+                const isFamilyMessage = message.kind === 'family';
+                const title = isFamilyMessage
+                    ? 'New family meeting message'
+                    : message.kind === 'marketplace' ? 'Marketplace message' : 'New friend message';
                 const toast = document.createElement('a');
-                toast.href = '/portal/chat?with=' + encodeURIComponent(message.sender_phone);
+                toast.href = isFamilyMessage
+                    ? '/portal/feed?active_tab=family'
+                    : '/portal/chat?with=' + encodeURIComponent(message.sender_phone);
                 toast.style.cssText = 'position:fixed;top:24px;right:20px;z-index:10000;display:block;width:min(360px,calc(100vw - 40px));padding:16px;background:#0f172a;color:#f8fafc;border:1px solid rgba(52,211,153,.5);border-radius:14px;box-shadow:0 12px 36px rgba(0,0,0,.45);text-decoration:none;';
                 const heading = document.createElement('strong');
                 heading.textContent = title + ' from ' + message.sender_name;
@@ -7608,7 +7891,9 @@ async def farmer_feed_portal(
                 preview.textContent = message.body;
                 preview.style.cssText = 'margin-top:7px;color:#cbd5e1;font-size:14px;line-height:1.4;overflow-wrap:anywhere;';
                 const count = document.createElement('div');
-                count.textContent = totalNew > 1 ? totalNew + ' unread messages — tap to open' : 'Tap to open message';
+                count.textContent = totalNew > 1
+                    ? totalNew + ' unread messages — tap to open'
+                    : isFamilyMessage ? 'Tap to open the family meeting' : 'Tap to open message';
                 count.style.cssText = 'margin-top:8px;color:#6ee7b7;font-size:12px;font-weight:700;';
                 toast.append(heading, preview, count);
                 document.body.appendChild(toast);
